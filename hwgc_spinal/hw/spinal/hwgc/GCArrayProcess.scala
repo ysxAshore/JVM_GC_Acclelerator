@@ -16,7 +16,22 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
   // default value
   io.Fetch2Process.Ready := False
   io.Fetch2Process.Done := False
+  io.Fetch2Process.DestOopPtr := U(0)
+
   io.Process2Trace.Valid := False
+  io.Process2Trace.OopType := U(0)
+  io.Process2Trace.KlassPtr := U(0)
+  io.Process2Trace.SrcOopPtr := U(0)
+  io.Process2Trace.DestOopPtr := U(0)
+  io.Process2Trace.Kid := U(0)
+  io.Process2Trace.ArrayLength := U(0)
+  io.Process2Trace.PartialArrayStart := U(0)
+  io.Process2Trace.StepIndex := U(0)
+  io.Process2Trace.StepNCreate := U(0)
+
+  io.Mreq.Request.valid := False
+  io.Mreq.Request.payload.clearAll()
+  io.Mreq.Response.ready := False
 
   object overall_state extends SpinalEnum {
     val s_idle, s_readSrcLen, s_readDestLen, s_readChunk, s_writeDestLen, s_readStepper, s_doTrace, s_waitDone = newElement()
@@ -36,56 +51,55 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
       oopType := io.Fetch2Process.OopType
       srcOopPtr := io.Fetch2Process.SrcOopPtr
       markWord := io.Fetch2Process.MarkWord
-      destOopPtr := io.Fetch2Process.MarkWord & ~LOCK_MASK_IN_PLACE
+      destOopPtr := io.Fetch2Process.MarkWord & ~U(LOCK_MASK_IN_PLACE, MMUDataWidth bits)
 
       state := overall_state.s_readSrcLen
     }
   }
 
-  val srcLength = RegInit(U(0, IntWidth bits))
+  val srcLength = RegInit(U(0, 32 bits))
   val reqIssued = RegInit(False)
   when(state === overall_state.s_readSrcLen){
     issueReq(io.Mreq, srcOopPtr + ArrayLenOff, False, U(0), U(0), reqIssued) { rd =>
-      srcLength := rd(IntWidth-1 downto 0)
+      srcLength := rd(31 downto 0)
       state := overall_state.s_readDestLen
     }
   }
 
-  val destLength = RegInit(U(0, IntWidth bits))
+  val destLength = RegInit(U(0, 32 bits))
   when(state === overall_state.s_readDestLen){
     issueReq(io.Mreq, destOopPtr + ArrayLenOff, False, U(0), U(0), reqIssued) { rd =>
-      destLength := rd(IntWidth-1 downto 0)
+      destLength := rd(31 downto 0)
       state := overall_state.s_readChunk
     }
   }
 
-  val chunk_size = RegInit(U(0, IntWidth bits))
+  val chunk_size = RegInit(U(0, 32 bits))
   when(state === overall_state.s_readChunk){
     issueReq(io.Mreq, pss + PARTIAL_ARRAY_CHUNK_SIZE_OFFSET, False, U(0), U(0), reqIssued) { rd =>
-      chunk_size := rd(IntWidth-1 downto 0)
+      chunk_size := rd(31 downto 0)
       state := overall_state.s_writeDestLen
     }
   }
 
 
-  val halfBytesOnes = U((BigInt(1) << (MMUDataWidth / 8 / 2)) - 1, MMUDataWidth / 8 bits)
   when(state === overall_state.s_writeDestLen){
-    issueReq(io.Mreq, destOopPtr + ArrayLenOff, True, halfBytesOnes, destLength + chunk_size, reqIssued) { rd =>
+    issueReq(io.Mreq, destOopPtr + ArrayLenOff, True, halfBytesOnes, (destLength + chunk_size).resized, reqIssued) { rd =>
       state := overall_state.s_readStepper
     }
   }
 
-  val stepIndex = RegInit(U(0, IntWidth bits))
-  val stepNCreate = RegInit(U(0, IntWidth bits))
+  val stepIndex = RegInit(U(0, 32 bits))
+  val stepNCreate = RegInit(U(0, 32 bits))
   when(state === overall_state.s_readStepper){
     issueReq(io.Mreq, pss + PARTIAL_ARRAY_STEPPER_OFFSET, False, U(0), U(0), reqIssued) { rd =>
       val task_num = destLength / chunk_size
       val remaining_tasks = (srcLength - destLength) / chunk_size
-      val task_limit = rd(IntWidth - 1 downto 0)
-      val task_fanout = rd(63 downto IntWidth)
+      val task_limit = rd(31 downto 0)
+      val task_fanout = rd(63 downto 32)
       val max_pending = (task_fanout - U(1)) * task_num + U(1)
       val pending = max_pending.min(remaining_tasks).min(task_limit)
-      stepNCreate := task_fanout.min(remaining_tasks.min(task_limit + U(1)) - pending)
+      stepNCreate := task_fanout.min(remaining_tasks.min(task_limit + U(1)) - pending).resized
       stepIndex := destLength + chunk_size
 
       state := overall_state.s_doTrace
@@ -94,7 +108,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
 
   when(state === overall_state.s_doTrace){
     io.Process2Trace.Valid := True
-    io.Process2Trace.OopType := PartialArrayOop
+    io.Process2Trace.OopType := oopType
     io.Process2Trace.SrcOopPtr := srcOopPtr
     io.Process2Trace.DestOopPtr := destOopPtr
     io.Process2Trace.ArrayLength := srcLength
@@ -113,4 +127,8 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
       state := overall_state.s_idle
     }
   }
+}
+
+object GCArrayProcessVerilog extends App {
+  Config.spinal.generateVerilog(new GCArrayProcess())
 }

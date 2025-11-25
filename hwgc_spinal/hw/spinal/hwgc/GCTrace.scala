@@ -20,7 +20,7 @@ case class StageData() extends Bundle with GCParameters with HWParameters {
 class GCTrace extends Module with GCParameters with HWParameters{
   val io = new Bundle {
     val TraceMMUIO = master(new TraceMReq2MMU(GCoopWorkStages, 4))
-    val DebugInfo = in(new DebugInfoIO)
+    val DebugTimeStampe = in UInt(MMUDataWidth bits)
     val ToTrace = slave(new GCProcess2Trace)
     val Trace2Stack = master Stream UInt(MMUAddrWidth bits)
     val Trace2Aop = master(new AopParameters)
@@ -48,6 +48,10 @@ class GCTrace extends Module with GCParameters with HWParameters{
   io.Trace2Stack.valid := False
   io.Trace2Stack.payload.clearAll()
 
+  io.Trace2Aop.Valid := False
+  io.Trace2Aop.ParScanThreadStatePtr := U(0)
+  io.Trace2Aop.DestOopPtr := U(0)
+
   // State Machine
   object overall_state extends SpinalEnum {
     val s_idle, s_arrayPush, s_arrayTrace, s_refKlassTrace, s_staticTrace, s_oopTrace, s_end = newElement()
@@ -61,8 +65,8 @@ class GCTrace extends Module with GCParameters with HWParameters{
     traceTaskFifo.io.push.valid := False
     when(!issued) {
       traceTaskFifo.io.push.valid := True
-      traceTaskFifo.io.push.payload.src := src
-      traceTaskFifo.io.push.payload.dest := dest
+      traceTaskFifo.io.push.payload.src := src.resize(MMUAddrWidth bits)
+      traceTaskFifo.io.push.payload.dest := dest.resize(MMUAddrWidth bits)
       issued := True
     }
     val pushed = traceTaskFifo.io.push.fire
@@ -73,19 +77,19 @@ class GCTrace extends Module with GCParameters with HWParameters{
 
   val RegionAttrBase = RegInit(U(0, MMUAddrWidth bits))
   val RegionAttrBiasedBase = RegInit(U(0, MMUAddrWidth bits))
-  val RegionAttrShiftBy = RegInit(U(0, IntWidth bits))
-  val HeapRegionBias = RegInit(U(0, IntWidth bits))
-  val HeapRegionShiftBy = RegInit(U(0, IntWidth bits))
+  val RegionAttrShiftBy = RegInit(U(0, 32 bits))
+  val HeapRegionBias = RegInit(U(0, 32 bits))
+  val HeapRegionShiftBy = RegInit(U(0, 32 bits))
   val HumongousReclaimCandidatesBoolBase = RegInit(U(0, MMUAddrWidth bits))
   val ParScanThreadStatePtr = RegInit(U(0, MMUAddrWidth bits))
   val KlassPtr = RegInit(U(0, MMUAddrWidth bits))
   val SrcOopPtr = RegInit(U(0, MMUAddrWidth bits))
   val DestOopPtr = RegInit(U(0, MMUAddrWidth bits))
-  val Kid = RegInit(U(0, IntWidth bits))
-  val ArrayLength = RegInit(U(0, IntWidth bits))
-  val PartialArrayStart = RegInit(U(0, IntWidth bits))
-  val StepIndex = RegInit(U(0, IntWidth bits))
-  val StepNCreate = RegInit(U(0, IntWidth bits))
+  val Kid = RegInit(U(0, 32 bits))
+  val ArrayLength = RegInit(U(0, 32 bits))
+  val PartialArrayStart = RegInit(U(0, 32 bits))
+  val StepIndex = RegInit(U(0, 32 bits))
+  val StepNCreate = RegInit(U(0, 32 bits))
 
   when(state === overall_state.s_idle){
     io.ToTrace.Ready := True
@@ -104,15 +108,15 @@ class GCTrace extends Module with GCParameters with HWParameters{
       DestOopPtr := io.ToTrace.DestOopPtr
       Kid := io.ToTrace.Kid
       ArrayLength := io.ToTrace.ArrayLength
-      PartialArrayStart := Mux(io.ToTrace.OopType === PartialArrayOop, io.ToTrace.PartialArrayStart, U(0))
+      PartialArrayStart := Mux(io.ToTrace.OopType === U(PartialArrayOop), io.ToTrace.PartialArrayStart, U(0))
       StepIndex := io.ToTrace.StepIndex
       StepNCreate := io.ToTrace.StepNCreate
 
-      when(io.ToTrace.OopType === PartialArrayOop || io.ToTrace.Kid === ObjectArrayKlassID){
+      when(io.ToTrace.OopType === U(PartialArrayOop) || io.ToTrace.Kid === U(ObjectArrayKlassID)){
         state := overall_state.s_arrayPush
-      }.elsewhen(io.ToTrace.Kid === InstanceRefKlassID){
+      }.elsewhen(io.ToTrace.Kid === U(InstanceRefKlassID)){
         state := overall_state.s_refKlassTrace
-      }.elsewhen(io.ToTrace.Kid === InstanceMirrorKlassID){
+      }.elsewhen(io.ToTrace.Kid === U(InstanceMirrorKlassID)){
         state := overall_state.s_staticTrace
       }.otherwise{
         state := overall_state.s_oopTrace
@@ -121,7 +125,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
       if(DebugEnable){
         if(DebugEnable){
           report(Seq(
-            "[GCTrace<", io.DebugInfo.DebugTimeStampe,
+            "[GCTrace<", io.DebugTimeStampe,
             ">] GCParse to GCTrace",
             ", RegionAttrBase = ", io.ConfigIO.RegionAttrBase,
             ", RegionAttrBiasedBase = ", io.ConfigIO.RegionAttrBiasedBase,
@@ -145,15 +149,14 @@ class GCTrace extends Module with GCParameters with HWParameters{
     }
   }
 
-  val for_counter = RegInit(U(0, IntWidth bits))
+  val for_counter = RegInit(U(0, 32 bits))
   when(state === overall_state.s_arrayPush){
     when(for_counter === StepNCreate){
       state := overall_state.s_arrayTrace
     }.otherwise{
       io.Trace2Stack.valid := True
-      io.Trace2Stack.payload := SrcOopPtr + PartialArrayTag
+      io.Trace2Stack.payload := SrcOopPtr + U(PartialArrayTag)
       when(io.Trace2Stack.fire){
-        io.Trace2Stack.valid := False
         for_counter := for_counter + U(1)
       }
     }
@@ -164,8 +167,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
     depth = 8
   )
   traceTaskFifo.io.push.valid := False
-  traceTaskFifo.io.push.clearAll()
-  traceTaskFifo.io.pop.ready := False
+  traceTaskFifo.io.push.payload.clearAll()
 
   val doOopWork = new Area{
     // MMU req and resp
@@ -189,12 +191,14 @@ class GCTrace extends Module with GCParameters with HWParameters{
     // helper to compute MMU op properties per stage index (pure combinational)
     // return (want, addr, isWrite, wmask, wdata)
     def mmuOpForIndex(i: Int, s: StageData): (Bool, UInt, Bool, UInt, UInt) = {
+      val delta = (s.obj - (HeapRegionBias << HeapRegionShiftBy(5 downto 0))).resize(64 bits)
+      val regionIndex = (delta >> LogOfHRGrainBytes).resize(64 bits)
       i match {
         case 0 => (True, s.src, False, U(0), U(0))
         case 1 => (True, RegionAttrBiasedBase + (s.obj >> RegionAttrShiftBy) * GCHeapRegionAttr_Size, False, U(0), U(0))
-        case 3 => (True, HumongousReclaimCandidatesBoolBase + ((s.obj - (HeapRegionBias << HeapRegionShiftBy)) >> LogOfHRGrainBytes), False, U(0), U(0))
-        case 4 => (True, HumongousReclaimCandidatesBoolBase + ((s.obj - (HeapRegionBias << HeapRegionShiftBy)) >> LogOfHRGrainBytes), True, U(1), U(0))
-        case 5 => (True, RegionAttrBase + ((s.obj - (HeapRegionBias << HeapRegionShiftBy)) >> LogOfHRGrainBytes) * GCHeapRegionAttr_Size + TypeOffSet, True, U(1), U(Type_NoInCset))
+        case 3 => (True, HumongousReclaimCandidatesBoolBase + regionIndex, False, U(0), U(0))
+        case 4 => (True, HumongousReclaimCandidatesBoolBase + regionIndex, True, oneByteOnes, U(0))
+        case 5 => (True, RegionAttrBase + regionIndex * GCHeapRegionAttr_Size + U(TypeOffSet), True, U(1), S(Type_NoInCset, 8 bits).asUInt) // U(-1) literal value is negative and cannot be represented -> S(-1, bits).asUInt
         case 6 => (True, ParScanThreadStatePtr + OBJCLOSURE_OFFSET + SCANNING_IN_YOUNG_OFFSET, False, U(0), U(0))
         case _ =>  (False, U(0), False, U(0), U(0))
       }
@@ -215,7 +219,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
       val mreq = io.TraceMMUIO.oopWorkMReqs(i)
       val (want, addr, isWrite, wmask, wdata) = mmuOpForIndex(i, s.reg)
       when(s.valid && !s.reqDone && want) {
-        issueReq(mreq, addr, isWrite, wmask, wdata, s.reqIssued) { rd =>
+        issueReq(mreq, addr.resized, isWrite, wmask.resized, wdata.resized, s.reqIssued) { rd =>
           s.reqDone := True
           s.responseData := rd
         }
@@ -232,8 +236,11 @@ class GCTrace extends Module with GCParameters with HWParameters{
               when(s.responseData === U(0)){
                 resetStage(0)
               }.elsewhen(!stages(1).valid){
-                transferStage(0, 1)
+                stages(1).valid := True
+                stages(1).reg.src := stages(0).reg.src
+                stages(1).reg.dest := stages(0).reg.dest
                 stages(1).reg.obj := s.responseData
+                stages(1).reg.regionAttr := stages(0).reg.regionAttr
               }
             }
           case 1 =>
@@ -241,17 +248,26 @@ class GCTrace extends Module with GCParameters with HWParameters{
               val regionAttrType = s.responseData(15 downto 8)
               when(regionAttrType.asSInt >= Type_Young){
                 when(!stages(2).valid){
-                  transferStage(1, 2)
+                  stages(2).valid := True
+                  stages(2).reg.src := stages(1).reg.src
+                  stages(2).reg.dest := stages(1).reg.dest
+                  stages(2).reg.obj := stages(1).reg.obj
                   stages(2).reg.regionAttr := s.responseData(15 downto 0)
                 }
-              }.elsewhen((s.reg.dest ^ s.reg.obj) >> LogOfHRGrainBytes =/= 0){
-                when(regionAttrType === U(Type_Humongous)){
+              }.elsewhen((s.reg.dest ^ s.reg.obj) >> U(LogOfHRGrainBytes) =/= 0){
+                when(regionAttrType === S(Type_Humongous, 8 bits).asUInt){
                   when(!stages(3).valid){
-                    transferStage(1, 3)
+                    stages(3).valid := True
+                    stages(3).reg.src := stages(1).reg.src
+                    stages(3).reg.dest := stages(1).reg.dest
+                    stages(3).reg.obj := stages(1).reg.obj
                     stages(3).reg.regionAttr := s.responseData(15 downto 0)
                   }
                 }.elsewhen(!stages(6).valid){
-                  transferStage(1, 6)
+                  stages(6).valid := True
+                  stages(6).reg.src := stages(1).reg.src
+                  stages(6).reg.dest := stages(1).reg.dest
+                  stages(6).reg.obj := stages(1).reg.obj
                   stages(6).reg.regionAttr := s.responseData(15 downto 0)
                 }
               }.otherwise{
@@ -307,8 +323,8 @@ class GCTrace extends Module with GCParameters with HWParameters{
     val done = traceTaskFifo.io.occupancy === U(0) && !anyValid && io.Trace2Aop.Done
   }
 
-  val p = RegInit(U(0, IntWidth bits))
-  val q = RegInit(U(0, IntWidth bits))
+  val p = RegInit(U(0, 32 bits))
+  val q = RegInit(U(0, 32 bits))
   val arrayTrace_subState = RegInit(sub_state.s_0)
   val issued_arrayPush = RegInit(False)
   when(state === overall_state.s_arrayTrace){
@@ -317,8 +333,8 @@ class GCTrace extends Module with GCParameters with HWParameters{
         //assign p, q and prev_state
         val low = DestOopPtr + ArrayElementOff + PartialArrayStart * GCObjectPtr_Size
         val high = DestOopPtr + ArrayElementOff + StepIndex * GCObjectPtr_Size
-        p := Mux(DestOopPtr + ArrayElementOff < low, low, DestOopPtr + ArrayElementOff)
-        q := Mux(DestOopPtr + ArrayElementOff + ArrayLength * GCObjectPtr_Size > high, high, DestOopPtr + ArrayElementOff + ArrayLength * GCObjectPtr_Size)
+        p := Mux(DestOopPtr + ArrayElementOff < low, low, DestOopPtr + ArrayElementOff).resized
+        q := Mux(DestOopPtr + ArrayElementOff + ArrayLength * GCObjectPtr_Size > high, high, DestOopPtr + ArrayElementOff + ArrayLength * GCObjectPtr_Size).resized
 
         arrayTrace_subState := sub_state.s_1
       }
@@ -379,8 +395,8 @@ class GCTrace extends Module with GCParameters with HWParameters{
         //access (SrcOopPtr + staticOopFieldOff)
         val addr = SrcOopPtr + staticOopFieldCountOff
         issueReq(io.TraceMMUIO.staticMReq, addr, False, U(0), U(0), staticReqIssue) {rd =>
-          p := SrcOopPtr + StaticFieldOff
-          q := SrcOopPtr + StaticFieldOff + rd(31 downto 0) * GCObjectPtr_Size
+          p := (SrcOopPtr + StaticFieldOff).resized
+          q := (SrcOopPtr + StaticFieldOff + rd(31 downto 0) * GCObjectPtr_Size).resized
           staticTrace_subState := sub_state.s_1
         }
       }
@@ -399,9 +415,9 @@ class GCTrace extends Module with GCParameters with HWParameters{
   }
 
   val oopTrace_subState = RegInit(sub_state.s_0)
-  val vtable_len = RegInit(U(0, IntWidth bits))
-  val itable_len = RegInit(U(0, IntWidth bits))
-  val nonstaticOopMapSize = RegInit(U(0, IntWidth bits))
+  val vtable_len = RegInit(U(0, 32 bits))
+  val itable_len = RegInit(U(0, 32 bits))
+  val nonstaticOopMapSize = RegInit(U(0, 32 bits))
 
   val start_map = RegInit(U(0, MMUAddrWidth bits))
   val end_map = RegInit(U(0, MMUAddrWidth bits))
@@ -440,8 +456,8 @@ class GCTrace extends Module with GCParameters with HWParameters{
           // access p and q
           val addr = end_map - GCObjectPtr_Size
           issueReq(io.TraceMMUIO.oopTraceMReqs(3), addr, False, U(0), U(0), oopReq(2)) {rd =>
-            p := DestOopPtr + rd(31 downto 0)
-            q := DestOopPtr + rd(31 downto 0) + rd(63 downto 32) * GCObjectPtr_Size - GCObjectPtr_Size
+            p := (DestOopPtr + rd(31 downto 0)).resized
+            q := (DestOopPtr + rd(31 downto 0) + rd(63 downto 32) * GCObjectPtr_Size - GCObjectPtr_Size).resized
             oopTrace_subState := sub_state.s_4
           }
         }.otherwise{
@@ -453,14 +469,14 @@ class GCTrace extends Module with GCParameters with HWParameters{
 
       }
       is(sub_state.s_4) {
-        when(p < q + GCObjectPtr_Size) {
+        when(p < q + U(GCObjectPtr_Size)) {
           when(pushFifo(q - DestOopPtr + SrcOopPtr, q, issued_oopTrace)){
-            q := q - GCObjectPtr_Size
+            q := q - U(GCObjectPtr_Size)
             issued_oopTrace := False
           }
         }.otherwise {
           oopTrace_subState := sub_state.s_3
-          end_map := end_map - GCObjectPtr_Size
+          end_map := end_map - U(GCObjectPtr_Size)
         }
       }
     }
@@ -470,4 +486,8 @@ class GCTrace extends Module with GCParameters with HWParameters{
     state := overall_state.s_idle
     io.ToTrace.Done := True
   }
+}
+
+object GCTraceVerilog extends App {
+  Config.spinal.generateVerilog(new GCTrace())
 }

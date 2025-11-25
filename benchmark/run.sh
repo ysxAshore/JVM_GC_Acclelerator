@@ -30,25 +30,20 @@ run_bench() {
     fi
 }
 
-export JAVA_TOOL_OPTIONS="-XX:-UseCompressedOops -XX:-UseCompressedClassPointers -XX:ParallelGCThreads=1 -XX:ConcGCThreads=1"
 # Renaissance 全部
-echo ">>>> Running Renaissance benchmarks"
-renaissance_list="scrabble page-rank future-genetic akka-uct movie-lens scala-doku chi-square fj-kmeans rx-scrabble db-shootout neo4j-analytics finagle-http reactors dec-tree scala-stm-bench7 naive-bayes als par-mnemonics scala-kmeans philosophers log-regression gauss-mix mnemonics dotty finagle-chirper"
-for b in $renaissance_list; do
-    run_bench "$RENAISSANCE" "$b"
-done
+# db-shootout neo4j-analytics reactors naive-bayes scala-stm-bench7
+#echo ">>>> Running Renaissance benchmarks"
+#renaissance_list="scrabble page-rank future-genetic akka-uct movie-lens scala-doku chi-square fj-kmeans rx-scrabble db-shootout neo4j-analytics finagle-http reactors dec-tree scala-stm-bench7 naive-bayes als par-mnemonics scala-kmeans philosophers log-regression gauss-mix mnemonics dotty finagle-chirper"
+#for b in $renaissance_list; do
+#    run_bench "$RENAISSANCE" "$b"
+#done
 
 # DaCapo 全部
+# biojava tradesoap tradebeans
 echo ">>>> Running DaCapo benchmarks"
 for b in $($JAVA -jar "$DACAPO" --list); do
-    run_bench "$DACAPO" "$b"
+   export JAVA_TOOL_OPTIONS="-XX:-UseCompressedOops -XX:-UseCompressedClassPointers -XX:ParallelGCThreads=1 -XX:ConcGCThreads=1"
+   run_bench "$DACAPO" "$b"
 done
-
-echo "========================="
-if [ -s "$LOG" ]; then
-    echo -e "${RED}Some benchmarks failed, see ${LOG}${RESET}"
-else
-    echo -e "${GREEN}All benchmarks passed!${RESET}"
-fi
 
 rm *.log

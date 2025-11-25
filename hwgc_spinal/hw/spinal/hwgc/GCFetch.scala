@@ -16,11 +16,21 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
   // default value
   io.Stack2Fetch.ready := False
+
   io.Fetch2ArrayProcess.Valid := False
+  io.Fetch2ArrayProcess.Task := U(0)
+  io.Fetch2ArrayProcess.OopType := U(0)
+  io.Fetch2ArrayProcess.SrcOopPtr := U(0)
+  io.Fetch2ArrayProcess.MarkWord := U(0)
+
   io.Fetch2OopProcess.Valid := False
+  io.Fetch2OopProcess.Task := U(0)
+  io.Fetch2OopProcess.OopType := U(0)
+  io.Fetch2OopProcess.SrcOopPtr := U(0)
+  io.Fetch2OopProcess.MarkWord := U(0)
+
   io.FetchMReq.Request.valid := False
   io.FetchMReq.Request.payload.clearAll()
-  io.FetchMReq.Response.payload.clearAll()
   io.FetchMReq.Response.ready := False
 
   object overall_state extends SpinalEnum {
@@ -42,10 +52,10 @@ class GCFetch extends Module with HWParameters with GCParameters {
     when(io.Stack2Fetch.fire){
       val payload = io.Stack2Fetch.payload
       when(payload(GCOopTypeWidth - 1 downto 0) === U(OopTag)){
-        oopType := U(OopTag)
+        oopType := U(CommonOop)
         task := payload - U(OopTag)
       }.otherwise{
-        oopType := U(PartialArrayTag)
+        oopType := U(PartialArrayOop)
         task := payload - U(PartialArrayTag)
       }
 
@@ -53,13 +63,13 @@ class GCFetch extends Module with HWParameters with GCParameters {
       issued := False
       memData := U(0)
 
-      state := overall_state.s_loadMem
+      state := overall_state.s_readOop
     }
   }
 
   // readOop: oopTag -> send mreq
   when(state === overall_state.s_readOop){
-    when(oopType === U(OopTag)){
+    when(oopType === U(CommonOop)){
      issueReq(io.FetchMReq, task, False, U(0), U(0), issued){ rd =>
        memData := rd
        state := overall_state.s_readMW
@@ -81,13 +91,21 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
   // send
   when(state === overall_state.s_send){
-    val processUnit = Mux(oopType === U(OopTag), io.Fetch2OopProcess, io.Fetch2ArrayProcess)
-    processUnit.Valid := True
-
-    processUnit.OopType := oopType
-    processUnit.SrcOopPtr := memData
-    processUnit.MarkWord := markWord
-
+    when(oopType === U(CommonOop)){
+      io.Fetch2OopProcess.Valid := True
+      io.Fetch2OopProcess.Task := task
+      io.Fetch2OopProcess.OopType := oopType
+      io.Fetch2OopProcess.SrcOopPtr := memData
+      io.Fetch2OopProcess.MarkWord := markWord
+    }.otherwise{
+      io.Fetch2ArrayProcess.Valid := True
+      io.Fetch2ArrayProcess.Task := task
+      io.Fetch2ArrayProcess.OopType := oopType
+      io.Fetch2ArrayProcess.SrcOopPtr := memData
+      io.Fetch2ArrayProcess.MarkWord := markWord
+    }
+    // Mux(cond, A, B)会生成 A 和 B 同时被驱动的逻辑路径，是根据组合逻辑选择数据
+    val processUnit = Mux(oopType === U(CommonOop), io.Fetch2OopProcess, io.Fetch2ArrayProcess)
     when(processUnit.Valid && processUnit.Ready){
       state := overall_state.s_waitDone
     }
@@ -95,9 +113,13 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
   // waitDone
   when(state === overall_state.s_waitDone){
-    val processUnit = Mux(oopType === U(OopTag), io.Fetch2OopProcess, io.Fetch2ArrayProcess)
+    val processUnit = Mux(oopType === U(CommonOop), io.Fetch2OopProcess, io.Fetch2ArrayProcess)
     when(processUnit.Done){
       state := overall_state.s_idle
     }
   }
+}
+
+object GCFetchVerilog extends App {
+  Config.spinal.generateVerilog(new GCFetch())
 }

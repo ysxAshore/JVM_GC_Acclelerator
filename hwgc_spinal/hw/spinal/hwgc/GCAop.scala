@@ -5,7 +5,7 @@ import spinal.lib._
 
 import scala.language.postfixOps
 
-case class StageData() extends Bundle with HWParameters{
+case class AopStageData() extends Bundle with HWParameters{
   val dest = UInt(MMUAddrWidth bits)
   val pss = UInt(MMUAddrWidth bits)
   val ct_ptr = UInt(MMUAddrWidth bits)
@@ -16,7 +16,7 @@ case class StageData() extends Bundle with HWParameters{
   val res = UInt(MMUDataWidth bits)
 }
 
-class GCAop extends Bundle with GCParameters with HWParameters {
+class GCAop extends Module with GCParameters with HWParameters {
   val io = new Bundle{
     val Aop = slave (new AopParameters)
     val aopMReqs = Vec.fill(GCaopWorkStages)(new LocalMMUIO)
@@ -33,14 +33,12 @@ class GCAop extends Bundle with GCParameters with HWParameters {
   val stages = Seq.tabulate(GCaopWorkStages) { _ =>
     new Area {
       val valid = RegInit(False)
-      val reg = Reg(StageData().getZero)
+      val reg = Reg(AopStageData().getZero)
       val reqDone = RegInit(False)
       val reqIssued = RegInit(False)
       val responseData = RegInit(U(0, MMUDataWidth bits))
     }
   }
-
-  val allBytesOnes = U((BigInt(1) << (MMUDataWidth / 8)) - 1, MMUDataWidth / 8 bits)
 
   // @todo : Aop backpressure -> (!stages(0).valid) && (!stages(1).valid || stages(1).reqDone)
   io.Aop.Ready := !stages(0).valid
@@ -52,7 +50,7 @@ class GCAop extends Bundle with GCParameters with HWParameters {
     stages(0).reg.dest := io.Aop.DestOopPtr
   }
 
-  def mmuOpForIndex(i: Int, s: StageData): (Bool, UInt, Bool, UInt, UInt) = {
+  def mmuOpForIndex(i: Int, s: AopStageData): (Bool, UInt, Bool, UInt, UInt) = {
     i match {
       case 0 => (True, s.pss + PSS_CARD_TABLE_OFFSET, False, U(0), U(0))
       case 1 => (True, s.ct_ptr + BYTE_MAP_OFFSET, False, U(0), U(0))
@@ -82,7 +80,7 @@ class GCAop extends Bundle with GCParameters with HWParameters {
     val mreq = io.aopMReqs(i)
     val (want, addr, isWrite, wmask, wdata) = mmuOpForIndex(i, s.reg)
     when(s.valid && !s.reqDone && want) {
-      issueReq(mreq, addr, isWrite, wmask, wdata, s.reqIssued) { rd =>
+      issueReq(mreq, addr.resized, isWrite, wmask.resized, wdata.resized, s.reqIssued) { rd =>
         s.reqDone := True
         s.responseData := rd
       }
@@ -97,23 +95,43 @@ class GCAop extends Bundle with GCParameters with HWParameters {
         case 0 =>
           when(s.reqDone){
             when(!stages(1).valid){
-              transferStage(0, 1)
+              stages(1).valid := True
+              stages(1).reg.dest := stages(0).reg.dest
+              stages(1).reg.pss := stages(0).reg.pss
+              stages(1).reg.byte_map := stages(0).reg.byte_map
+              stages(1).reg.card_index := stages(0).reg.card_index
+              stages(1).reg.index := stages(0).reg.index
+              stages(1).reg.buffer:= stages(0).reg.buffer
+              stages(1).reg.res := stages(0).reg.res
               stages(1).reg.ct_ptr := s.responseData
             }
           }
         case 1 =>
           when(s.reqDone){
             when(!stages(2).valid){
-              transferStage(1, 2)
+              stages(2).valid := True
+              stages(2).reg.dest := stages(1).reg.dest
+              stages(2).reg.pss := stages(1).reg.pss
               stages(2).reg.byte_map := s.responseData
+              stages(2).reg.card_index := stages(1).reg.card_index
+              stages(2).reg.index := stages(1).reg.index
+              stages(2).reg.buffer:= stages(1).reg.buffer
+              stages(2).reg.res := stages(1).reg.res
+              stages(2).reg.ct_ptr := stages(1).reg.ct_ptr
             }
           }
         case 2 =>
           when(s.reqDone){
             when(!stages(3).valid){
-              transferStage(2, 3)
-              stages(3).reg.res := s.responseData + (s.reg.dest >> 9)
+              stages(3).valid := True
+              stages(3).reg.dest := stages(2).reg.dest
+              stages(3).reg.pss := stages(2).reg.pss
+              stages(3).reg.byte_map := stages(2).reg.byte_map
               stages(3).reg.card_index := s.responseData + (s.reg.dest >> 9) - s.reg.byte_map
+              stages(3).reg.index := stages(2).reg.index
+              stages(3).reg.buffer:= stages(2).reg.buffer
+              stages(3).reg.res := s.responseData + (s.reg.dest >> 9)
+              stages(3).reg.ct_ptr := stages(2).reg.ct_ptr
             }
           }
         case 3 =>
@@ -127,20 +145,41 @@ class GCAop extends Bundle with GCParameters with HWParameters {
         case 4 =>
           when(s.reqDone){
             when(!stages(5).valid){
-              transferStage(4, 5)
+              stages(5).valid := True
+              stages(5).reg.dest := stages(4).reg.dest
+              stages(5).reg.pss := stages(4).reg.pss
+              stages(5).reg.byte_map := stages(4).reg.byte_map
+              stages(5).reg.card_index := stages(4).reg.card_index
               stages(5).reg.index := s.responseData / U(8)
+              stages(5).reg.buffer:= stages(4).reg.buffer
+              stages(5).reg.res := stages(4).reg.res
+              stages(5).reg.ct_ptr := stages(4).reg.ct_ptr
             }
           }
         case 5 =>
           when(s.reqDone){
             when(s.reg.index === U(0)){
               when(!stages(6).valid){
-                transferStage(5, 6)
-                stages(6).reg.buffer := s.responseData
+                stages(6).valid := True
+                stages(6).reg.dest := stages(5).reg.dest
+                stages(6).reg.pss := stages(5).reg.pss
+                stages(6).reg.byte_map := stages(5).reg.byte_map
+                stages(6).reg.card_index := stages(5).reg.card_index
+                stages(6).reg.index := stages(5).reg.index
+                stages(6).reg.buffer:= s.responseData
+                stages(6).reg.res := stages(5).reg.res
+                stages(6).reg.ct_ptr := stages(5).reg.ct_ptr
               }
             }.elsewhen(!stages(7).valid){
-              transferStage(5, 7)
-              stages(7).reg.buffer := s.responseData
+              stages(7).valid := True
+              stages(7).reg.dest := stages(5).reg.dest
+              stages(7).reg.pss := stages(5).reg.pss
+              stages(7).reg.byte_map := stages(5).reg.byte_map
+              stages(7).reg.card_index := stages(5).reg.card_index
+              stages(7).reg.index := stages(5).reg.index
+              stages(7).reg.buffer:= s.responseData
+              stages(7).reg.res := stages(5).reg.res
+              stages(7).reg.ct_ptr := stages(5).reg.ct_ptr
             }
           }
         case 6 =>
@@ -159,4 +198,8 @@ class GCAop extends Bundle with GCParameters with HWParameters {
       }
     }
   }
+}
+
+object GCAopVerilog extends App{
+  Config.spinal.generateVerilog(new GCAop())
 }
