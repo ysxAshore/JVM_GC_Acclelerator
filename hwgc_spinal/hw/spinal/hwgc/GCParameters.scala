@@ -201,6 +201,34 @@ trait HWParameters {
       onResp(rd) // callback to let caller handle response data
     }
   }
+
+  def process2stream(p : GCProcess2Trace): Stream[GCTracePayload] = {
+    val s = Stream(GCTracePayload())
+
+    s.valid := p.Valid
+    s.payload.OopType := p.OopType
+    s.payload.KlassPtr := p.KlassPtr
+    s.payload.SrcOopPtr := p.SrcOopPtr
+    s.payload.DestOopPtr := p.DestOopPtr
+    s.payload.Kid := p.Kid
+    s.payload.ArrayLength := p.ArrayLength
+    s.payload.PartialArrayStart := p.PartialArrayStart
+    s.payload.StepIndex := p.StepIndex
+    s.payload.StepNCreate := p.StepNCreate
+
+    p.Ready := s.ready
+    s
+  }
+
+  def aop2stream(p : AopParameters) : Stream[GCAopPayload] = {
+    val s = Stream(GCAopPayload())
+    s.valid := p.Valid
+    s.payload.ParScanThreadStatePtr := p.ParScanThreadStatePtr
+    s.payload.DestOopPtr := p.DestOopPtr
+
+    p.Ready := s.ready
+    s
+  }
 }
 
 class ProcessUnit extends Bundle with HWParameters with GCParameters with IMasterSlave {
@@ -219,6 +247,18 @@ class ProcessUnit extends Bundle with HWParameters with GCParameters with IMaste
     in(Ready, Done, DestOopPtr)
     out(Valid, Task, OopType, SrcOopPtr, MarkWord)
   }
+}
+
+case class GCTracePayload() extends Bundle with HWParameters with GCParameters {
+  val OopType = UInt(GCOopTypeWidth bits)
+  val KlassPtr = UInt(MMUAddrWidth bits)
+  val SrcOopPtr = UInt(MMUAddrWidth bits)
+  val DestOopPtr = UInt(MMUAddrWidth bits)
+  val Kid = UInt(32 bits)
+  val ArrayLength = UInt(32 bits)
+  val PartialArrayStart = UInt(32 bits)
+  val StepIndex = UInt(32 bits)
+  val StepNCreate = UInt(32 bits)
 }
 
 class GCProcess2Trace extends Bundle with HWParameters with GCParameters with IMasterSlave{
@@ -249,8 +289,8 @@ class GCProcess2Copy extends Bundle with HWParameters with GCParameters with IMa
   val Done = out Bool()
 
   // some parse module caculate parameters
-  val SrcOopPtr = in UInt(MMUAddrWidth bits)
   val DestOopPtr = in UInt(MMUAddrWidth bits)
+  val SrcOopPtr = in UInt(MMUAddrWidth bits)
   val Size = in UInt(MMUDataWidth bits)
 
   override def asMaster(): Unit = {
@@ -301,8 +341,8 @@ class GCTraceConfigIO extends Bundle with HWParameters with IMasterSlave{
   val ParScanThreadStatePtr = in UInt(MMUAddrWidth bits)
 
   override def asMaster(): Unit = {
-   out(RegionAttrBase, RegionAttrBiasedBase, RegionAttrShiftBy, HeapRegionBias, HeapRegionShiftBy, HumongousReclaimCandidatesBoolBase, ParScanThreadStatePtr)
-   in()
+    out(RegionAttrBase, RegionAttrBiasedBase, RegionAttrShiftBy, HeapRegionBias, HeapRegionShiftBy, HumongousReclaimCandidatesBoolBase, ParScanThreadStatePtr)
+    in()
   }
 }
 
@@ -331,6 +371,11 @@ class TraceMReq2MMU(oopWorkStage:Int, oopTraceStates:Int) extends Bundle with IM
     master(staticMReq)
     oopTraceMReqs.foreach(master(_))
   }
+}
+
+case class GCAopPayload() extends Bundle with HWParameters with GCParameters{
+  val ParScanThreadStatePtr = UInt(MMUAddrWidth bits)
+  val DestOopPtr = UInt(MMUAddrWidth bits)
 }
 
 class AopParameters extends Bundle with HWParameters with IMasterSlave{

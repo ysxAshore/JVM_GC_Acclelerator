@@ -23,7 +23,7 @@ class GCLocalMMU extends Module with HWParameters with GCParameters {
     io.localMMUIOs(i).ConherentRequsetSourceID.valid := False
     io.localMMUIOs(i).ConherentRequsetSourceID.payload.clearAll()
     io.localMMUIOs(i).Response.valid := False
-    io.localMMUIOs(i).Response.payload.assignAllByName(io.LastLevelCacheTLIO.Response.payload)
+    io.localMMUIOs(i).Response.payload.clearAll()
   }
 
   val sourceid2port =  RegInit(Vec(Seq.fill(LLCSourceMaxNum)(U(0,log2Up(LocalMMUTaskType.TaskTypeMax) bits))))
@@ -68,8 +68,13 @@ class GCLocalMMU extends Module with HWParameters with GCParameters {
   }
 
   val response_index = sourceid2port(io.LastLevelCacheTLIO.Response.payload.ResponseSourceID.resized)
-  io.localMMUIOs(response_index).Response.valid := io.LastLevelCacheTLIO.Response.valid
-  io.LastLevelCacheTLIO.Response.ready := io.localMMUIOs(response_index).Response.ready
+  when(io.LastLevelCacheTLIO.Response.valid){
+    io.localMMUIOs(response_index).Response.valid := True
+    io.LastLevelCacheTLIO.Response.ready := io.localMMUIOs(response_index).Response.ready
+    io.localMMUIOs(response_index).Response.payload.assignAllByName(io.LastLevelCacheTLIO.Response.payload)
+  }.otherwise{
+    io.LastLevelCacheTLIO.Response.ready := False
+  }
 }
 
 object GCLocalMMUVerilog extends App{

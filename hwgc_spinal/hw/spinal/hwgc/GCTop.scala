@@ -1,7 +1,7 @@
 package hwgc
 
 import spinal.core._
-import spinal.lib.StreamArbiter
+import spinal.lib._
 
 import scala.language.postfixOps
 
@@ -86,32 +86,77 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcOop2CopySurvivor.io.ConfigIO.HeapRegionShiftBy := HeapRegionShiftBy
 
   // GCTrace
-  val useArray = gcArrayProcess.io.Process2Trace.Valid
-  gcTrace.io.ToTrace.Valid := Mux(useArray, gcArrayProcess.io.Process2Trace.Valid, gcOop2CopySurvivor.io.Process2Trace.Valid)
-  gcTrace.io.ToTrace.OopType := Mux(useArray, gcArrayProcess.io.Process2Trace.OopType, gcOop2CopySurvivor.io.Process2Trace.OopType)
-  gcTrace.io.ToTrace.KlassPtr := Mux(useArray, gcArrayProcess.io.Process2Trace.KlassPtr, gcOop2CopySurvivor.io.Process2Trace.KlassPtr)
-  gcTrace.io.ToTrace.SrcOopPtr := Mux(useArray, gcArrayProcess.io.Process2Trace.SrcOopPtr, gcOop2CopySurvivor.io.Process2Trace.SrcOopPtr)
-  gcTrace.io.ToTrace.DestOopPtr := Mux(useArray, gcArrayProcess.io.Process2Trace.DestOopPtr, gcOop2CopySurvivor.io.Process2Trace.DestOopPtr)
-  gcTrace.io.ToTrace.Kid := Mux(useArray, gcArrayProcess.io.Process2Trace.Kid, gcOop2CopySurvivor.io.Process2Trace.Kid)
-  gcTrace.io.ToTrace.ArrayLength := Mux(useArray, gcArrayProcess.io.Process2Trace.ArrayLength, gcOop2CopySurvivor.io.Process2Trace.ArrayLength)
-  gcTrace.io.ToTrace.PartialArrayStart := Mux(useArray, gcArrayProcess.io.Process2Trace.PartialArrayStart, gcOop2CopySurvivor.io.Process2Trace.PartialArrayStart)
-  gcTrace.io.ToTrace.StepIndex := Mux(useArray, gcArrayProcess.io.Process2Trace.StepIndex, gcOop2CopySurvivor.io.Process2Trace.StepIndex)
-  gcTrace.io.ToTrace.StepNCreate := Mux(useArray, gcArrayProcess.io.Process2Trace.StepNCreate, gcOop2CopySurvivor.io.Process2Trace.StepNCreate)
+  val arrayStream = process2stream(gcArrayProcess.io.Process2Trace)
+  val oopStream = process2stream(gcOop2CopySurvivor.io.Process2Trace)
 
-  gcArrayProcess.io.Process2Trace.Ready := gcTrace.io.ToTrace.Ready
-  gcArrayProcess.io.Process2Trace.Done := gcTrace.io.ToTrace.Done
-  gcOop2CopySurvivor.io.Process2Trace.Ready := gcTrace.io.ToTrace.Ready
-  gcOop2CopySurvivor.io.Process2Trace.Done := gcTrace.io.ToTrace.Done
+ // val arb = StreamArbiterFactory.lowerFirst.onArgs(arrayStream, oopStream)
+  val arb_trace = StreamArbiterFactory.lowerFirst.build(GCTracePayload(), 2)
 
-  val useTrace = gcTrace.io.Trace2Aop.Valid
-  gcAop.io.Aop.Valid := Mux(useTrace, gcTrace.io.Trace2Aop.Valid, gcOopProcess.io.Process2Aop.Valid)
-  gcAop.io.Aop.ParScanThreadStatePtr := Mux(useTrace,gcTrace.io.Trace2Aop.ParScanThreadStatePtr, gcOopProcess.io.Process2Aop.ParScanThreadStatePtr)
-  gcAop.io.Aop.DestOopPtr := Mux(useTrace,gcTrace.io.Trace2Aop.DestOopPtr, gcOopProcess.io.Process2Aop.DestOopPtr)
+  arb_trace.io.inputs(0) << arrayStream
+  arb_trace.io.inputs(1) << oopStream
 
-  gcOopProcess.io.Process2Aop.Ready := gcAop.io.Aop.Ready
-  gcOopProcess.io.Process2Aop.Done := gcAop.io.Aop.Done
-  gcTrace.io.Trace2Aop.Ready := gcAop.io.Aop.Ready
-  gcTrace.io.Trace2Aop.Done := gcAop.io.Aop.Done
+  gcTrace.io.ToTrace.Valid := arb_trace.io.output.valid
+  gcTrace.io.ToTrace.OopType := arb_trace.io.output.payload.OopType
+  gcTrace.io.ToTrace.KlassPtr := arb_trace.io.output.payload.KlassPtr
+  gcTrace.io.ToTrace.SrcOopPtr := arb_trace.io.output.payload.SrcOopPtr
+  gcTrace.io.ToTrace.DestOopPtr := arb_trace.io.output.payload.DestOopPtr
+  gcTrace.io.ToTrace.Kid := arb_trace.io.output.payload.Kid
+  gcTrace.io.ToTrace.ArrayLength := arb_trace.io.output.payload.ArrayLength
+  gcTrace.io.ToTrace.PartialArrayStart := arb_trace.io.output.payload.PartialArrayStart
+  gcTrace.io.ToTrace.StepIndex := arb_trace.io.output.payload.StepIndex
+  gcTrace.io.ToTrace.StepNCreate := arb_trace.io.output.payload.StepNCreate
+
+  arb_trace.io.output.ready := gcTrace.io.ToTrace.Ready
+
+  gcArrayProcess.io.Process2Trace.Done := False
+  gcOop2CopySurvivor.io.Process2Trace.Done := False
+  val currentId_trace = RegInit(U(0, 1 bits))
+  val working_trace = RegInit(False)
+
+  when(arb_trace.io.output.fire){
+    working_trace := True
+    currentId_trace := arb_trace.io.chosen
+  }
+
+  when(working_trace && gcTrace.io.ToTrace.Done){
+    switch(currentId_trace){
+      is(0) {gcArrayProcess.io.Process2Trace.Done := True}
+      is(1) {gcOop2CopySurvivor.io.Process2Trace.Done := True}
+    }
+    working_trace := False
+  }
+
+  val traceAopStream = aop2stream(gcTrace.io.Trace2Aop)
+  val oopAopStream = aop2stream(gcOopProcess.io.Process2Aop)
+
+  val arb_aop = StreamArbiterFactory.lowerFirst.build(GCAopPayload(), 2)
+  arb_aop.io.inputs(0) << traceAopStream
+  arb_aop.io.inputs(1) << oopAopStream
+
+  gcAop.io.Aop.Valid := arb_aop.io.output.valid
+  gcAop.io.Aop.ParScanThreadStatePtr := arb_aop.io.output.payload.ParScanThreadStatePtr
+  gcAop.io.Aop.DestOopPtr := arb_aop.io.output.payload.DestOopPtr
+
+  arb_aop.io.output.ready := gcAop.io.Aop.Ready
+
+  gcOopProcess.io.Process2Aop.Done := False
+  gcTrace.io.Trace2Aop.Done := False
+
+  val currentId_aop = RegInit(U(0, 1 bits))
+  val working_aop = RegInit(False)
+
+  when(arb_aop.io.output.fire){
+    working_aop := True
+    currentId_aop := arb_aop.io.chosen
+  }
+
+  when(working_aop && gcAop.io.Aop.Done){
+    switch(currentId_aop){
+      is(0) {gcTrace.io.Trace2Aop.Done := True}
+      is(1) {gcOopProcess.io.Process2Aop.Done := True}
+    }
+    working_aop := False
+  }
 
   gcTrace.io.ConfigIO.ParScanThreadStatePtr := ParScanThreadStatePtr
   gcTrace.io.ConfigIO.RegionAttrBase := RegionAttrBase
