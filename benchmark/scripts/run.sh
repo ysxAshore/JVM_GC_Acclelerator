@@ -22,7 +22,8 @@ run_bench() {
 	local macro=""
     [[ $b == "cassandra" ]] && macro="-Djava.security.manager=allow"
 
-    if $JAVA $macro -jar "${suite}" "${name}" > "../log/${name}.log" 2> "../log/${name}.log";  then
+ #   if $JAVA "-Xlog:gc+task=info" $macro -jar "${suite}" "${name}" > "../log/${name}.log" 2> "../log/${name}.log";  then
+    if $JAVA $macro -jar "${suite}" "${name}" > "log" 2> "log";  then
         printf "${GREEN}OK${RESET}\n"
     else
         local code=$?
@@ -45,5 +46,6 @@ renaissance_list="scrabble page-rank future-genetic akka-uct movie-lens scala-do
 for b in $renaissance_list; do
     run_bench "$RENAISSANCE" "$b"
 done
-
-rm *.log
+rm log
+rm -rf harness*
+rm -rf scratch

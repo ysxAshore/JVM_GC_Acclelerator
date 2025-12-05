@@ -8,6 +8,7 @@ import scala.language.postfixOps
 /* GCTaskStack
  * @description: As a hardware buffer for the task queue in the JVM Hotspot
  * in HWGC pop and push operate on stack_top
+ * in JVM spillout and readback operate on stack_bottom and queue_bottom
  */
 class GCTaskStack extends Module with GCParameters with HWParameters {
   val io = new Bundle {
@@ -53,18 +54,17 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   io.ConfigIO.Done := False
   io.ConfigIO.TaskReady := False
 
-  val issued_readBottom = RegInit(False)
-  val issued_readAgeTop = RegInit(False)
-  val issued_spill_elems = RegInit(False)
-  val issued_spill_bottom = RegInit(False)
-  val issued_readback_elems = RegInit(False)
-  val issued_readback_bottom = RegInit(False)
+  val issued_memReq = RegInit(False)
 
-  val dispatch_done = stack_top === stack_bottom && queue_bottom === queue_ageTop
-  val task_capacity = (stack_top - stack_bottom) & stack_mask
+  // hwgc stack and jvm queue both are empty meanwhile task all done(fetch module ready can receive new task)
+  val dispatch_done = stack_top === stack_bottom && queue_bottom === queue_ageTop && io.Pop.ready
+  // size is a power of 2 and the usage can be calculated using (top - bottom) & (size - 1)
+  val task_usage = (stack_top - stack_bottom) & stack_mask
 
-  val need_spillOut = task_capacity >= U(GCTaskStack_SpillNeed)
-  val need_readback = task_capacity <= U(GCTaskStack_ReadNeed)
+  // spillout: not need judge queue_bottom and queue_ageTop, becuase in these benchmark 1 << 17 capacity is enough
+  val need_spillOut = task_usage >= U(GCTaskStack_SpillNeed)
+  // readback: need judge queue_bottom and queue_ageTop, because readback can result in jvm queue empty
+  val need_readback = task_usage <= U(GCTaskStack_ReadNeed) && queue_bottom =/= queue_ageTop
 
   val nextTop = WrapInc(stack_top, GCTaskStack_Entry)
   val nextBottom = WrapInc(stack_bottom, GCTaskStack_Entry)
@@ -73,18 +73,13 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   val nextQueueBottom = WrapInc(queue_bottom, GCTaskQueue_Size).resized
   val prevQueueBottom = WrapDec(queue_bottom, GCTaskQueue_Size).resized
 
-  io.Pop.valid := task_capacity =/= U(0)
+  io.Pop.valid := task_usage =/= U(0)
   io.Pop.payload := stack_data(prevTop)
-  io.Push.ready := state === overall_state.s_work && nextTop =/= stack_bottom
+  io.Push.ready := state === overall_state.s_work && nextTop =/= stack_bottom // not full
 
   when(state === overall_state.s_idle){
     //reset issued
-    issued_readBottom := False
-    issued_readAgeTop := False
-    issued_spill_elems := False
-    issued_spill_bottom := False
-    issued_readback_bottom := False
-    issued_readback_elems := False
+    issued_memReq := False
 
     stack_top := U(0)
     stack_bottom := U(0)
@@ -111,13 +106,13 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   when(state === overall_state.s_read){
     switch(readQueue_sub_state){
       is(sub_state.s0){
-        issueReq(io.LocalMMUIO, queue_bottom_addr, False, U(0), U(0), issued_readBottom) { rd =>
+        issueReq(io.LocalMMUIO, queue_bottom_addr, False, U(0), U(0), issued_memReq) { rd =>
           queue_bottom := rd
           readQueue_sub_state := sub_state.s1
         }
       }
       is(sub_state.s1) {
-        issueReq(io.LocalMMUIO, queue_ageTop_addr, False, U(0), U(0), issued_readAgeTop) { rd =>
+        issueReq(io.LocalMMUIO, queue_ageTop_addr, False, U(0), U(0), issued_memReq) { rd =>
           queue_ageTop := rd
           readQueue_sub_state := sub_state.s0
           state := overall_state.s_work
@@ -134,19 +129,20 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
     }
   }
 
-
   when(state === overall_state.s_work){
     // push to stack or pop from stack --- operate on stack_top
-    // push > pop
     when(dispatch_done){
       state := overall_state.s_end
     }.otherwise{
        when(io.Push.fire && !io.Pop.fire){
+         // push: write stack_top and stack top point next
          stack_data(stack_top) := io.Push.payload
          stack_top := nextTop
        }.elsewhen(io.Pop.fire && !io.Push.fire){
+         // pop: read stack_top prev data and stack_top point before
          stack_top := prevTop
        }.elsewhen(io.Pop.fire && io.Push.fire){
+         // meanwhile: read stack_top prev and write stack_top prev, stack_top remain
          stack_data(prevTop) := io.Push.payload
        }
 
@@ -155,12 +151,12 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
        when(need_spillOut){
          switch(spillOut_sub_state){
            is(sub_state.s0){
-             issueReq(io.LocalMMUIO, (queue_elems_base + queue_bottom * GCScannerTask_Size).resized, True, allBytesOnes, stack_data(stack_bottom), issued_spill_elems){ rd =>
+             issueReq(io.LocalMMUIO, (queue_elems_base + queue_bottom * GCScannerTask_Size).resized, True, allBytesOnes, stack_data(stack_bottom), issued_memReq){ rd =>
                spillOut_sub_state := sub_state.s1
              }
            }
            is(sub_state.s1){
-             issueReq(io.LocalMMUIO, queue_bottom_addr, True, allBytesOnes, nextQueueBottom, issued_spill_bottom) { rd =>
+             issueReq(io.LocalMMUIO, queue_bottom_addr, True, allBytesOnes, nextQueueBottom, issued_memReq) { rd =>
                queue_bottom := nextQueueBottom
                stack_bottom := nextBottom
                spillOut_sub_state := sub_state.s0
@@ -170,15 +166,16 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
        }.elsewhen(need_readback){
          switch(readBack_sub_state){
            is(sub_state.s0){
-             issueReq(io.LocalMMUIO, (queue_elems_base + prevQueueBottom * GCScannerTask_Size).resized, False, U(0), U(0), issued_readback_elems) { rd =>
-               when(!io.Push.fire || U(GCTaskStack_Entry) - U(1) - task_capacity  >= U(2)){
+             issueReq(io.LocalMMUIO, (queue_elems_base + prevQueueBottom * GCScannerTask_Size).resized, False, U(0), U(0), issued_memReq) { rd =>
+               // when readback, not push or capacity >= 2(can support one push and readback)
+               when(!io.Push.fire || U(GCTaskStack_Entry) - U(1) - task_usage  >= U(2)){
                  stack_data(prevBottom) := rd
                }
                readBack_sub_state := sub_state.s1
              }
            }
            is(sub_state.s1){
-             issueReq(io.LocalMMUIO, queue_bottom_addr, True, allBytesOnes, prevQueueBottom, issued_readback_bottom){ rd =>
+             issueReq(io.LocalMMUIO, queue_bottom_addr, True, allBytesOnes, prevQueueBottom, issued_memReq){ rd =>
                queue_bottom := prevQueueBottom
                stack_bottom := prevBottom
                readBack_sub_state := sub_state.s0
