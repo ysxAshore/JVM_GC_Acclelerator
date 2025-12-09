@@ -46,17 +46,17 @@ class GCFetch extends Module with HWParameters with GCParameters {
   val issued = RegInit(False)
   val memData = RegInit(U(0, MMUAddrWidth bits))
 
-  // idle: take task from stack
+  // idle: take task from stack and sub the tag
   when(state === overall_state.s_idle){
     io.Stack2Fetch.ready := True
     when(io.Stack2Fetch.fire){
       val payload = io.Stack2Fetch.payload
       when(payload(GCOopTypeWidth - 1 downto 0) === U(OopTag)){
         oopType := U(CommonOop)
-        task := payload - U(OopTag)
+        task := (payload - U(OopTag)).resized
       }.otherwise{
         oopType := U(PartialArrayOop)
-        task := payload - U(PartialArrayTag)
+        task := (payload - U(PartialArrayTag)).resized
       }
 
       // reset mem flags for next task
@@ -91,6 +91,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
   // send
   when(state === overall_state.s_send){
+    // Mux(cond, A, B) could read, but not support write
     when(oopType === U(CommonOop)){
       io.Fetch2OopProcess.Valid := True
       io.Fetch2OopProcess.Task := task
@@ -104,7 +105,6 @@ class GCFetch extends Module with HWParameters with GCParameters {
       io.Fetch2ArrayProcess.SrcOopPtr := memData
       io.Fetch2ArrayProcess.MarkWord := markWord
     }
-    // Mux(cond, A, B)会生成 A 和 B 同时被驱动的逻辑路径，是根据组合逻辑选择数据
     val processUnit = Mux(oopType === U(CommonOop), io.Fetch2OopProcess, io.Fetch2ArrayProcess)
     when(processUnit.Valid && processUnit.Ready){
       state := overall_state.s_waitDone

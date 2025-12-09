@@ -7,8 +7,9 @@ import scala.language.postfixOps
 
 /* GCTaskStack
  * @description: As a hardware buffer for the task queue in the JVM Hotspot
- * in HWGC pop and push operate on stack_top
- * in JVM spillout and readback operate on stack_bottom and queue_bottom
+ *               in HWGC pop and push operate on stack_top
+ *               in JVM spillout and readback operate on stack_bottom and queue_bottom
+ * @parameters: needs Config Parameter--ageTopAddr bottomAddr and Base
  */
 class GCTaskStack extends Module with GCParameters with HWParameters {
   val io = new Bundle {
@@ -19,14 +20,20 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
     val DebugTimeStamp = in(UInt(MMUDataWidth bits))
   }
 
-  // TaskQueue config
+  // HWGC Queue, Sacrificing one space indicates fullness
+  // push and pop operate on stack_top
+  //    push: first inc then store
+  //     pop: first load then dec
+  // readBack and spillOut operate on stack_bottom
+  //    readBack: first store then dec
+  //    spillout: first inc then load
   val stackMaskWidth = log2Up(GCTaskStack_Entry)
   val stack_mask = U(GCTaskStack_Entry - 1, stackMaskWidth bits)
   val stack_top = RegInit(U(0, stackMaskWidth bits))
   val stack_bottom = RegInit(U(0, stackMaskWidth bits))
   val stack_data = RegInit(Vec.fill(GCTaskStack_Entry)(U(0, MMUAddrWidth bits)))
 
-  // TaskQueue
+  // JVM HotSpot Queue Config
   val queue_bottom_addr = RegInit(U(0, MMUAddrWidth bits))
   val queue_ageTop_addr = RegInit(U(0, MMUAddrWidth bits))
   val queue_elems_base = RegInit(U(0, MMUAddrWidth bits))
@@ -38,11 +45,13 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   object overall_state extends SpinalEnum {
     val s_idle, s_read, s_work, s_end = newElement()
   }
+  // 0: s0 1: s1
   object sub_state extends SpinalEnum {
     val s0, s1 = newElement()
   }
 
   val state = RegInit(overall_state.s_idle)
+  // these all need access memory twice
   val readQueue_sub_state = RegInit(sub_state.s0)
   val spillOut_sub_state = RegInit(sub_state.s0)
   val readBack_sub_state = RegInit(sub_state.s0)
@@ -60,6 +69,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   val dispatch_done = stack_top === stack_bottom && queue_bottom === queue_ageTop && io.Pop.ready
   // size is a power of 2 and the usage can be calculated using (top - bottom) & (size - 1)
   val task_usage = (stack_top - stack_bottom) & stack_mask
+  val task_free = (U(GCTaskStack_Entry - 1, stackMaskWidth bits) - task_usage).resized
 
   // spillout: not need judge queue_bottom and queue_ageTop, becuase in these benchmark 1 << 17 capacity is enough
   val need_spillOut = task_usage >= U(GCTaskStack_SpillNeed)
@@ -74,8 +84,8 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   val prevQueueBottom = WrapDec(queue_bottom, GCTaskQueue_Size).resized
 
   io.Pop.valid := task_usage =/= U(0)
-  io.Pop.payload := stack_data(prevTop)
-  io.Push.ready := state === overall_state.s_work && nextTop =/= stack_bottom // not full
+  io.Pop.payload := stack_data(stack_top)
+  io.Push.ready := state === overall_state.s_work && task_free =/= U(0) // not full
 
   when(state === overall_state.s_idle){
     //reset issued
@@ -136,14 +146,14 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
     }.otherwise{
        when(io.Push.fire && !io.Pop.fire){
          // push: write stack_top and stack top point next
-         stack_data(stack_top) := io.Push.payload
+         stack_data(nextTop) := io.Push.payload
          stack_top := nextTop
        }.elsewhen(io.Pop.fire && !io.Push.fire){
          // pop: read stack_top prev data and stack_top point before
          stack_top := prevTop
        }.elsewhen(io.Pop.fire && io.Push.fire){
          // meanwhile: read stack_top prev and write stack_top prev, stack_top remain
-         stack_data(prevTop) := io.Push.payload
+         stack_data(stack_top) := io.Push.payload
        }
 
        // spill or readBack from stack --- operate on queue_bottom and stack_bottom
@@ -151,7 +161,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
        when(need_spillOut){
          switch(spillOut_sub_state){
            is(sub_state.s0){
-             issueReq(io.LocalMMUIO, (queue_elems_base + queue_bottom * GCScannerTask_Size).resized, True, allBytesOnes, stack_data(stack_bottom), issued_memReq){ rd =>
+             issueReq(io.LocalMMUIO, (queue_elems_base + queue_bottom * GCScannerTask_Size).resized, True, allBytesOnes, stack_data(nextBottom), issued_memReq){ rd =>
                spillOut_sub_state := sub_state.s1
              }
            }
@@ -168,8 +178,8 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
            is(sub_state.s0){
              issueReq(io.LocalMMUIO, (queue_elems_base + prevQueueBottom * GCScannerTask_Size).resized, False, U(0), U(0), issued_memReq) { rd =>
                // when readback, not push or capacity >= 2(can support one push and readback)
-               when(!io.Push.fire || U(GCTaskStack_Entry) - U(1) - task_usage  >= U(2)){
-                 stack_data(prevBottom) := rd
+               when(!io.Push.fire || task_free  >= U(2)){
+                 stack_data(stack_bottom) := rd
                }
                readBack_sub_state := sub_state.s1
              }
