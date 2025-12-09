@@ -135,7 +135,7 @@ class GCTop extends Module with GCParameters with HWParameters {
 
   gcAop.io.Aop.Valid := arb_aop.io.output.valid
   gcAop.io.Aop.ParScanThreadStatePtr := arb_aop.io.output.payload.ParScanThreadStatePtr
-  gcAop.io.Aop.DestOopPtr := arb_aop.io.output.payload.DestOopPtr
+  gcAop.io.Aop.Task := arb_aop.io.output.payload.Task
 
   arb_aop.io.output.ready := gcAop.io.Aop.Ready
 

@@ -9,8 +9,8 @@ import scala.language.postfixOps
 class GCFetch extends Module with HWParameters with GCParameters {
   val io = new Bundle{
     val Stack2Fetch = slave Stream UInt(MMUAddrWidth bits)
-    val Fetch2ArrayProcess = master(new ProcessUnit)
-    val Fetch2OopProcess = master(new ProcessUnit)
+    val Fetch2ArrayProcess = master(new GCFetch2ProcessUnit)
+    val Fetch2OopProcess = master(new GCFetch2ProcessUnit)
     val FetchMReq = master(new LocalMMUIO)
   }
 

@@ -47,7 +47,7 @@ class GCAop extends Module with GCParameters with HWParameters {
   when(io.Aop.Valid && io.Aop.Ready){
     stages(0).valid := True
     stages(0).reg.pss := io.Aop.ParScanThreadStatePtr
-    stages(0).reg.dest := io.Aop.DestOopPtr
+    stages(0).reg.dest := io.Aop.Task
   }
 
   def mmuOpForIndex(i: Int, s: AopStageData): (Bool, UInt, Bool, UInt, UInt) = {

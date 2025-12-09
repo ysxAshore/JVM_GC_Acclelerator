@@ -50,7 +50,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
 
   io.Trace2Aop.Valid := False
   io.Trace2Aop.ParScanThreadStatePtr := U(0)
-  io.Trace2Aop.DestOopPtr := U(0)
+  io.Trace2Aop.Task := U(0)
 
   // State Machine
   object overall_state extends SpinalEnum {
@@ -305,7 +305,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
           case 7 =>
             io.Trace2Aop.Valid := True
             io.Trace2Aop.ParScanThreadStatePtr := ParScanThreadStatePtr
-            io.Trace2Aop.DestOopPtr := s.reg.dest
+            io.Trace2Aop.Task := s.reg.dest
             when(io.Trace2Aop.Valid && io.Trace2Aop.Ready){
               resetStage(7)
             }
