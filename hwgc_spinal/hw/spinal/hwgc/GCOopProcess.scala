@@ -26,7 +26,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
 
   io.Process2Aop.Valid := False
   io.Process2Aop.Task := U(0)
-  io.Process2Aop.RegionAttrPtr := U(0)
+  io.Process2Aop.RegionAttr := U(0)
   io.Process2Aop.ParScanThreadStatePtr := U(0)
 
   io.Mreq.Request.valid := False
@@ -48,6 +48,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
   val srcOopPtr = RegInit(U(0, MMUAddrWidth bits))
   val destOopPtr = RegInit(U(0,MMUAddrWidth bits))
   val markWord = RegInit(U(0, MMUDataWidth bits))
+  val logOfHRGrainBytes = RegInit(U(0, 32 bits))
 
   def resetState(): Unit = {
     state := overall_state.s_idle
@@ -62,6 +63,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
       regionAttrShiftBy := io.ConfigIO.RegionAttrShiftBy
       heapRegionBiasedBase := io.ConfigIO.HeapRegionBiasedBase
       heapRegionShiftBy := io.ConfigIO.HeapRegionShiftBy
+      logOfHRGrainBytes := io.ConfigIO.LogOfHRGrainBytes
 
       oopType := io.Fetch2Process.OopType
       task := io.Fetch2Process.Task
@@ -99,7 +101,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
   val reqIssued = RegInit(False)
   when(state === overall_state.s_writeTask){
     issueReq(io.Mreq, task, True, allBytesOnes, destOopPtr, reqIssued) { rd =>
-      when((task ^ destOopPtr) >> LogOfHRGrainBytes === U(0)){
+      when((task ^ destOopPtr) >> logOfHRGrainBytes === U(0)){
         resetState()
       }.otherwise{
         state := overall_state.s_readHR
@@ -125,14 +127,25 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
     }
   }
 
+  val reqDone = RegInit(False)
+  val regionAttr = RegInit(U(0, 16 bits))
   when(state === overall_state.s_sendAop){
+    when(!reqDone){
+      val regionAttrPtr = (regionAttrBiasedBase + (destOopPtr >> regionAttrShiftBy) * GCHeapRegionAttr_Size).resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, regionAttrPtr, False, U(0), U(0), reqIssued){ rd =>
+        reqDone := True
+        regionAttr := rd(15 downto 0)
+      }
+    }
+
     io.Process2Aop.Valid := True
     io.Process2Aop.Task := task
     io.Process2Aop.ParScanThreadStatePtr := pss
-    io.Process2Aop.RegionAttrPtr := (regionAttrBiasedBase + (destOopPtr >> regionAttrShiftBy) * GCHeapRegionAttr_Size).resized
+    io.Process2Aop.RegionAttr := regionAttr
 
     when(io.Process2Aop.Valid && io.Process2Aop.Ready){
       state := overall_state.s_waitDone2
+      reqDone := False
     }
   }
 

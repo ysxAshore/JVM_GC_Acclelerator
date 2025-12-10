@@ -117,7 +117,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
     io.Process2Trace.OopType := oopType
     io.Process2Trace.SrcOopPtr := srcOopPtr
     io.Process2Trace.DestOopPtr := destOopPtr
-    io.Process2Trace.ArrayLength := srcLength
+    io.Process2Trace.ArrayLength := destLength + chunk_size
     io.Process2Trace.PartialArrayStart := destLength
     io.Process2Trace.StepIndex := stepIndex
     io.Process2Trace.StepNCreate := stepNCreate

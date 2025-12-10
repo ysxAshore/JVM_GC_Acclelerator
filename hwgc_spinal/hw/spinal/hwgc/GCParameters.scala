@@ -20,7 +20,7 @@ trait GCParameters {
   val GCTaskStack_Entry = 64
   val GCTaskStack_SpillNeed = 63
   val GCTaskStack_ReadNeed = 8
-  val GCoopWorkStages = 8
+  val GCoopWorkStages = 7
   val GCaopWorkStages = 10
   val GCCopyEntry = 64
 
@@ -111,7 +111,6 @@ trait GCParameters {
   val HEAP_PREV_OFFSET = 0xd8
   val NODE_INDEX_OFFSET = 0x120
   val YOUND_INDEX_IN_CSET_OFFSET = 0x100
-  val LogOfHRGrainBytes = 0x16
   val YOUNG_MASK = 0x2
   val OLD_MASK = 0x10
   val HEAPREGION_TYPE_SURVIVOR = 0x3
@@ -224,7 +223,7 @@ trait HWParameters {
     val s = Stream(GCAopPayload())
     s.valid := p.Valid
     s.payload.ParScanThreadStatePtr := p.ParScanThreadStatePtr
-    s.payload.RegionAttrPtr := p.RegionAttrPtr
+    s.payload.RegionAttrPtr := p.RegionAttr
     s.payload.Task := p.Task
 
     p.Ready := s.ready
@@ -267,25 +266,6 @@ class GCProcess2Survivor extends Bundle with HWParameters with GCParameters with
     }
 }
 
-class ProcessUnit extends Bundle with HWParameters with GCParameters with IMasterSlave {
-  val Valid = in Bool()
-  val Ready = out Bool()
-
-  val Done = out Bool()
-  val DestOopPtr = out UInt(MMUAddrWidth bits)
-
-  val Task = in UInt(MMUAddrWidth bits)
-  val OopType = in UInt(GCOopTypeWidth bits)
-  val SrcOopPtr = in UInt(MMUAddrWidth bits)
-  val MarkWord = in UInt(MMUDataWidth bits)
-  val RegionAttr = in UInt(16 bits)
-
-  override def asMaster(): Unit = {
-    in(Ready, Done, DestOopPtr)
-    out(Valid, Task, OopType, SrcOopPtr, MarkWord, RegionAttr)
-  }
-}
-
 case class GCTracePayload() extends Bundle with HWParameters with GCParameters {
   val OopType = UInt(GCOopTypeWidth bits)
   val KlassPtr = UInt(MMUAddrWidth bits)
@@ -308,12 +288,14 @@ class GCProcess2Trace extends Bundle with HWParameters with GCParameters with IM
   val KlassPtr = in UInt(MMUAddrWidth bits)
   val SrcOopPtr = in UInt(MMUAddrWidth bits)
   val DestOopPtr = in UInt(MMUAddrWidth bits)
+
   val Kid = in UInt(32 bits)
+  val ScanningInYoung = in Bool()
+
   val ArrayLength = in UInt(32 bits)
   val PartialArrayStart = in UInt(32 bits)
   val StepIndex = in UInt(32 bits)
   val StepNCreate = in UInt(32 bits)
-  val ScanningInYoung = in Bool()
 
   override def asMaster(): Unit = {
     out(Valid, OopType, KlassPtr, SrcOopPtr, DestOopPtr, Kid, ArrayLength, PartialArrayStart, StepIndex, StepNCreate, ScanningInYoung)
@@ -355,6 +337,7 @@ class GCOopProcessConfigIO extends Bundle with HWParameters with IMasterSlave{
   val RegionAttrShiftBy = in UInt(32 bits)
   val HeapRegionBiasedBase = in UInt(MMUAddrWidth bits)
   val HeapRegionShiftBy = in UInt(32 bits)
+  val LogOfHRGrainBytes = in UInt(32 bits)
   override def asMaster(): Unit = {
     out(ParScanThreadStatePtr, RegionAttrBiasedBase, RegionAttrShiftBy, HeapRegionBiasedBase, HeapRegionShiftBy)
     in()
@@ -362,15 +345,15 @@ class GCOopProcessConfigIO extends Bundle with HWParameters with IMasterSlave{
 }
 
 class GCCopy2SurvivorConfigIO extends Bundle with HWParameters with GCParameters with IMasterSlave {
-  val ParScanThreadStatePtr = in(UInt(MMUAddrWidth bits))
-  val RegionAttrBiasedBase = in UInt(MMUAddrWidth bits)
-  val RegionAttrShiftBy = in UInt(32 bits)
+  val ParScanThreadStatePtr = in UInt(MMUAddrWidth bits)
+  val PlabAllocatorPtr = in UInt(MMUAddrWidth bits)
+  val AgeThreshold = in UInt(32 bits)
+  val ChunkSize = in UInt(32 bits)
   val HeapRegionBiasedBase = in UInt(MMUAddrWidth bits)
   val HeapRegionShiftBy = in UInt(32 bits)
 
-
   override def asMaster(): Unit = {
-    out(ParScanThreadStatePtr, RegionAttrBiasedBase, RegionAttrShiftBy, HeapRegionBiasedBase, HeapRegionShiftBy)
+    out(ParScanThreadStatePtr, PlabAllocatorPtr, AgeThreshold, HeapRegionBiasedBase, HeapRegionShiftBy, ChunkSize)
     in()
   }
 }
@@ -383,9 +366,10 @@ class GCTraceConfigIO extends Bundle with HWParameters with IMasterSlave{
   val HeapRegionShiftBy = in UInt(32 bits)
   val HumongousReclaimCandidatesBoolBase = in UInt(MMUAddrWidth bits)
   val ParScanThreadStatePtr = in UInt(MMUAddrWidth bits)
+  val LogOfHRGrainBytes = in UInt(32 bits)
 
   override def asMaster(): Unit = {
-    out(RegionAttrBase, RegionAttrBiasedBase, RegionAttrShiftBy, HeapRegionBias, HeapRegionShiftBy, HumongousReclaimCandidatesBoolBase, ParScanThreadStatePtr)
+    out(RegionAttrBase, RegionAttrBiasedBase, RegionAttrShiftBy, HeapRegionBias, HeapRegionShiftBy, HumongousReclaimCandidatesBoolBase, ParScanThreadStatePtr, LogOfHRGrainBytes)
     in()
   }
 }
@@ -407,19 +391,17 @@ class GCTaskStackConfigIO extends Bundle with HWParameters with IMasterSlave{
 
 class TraceMReq2MMU(oopWorkStage:Int, oopTraceStates:Int) extends Bundle with IMasterSlave {
   val oopWorkMReqs  = Vec.fill(oopWorkStage)(new LocalMMUIO)
-  val staticMReq    = new LocalMMUIO
-  val oopTraceMReqs = Vec.fill(oopTraceStates)(new LocalMMUIO)
+  val commonMReq  = new LocalMMUIO
 
   override def asMaster(): Unit = {
     oopWorkMReqs.foreach(master(_))
-    master(staticMReq)
-    oopTraceMReqs.foreach(master(_))
+    master(commonMReq)
   }
 }
 
 case class GCAopPayload() extends Bundle with HWParameters with GCParameters{
   val ParScanThreadStatePtr = UInt(MMUAddrWidth bits)
-  val RegionAttrPtr = UInt(MMUAddrWidth bits)
+  val RegionAttr = UInt(16 bits)
   val Task = UInt(MMUAddrWidth bits)
 }
 
@@ -428,12 +410,12 @@ class AopParameters extends Bundle with HWParameters with IMasterSlave{
   val Ready = out Bool()
   val Done = out Bool()
   val ParScanThreadStatePtr = in UInt(MMUAddrWidth bits)
-  val RegionAttrPtr = in UInt(MMUAddrWidth bits)
+  val RegionAttr = in UInt(MMUAddrWidth bits)
   val Task = in UInt(MMUAddrWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done)
-    out(Valid, ParScanThreadStatePtr, RegionAttrPtr, Task)
+    out(Valid, ParScanThreadStatePtr, RegionAttr, Task)
   }
 }
 

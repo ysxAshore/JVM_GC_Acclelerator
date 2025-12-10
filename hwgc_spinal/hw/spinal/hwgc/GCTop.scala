@@ -80,8 +80,6 @@ class GCTop extends Module with GCParameters with HWParameters {
   // GCOopCopy2Survivor
   gcOop2CopySurvivor.io.Process2Copy <> gcCopy.io.fromProcess
   gcOop2CopySurvivor.io.ConfigIO.ParScanThreadStatePtr := ParScanThreadStatePtr
-  gcOop2CopySurvivor.io.ConfigIO.RegionAttrBiasedBase := RegionAttrBiasedBase
-  gcOop2CopySurvivor.io.ConfigIO.RegionAttrShiftBy := RegionAttrShiftBy
   gcOop2CopySurvivor.io.ConfigIO.HeapRegionBiasedBase := HeapRegionBiasedBase
   gcOop2CopySurvivor.io.ConfigIO.HeapRegionShiftBy := HeapRegionShiftBy
 
@@ -172,7 +170,7 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcLocalMMU.io.localMMUIOs(1) <> gcFetch.io.FetchMReq
   gcLocalMMU.io.localMMUIOs(2) <> gcArrayProcess.io.Mreq
   gcLocalMMU.io.localMMUIOs(3) <> gcOopProcess.io.Mreq
-  gcLocalMMU.io.localMMUIOs(4) <> gcOop2CopySurvivor.io.Mreq
+  gcLocalMMU.io.localMMUIOs(4) <> gcOop2CopySurvivor.io.CommonMreq
   gcLocalMMU.io.localMMUIOs(5) <> gcCopy.io.readMReq
   gcLocalMMU.io.localMMUIOs(6) <> gcCopy.io.writeMReq
   for(i <- 7 until 7 + GCoopWorkStages){
