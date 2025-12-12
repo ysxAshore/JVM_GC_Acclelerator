@@ -47,12 +47,12 @@ class GCLocalMMU extends Module with HWParameters with GCParameters {
     (rotatedValid(i), U(i, LocalMMUTaskType.TaskTypeBitWidth bits))
   )
   val offset = PriorityMux(indexCandidates)
-  val chosen_index = (arbStart + offset).resized
+  val chosen_index = (arbStart + offset).resize(LocalMMUTaskType.TaskTypeBitWidth bits)
 
   val hasRequest = rotatedValid.asBits.orR
 
   when(hasRequest && io.LastLevelCacheTLIO.Request.ready && io.LastLevelCacheTLIO.ConherentRequsetSourceID.valid){
-    arbStart := ((chosen_index + U(1)) % LocalMMUTaskType.TaskTypeMax).resized
+    arbStart := ((chosen_index + U(1)) % LocalMMUTaskType.TaskTypeMax).resize(LocalMMUTaskType.TaskTypeBitWidth bits)
 
     io.localMMUIOs(chosen_index).Request.ready := io.LastLevelCacheTLIO.Request.ready
     io.localMMUIOs(chosen_index).ConherentRequsetSourceID.valid := io.LastLevelCacheTLIO.ConherentRequsetSourceID.valid

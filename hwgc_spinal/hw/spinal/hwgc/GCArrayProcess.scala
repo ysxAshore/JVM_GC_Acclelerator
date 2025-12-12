@@ -7,44 +7,45 @@ import scala.language.postfixOps
 
 class GCArrayProcess extends Module with HWParameters with GCParameters {
   val io = new Bundle{
+    val Mreq = master(new LocalMMUIO)
     val Fetch2Process = slave(new GCFetch2ProcessUnit)
     val Process2Trace = master(new GCProcess2Trace)
-    val Mreq = master(new LocalMMUIO)
     val ConfigIO = slave(new GCArrayProcessConfigIO)
+    val DebugTimeStamp = in(UInt(MMUDataWidth bits))
   }
 
   // default value
+  io.Mreq.Request.valid := False
+  io.Mreq.Request.payload.clearAll()
+  io.Mreq.Response.ready := False
+
   io.Fetch2Process.Ready := False
   io.Fetch2Process.Done := False
-  io.Fetch2Process.DestOopPtr := U(0)
 
   io.Process2Trace.Valid := False
+  io.Process2Trace.Kid := U(0)
   io.Process2Trace.OopType := U(0)
   io.Process2Trace.KlassPtr := U(0)
   io.Process2Trace.SrcOopPtr := U(0)
   io.Process2Trace.DestOopPtr := U(0)
-  io.Process2Trace.Kid := U(0)
-  io.Process2Trace.ArrayLength := U(0)
-  io.Process2Trace.PartialArrayStart := U(0)
+  io.Process2Trace.ScanningInYoung := False
   io.Process2Trace.StepIndex := U(0)
   io.Process2Trace.StepNCreate := U(0)
-  io.Process2Trace.ScanningInYoung := False
-
-  io.Mreq.Request.valid := False
-  io.Mreq.Request.payload.clearAll()
-  io.Mreq.Response.ready := False
+  io.Process2Trace.ArrayLength := U(0)
+  io.Process2Trace.PartialArrayStart := U(0)
 
   object overall_state extends SpinalEnum {
     val s_idle, s_readSrcLen, s_readDestLen, s_readHeapRegionPtr, s_readHeapRegionType, s_doTrace, s_waitDone = newElement()
   }
 
   val state = RegInit(overall_state.s_idle)
-  val pss = RegInit(U(0, MMUAddrWidth bits))
+
   val chunk_size = RegInit(U(0, 32 bits))
   val task_limit = RegInit(U(0, 32 bits))
   val task_fanout = RegInit(U(0, 32 bits))
-  val heapRegionBiasedBase = RegInit(U(0, MMUAddrWidth bits))
   val heapRegionShiftBy = RegInit(U(0, 32 bits))
+  val heapRegionBiasedBase = RegInit(U(0, MMUAddrWidth bits))
+
   val oopType = RegInit(U(0, GCOopTypeWidth bits))
   val srcOopPtr = RegInit(U(0, MMUAddrWidth bits))
   val destOopPtr = RegInit(U(0,MMUAddrWidth bits))
@@ -53,12 +54,11 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
   when(state === overall_state.s_idle){
     io.Fetch2Process.Ready := True
     when(io.Fetch2Process.Valid && io.Fetch2Process.Ready){
-      pss := io.ConfigIO.ParScanThreadStatePtr
       chunk_size := io.ConfigIO.ChunkSize
-      task_limit := io.ConfigIO.STEPPER_OFFSET(31 downto 0)
-      task_fanout := io.ConfigIO.STEPPER_OFFSET(63 downto 32)
-      heapRegionBiasedBase := io.ConfigIO.HeapRegionBiasedBase
+      task_limit := io.ConfigIO.StepperOffset(31 downto 0)
+      task_fanout := io.ConfigIO.StepperOffset(63 downto 32)
       heapRegionShiftBy := io.ConfigIO.HeapRegionShiftBy
+      heapRegionBiasedBase := io.ConfigIO.HeapRegionBiasedBase
 
       oopType := io.Fetch2Process.OopType
       srcOopPtr := io.Fetch2Process.SrcOopPtr
@@ -66,30 +66,41 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
       destOopPtr := io.Fetch2Process.MarkWord & ~U(LOCK_MASK_IN_PLACE, MMUDataWidth bits)
 
       state := overall_state.s_readSrcLen
+
+      if(DebugEnable){
+        report(Seq(
+          "[GCArrayProcess<", io.DebugTimeStamp,
+          ">]Receive task from Fetch Module",
+          ", the srcOopPtr is ", io.Fetch2Process.SrcOopPtr,
+          ", the markWord is ", io.Fetch2Process.MarkWord,
+          ", the destOopPtr is ", io.Fetch2Process.MarkWord & ~U(LOCK_MASK_IN_PLACE, MMUDataWidth bits),
+          "\n"
+        ))
+      }
     }
   }
 
   val srcLength = RegInit(U(0, 32 bits))
   val reqIssued = RegInit(False)
   when(state === overall_state.s_readSrcLen){
-    issueReq(io.Mreq, srcOopPtr + ArrayLenOff, False, U(0), U(0), reqIssued) { rd =>
+    issueReq(io.Mreq, (srcOopPtr + U(ArrayLenOff)).resize(MMUAddrWidth bits), False, U(0), U(0), reqIssued) { rd =>
       srcLength := rd(31 downto 0)
       state := overall_state.s_readDestLen
     }
   }
 
-  val destLength = RegInit(U(0, 32 bits))
   val stepIndex = RegInit(U(0, 32 bits))
+  val destLength = RegInit(U(0, 32 bits))
   val stepNCreate = RegInit(U(0, 32 bits))
   val destLenWriteDone = RegInit(False)
   when(state === overall_state.s_readDestLen){
-    issueReq(io.Mreq, destOopPtr + ArrayLenOff, False, U(0), U(0), reqIssued) { rd =>
+    issueReq(io.Mreq, (destOopPtr + U(ArrayLenOff)).resize(MMUAddrWidth bits), False, U(0), U(0), reqIssued) { rd =>
       destLength := rd(31 downto 0)
-      val task_num = rd(31 downto 0) / chunk_size
-      val remaining_tasks = (srcLength - rd(31 downto 0)) / chunk_size
-      val max_pending = (task_fanout - U(1)) * task_num + U(1)
+      val task_num = (rd(31 downto 0) / chunk_size).resize(32 bits)
+      val remaining_tasks = ((srcLength - rd(31 downto 0)) / chunk_size).resize(32 bits)
+      val max_pending = ((task_fanout - U(1)) * task_num + U(1)).resize(32 bits)
       val pending = max_pending.min(remaining_tasks).min(task_limit)
-      stepNCreate := task_fanout.min(remaining_tasks.min(task_limit + U(1)) - pending).resized
+      stepNCreate := task_fanout.min(remaining_tasks.min(task_limit + U(1)) - pending).resize(32 bits)
       stepIndex := destLength + chunk_size
       destLenWriteDone := False
       state := overall_state.s_readHeapRegionPtr
@@ -98,7 +109,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
 
   val heap_region = RegInit(U(0,MMUAddrWidth bits))
   when(state === overall_state.s_readHeapRegionPtr){
-    issueReq(io.Mreq, (heapRegionBiasedBase + (destOopPtr >> heapRegionShiftBy) * GCObjectPtr_Size).resized, False, U(0), U(0), reqIssued){ rd =>
+    issueReq(io.Mreq, (heapRegionBiasedBase + (destOopPtr >> heapRegionShiftBy) * U(GCObjectPtr_Size)).resize(MMUAddrWidth bits), False, U(0), U(0), reqIssued){ rd =>
       heap_region := rd
       state := overall_state.s_readHeapRegionType
     }
@@ -106,7 +117,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
 
   val scanning_in_young = RegInit(False)
   when(state === overall_state.s_readHeapRegionType){
-    issueReq(io.Mreq, heap_region + HEAP_REGION_TYPE_OFFSET, False, U(0), U(0), reqIssued){ rd =>
+    issueReq(io.Mreq, (heap_region + U(HEAP_REGION_TYPE_OFFSET)).resize(MMUAddrWidth bits), False, U(0), U(0), reqIssued){ rd =>
       scanning_in_young := (rd(31 downto 0) & U(2, 32 bits)) =/= U(0)
       state := overall_state.s_doTrace
     }
@@ -117,29 +128,52 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
     io.Process2Trace.OopType := oopType
     io.Process2Trace.SrcOopPtr := srcOopPtr
     io.Process2Trace.DestOopPtr := destOopPtr
-    io.Process2Trace.ArrayLength := destLength + chunk_size
-    io.Process2Trace.PartialArrayStart := destLength
+    io.Process2Trace.ScanningInYoung := scanning_in_young
     io.Process2Trace.StepIndex := stepIndex
     io.Process2Trace.StepNCreate := stepNCreate
-    io.Process2Trace.ScanningInYoung := scanning_in_young
+    io.Process2Trace.ArrayLength := destLength + chunk_size
+    io.Process2Trace.PartialArrayStart := destLength
 
     when(io.Process2Trace.Valid && io.Process2Trace.Ready){
       state := overall_state.s_waitDone
+
+      if(DebugEnable){
+        report(Seq(
+          "[GCArrayProcess<", io.DebugTimeStamp,
+          ">]This task has sent to Trace Module",
+          "\n"
+        ))
+      }
     }
   }
 
   when(state === overall_state.s_doTrace || state === overall_state.s_waitDone){
     when(!destLenWriteDone){
-      issueReq(io.Mreq, destOopPtr + ArrayLenOff, True, halfBytesOnes, (destLength + chunk_size).resized, reqIssued) { rd =>
+      issueReq(io.Mreq, (destOopPtr + U(ArrayLenOff)).resize(MMUAddrWidth bits), True, halfBytesOnes, (destLength + chunk_size).resize(MMUDataWidth bits), reqIssued) { rd =>
         destLenWriteDone := True
       }
     }
   }
 
+  val traceDone = RegInit(False)
   when(state === overall_state.s_waitDone){
-    when(io.Process2Trace.Done && destLenWriteDone){
+    when(io.Process2Trace.Done){
+      traceDone := True
+    }
+
+    when(destLenWriteDone && (traceDone || io.Process2Trace.Done)){
+      traceDone := False
       io.Fetch2Process.Done := True
+
       state := overall_state.s_idle
+
+      if(DebugEnable){
+        report(Seq(
+          "[GCArrayProcess<", io.DebugTimeStamp,
+          ">]This task done",
+          "\n"
+        ))
+      }
     }
   }
 }

@@ -20,6 +20,7 @@ class GCAop extends Module with GCParameters with HWParameters {
   val io = new Bundle{
     val Aop = slave (new AopParameters)
     val aopMReqs = Vec.fill(GCaopWorkStages)(new LocalMMUIO)
+    val DebugTimeStamp = in(UInt(MMUDataWidth bits))
     aopMReqs.foreach(master(_))
   }
 
@@ -30,48 +31,98 @@ class GCAop extends Module with GCParameters with HWParameters {
     io.aopMReqs(i).Response.ready := False
   }
 
-  val stages = Seq.tabulate(GCaopWorkStages) { _ =>
-    new Area {
-      val valid = RegInit(False)
-      val reg = Reg(AopStageData().getZero)
-      val reqDone = RegInit(False)
-      val reqIssued = RegInit(False)
-      val responseData = RegInit(U(0, MMUDataWidth bits))
-    }
+  case class Stage() extends Area{
+    val valid = RegInit(False)
+    val reqDone = RegInit(False)
+    val reqIssued = RegInit(False)
+    val reg = RegInit(AopStageData().getZero)
+    val responseData = RegInit(U(0, MMUDataWidth bits))
   }
 
-  // @todo : Aop backpressure -> (!stages(0).valid) && (!stages(1).valid || stages(1).reqDone)
+  val stages = Seq.fill(GCaopWorkStages)(Stage())
+
   io.Aop.Ready := !stages(0).valid
   io.Aop.Done := !stages.map(_.valid).reduce(_ || _)
 
   when(io.Aop.Valid && io.Aop.Ready){
-    stages(0).valid := True
-    stages(0).reg.pss := io.Aop.ParScanThreadStatePtr
-    stages(0).reg.dest := io.Aop.Task
+    val s0 = stages(0)
+    s0.valid := io.Aop.RegionAttr(7 downto 0) =/= U(0)
+    s0.reqDone := False
+    s0.reqIssued := False
+    s0.reg.pss := io.Aop.ParScanThreadStatePtr
+    s0.reg.dest := io.Aop.Task
+    s0.reg.ct_ptr := io.Aop.CardTablePtr
+    s0.reg.byte_map := U(0)
+    s0.reg.card_index := U(0)
+    s0.reg.index := U(0)
+    s0.reg.buffer := U(0)
+    s0.reg.res := U(0)
+    if(DebugEnable){
+      report(Seq(
+        "[GCAop<", io.DebugTimeStamp,
+        ">]Receive task",
+        "\n"
+      ))
+    }
   }
 
   def mmuOpForIndex(i: Int, s: AopStageData): (Bool, UInt, Bool, UInt, UInt) = {
+    val valid = if(i != 4) True else False
+    val write = if(i == 6 || i == 7 || i == 8) True else False
+    val addr = UInt(MMUAddrWidth bits)
+    val wdata = UInt(MMUDataWidth bits)
+    val wmask = Mux(write, allBytesOnes, U(0, MMUDataWidth / 8 bits))
     i match {
-      case 0 => (True, s.pss + PSS_CARD_TABLE_OFFSET, False, U(0), U(0))
-      case 1 => (True, s.ct_ptr + BYTE_MAP_OFFSET, False, U(0), U(0))
-      case 2 => (True, s.ct_ptr + BYTE_MAP_BASE_OFFSET, False, U(0), U(0))
-      case 3 => (True, s.pss + LAST_ENQUEUED_CARD_OFFSET, False, U(0), U(0))
-      case 4 => (True, s.pss + QSET_OFFSET + QSET_QUEUE_OFFSET + INDEX_OFFSET, False, U(0), U(0))
-      case 5 => (True, s.pss + QSET_OFFSET + QSET_QUEUE_OFFSET + BUFFER_OFFSET, False, U(0), U(0))
-      case 7 => (True, s.buffer + (s.index - U(1)) * GCObjectPtr_Size, True, allBytesOnes, s.res)
-      case 8 => (True, s.pss + QSET_OFFSET + QSET_QUEUE_OFFSET + INDEX_OFFSET, True, allBytesOnes, (s.index - U(1)) * GCObjectPtr_Size)
-      case 9 => (True, s.pss + LAST_ENQUEUED_CARD_OFFSET, True, allBytesOnes, s.card_index)
-      case _ => (False, U(0), False, U(0), U(0))
+      case 0 => addr := (s.ct_ptr + BYTE_MAP_OFFSET).resize(MMUAddrWidth bits)
+      case 1 => addr := (s.ct_ptr + BYTE_MAP_BASE_OFFSET).resize(MMUAddrWidth bits)
+      case 2 => addr := (s.pss + LAST_ENQUEUED_CARD_OFFSET).resize(MMUAddrWidth bits)
+      case 3 => addr := (s.pss + QSET_OFFSET + QSET_QUEUE_OFFSET + INDEX_OFFSET).resize(MMUAddrWidth bits)
+      case 5 => addr := (s.pss + QSET_OFFSET + QSET_QUEUE_OFFSET + BUFFER_OFFSET).resize(MMUAddrWidth bits)
+      case 6 => addr := (s.buffer + (s.index - U(1)) * U(GCObjectPtr_Size)).resize(MMUAddrWidth bits)
+      case 7 => addr := (s.pss + QSET_OFFSET + QSET_QUEUE_OFFSET + INDEX_OFFSET).resize(MMUAddrWidth bits)
+      case 8 => addr := (s.pss + LAST_ENQUEUED_CARD_OFFSET).resize(MMUAddrWidth bits)
+      case _ => addr := U(0)
     }
+    i match {
+      case 6 => wdata := s.res
+      case 7 => wdata := ((s.index - U(1)) * U(GCObjectPtr_Size)).resize(MMUDataWidth bits)
+      case 8 => wdata := s.card_index
+      case _ => wdata := U(0)
+    }
+    (valid, addr, write, wmask, wdata)
   }
+
+  // helper: reset stage
   def resetStage(i: Int): Unit = {
     stages(i).valid := False
     stages(i).reqDone := False
+    stages(i).reqIssued := False
   }
-  def transferStage(i: Int , j: Int) : Unit = {
-    resetStage(i)
-    stages(j).valid := True
-    stages(j).reg := stages(i).reg
+
+  def advance(from: Int,
+              to: Int,
+              changeByteMap: Option[UInt] = None,
+              changeCardIndex: Option[UInt] = None,
+              changeRes: Option[UInt] = None,
+              changeIndex: Option[UInt] = None,
+              changeBuffer: Option[UInt] = None,
+             ): Unit = {
+    val sFrom = stages(from)
+    val sTo   = stages(to)
+
+    when(sFrom.valid && sFrom.reqDone && !sTo.valid) {
+      resetStage(from)
+
+      sTo.valid := True
+      sTo.reg.pss := sFrom.reg.pss
+      sTo.reg.dest := sFrom.reg.dest
+      sTo.reg.ct_ptr := sFrom.reg.ct_ptr
+      sTo.reg.byte_map := changeByteMap.getOrElse(sFrom.reg.byte_map)
+      sTo.reg.card_index := changeCardIndex.getOrElse(sFrom.reg.card_index)
+      sTo.reg.index := changeIndex.getOrElse(sFrom.reg.index)
+      sTo.reg.buffer := changeBuffer.getOrElse(sFrom.reg.buffer)
+      sTo.reg.res := changeRes.getOrElse(sFrom.reg.res)
+    }
   }
 
   // send and save response
@@ -80,122 +131,69 @@ class GCAop extends Module with GCParameters with HWParameters {
     val mreq = io.aopMReqs(i)
     val (want, addr, isWrite, wmask, wdata) = mmuOpForIndex(i, s.reg)
     when(s.valid && !s.reqDone && want) {
-      issueReq(mreq, addr.resized, isWrite, wmask.resized, wdata.resized, s.reqIssued) { rd =>
+      issueReq(mreq, addr, isWrite, wmask, wdata, s.reqIssued) { rd =>
         s.reqDone := True
         s.responseData := rd
       }
     }
   }
 
-  // reg handler logic
-  for(i <- 0 until GCaopWorkStages){
-    val s = stages(i)
-    when(s.valid){
-      i match {
-        case 0 =>
-          when(s.reqDone){
-            when(!stages(1).valid){
-              stages(1).valid := True
-              stages(1).reg.dest := stages(0).reg.dest
-              stages(1).reg.pss := stages(0).reg.pss
-              stages(1).reg.byte_map := stages(0).reg.byte_map
-              stages(1).reg.card_index := stages(0).reg.card_index
-              stages(1).reg.index := stages(0).reg.index
-              stages(1).reg.buffer:= stages(0).reg.buffer
-              stages(1).reg.res := stages(0).reg.res
-              stages(1).reg.ct_ptr := s.responseData
-            }
-          }
-        case 1 =>
-          when(s.reqDone){
-            when(!stages(2).valid){
-              stages(2).valid := True
-              stages(2).reg.dest := stages(1).reg.dest
-              stages(2).reg.pss := stages(1).reg.pss
-              stages(2).reg.byte_map := s.responseData
-              stages(2).reg.card_index := stages(1).reg.card_index
-              stages(2).reg.index := stages(1).reg.index
-              stages(2).reg.buffer:= stages(1).reg.buffer
-              stages(2).reg.res := stages(1).reg.res
-              stages(2).reg.ct_ptr := stages(1).reg.ct_ptr
-            }
-          }
-        case 2 =>
-          when(s.reqDone){
-            when(!stages(3).valid){
-              stages(3).valid := True
-              stages(3).reg.dest := stages(2).reg.dest
-              stages(3).reg.pss := stages(2).reg.pss
-              stages(3).reg.byte_map := stages(2).reg.byte_map
-              stages(3).reg.card_index := s.responseData + (s.reg.dest >> 9) - s.reg.byte_map
-              stages(3).reg.index := stages(2).reg.index
-              stages(3).reg.buffer:= stages(2).reg.buffer
-              stages(3).reg.res := s.responseData + (s.reg.dest >> 9)
-              stages(3).reg.ct_ptr := stages(2).reg.ct_ptr
-            }
-          }
-        case 3 =>
-          when(s.reqDone){
-            when(s.responseData === s.reg.card_index){
-              resetStage(3)
-            }.elsewhen(!stages(4).valid){
-              transferStage(3, 4)
-            }
-          }
-        case 4 =>
-          when(s.reqDone){
-            when(!stages(5).valid){
-              stages(5).valid := True
-              stages(5).reg.dest := stages(4).reg.dest
-              stages(5).reg.pss := stages(4).reg.pss
-              stages(5).reg.byte_map := stages(4).reg.byte_map
-              stages(5).reg.card_index := stages(4).reg.card_index
-              stages(5).reg.index := s.responseData / U(8)
-              stages(5).reg.buffer:= stages(4).reg.buffer
-              stages(5).reg.res := stages(4).reg.res
-              stages(5).reg.ct_ptr := stages(4).reg.ct_ptr
-            }
-          }
-        case 5 =>
-          when(s.reqDone){
-            when(s.reg.index === U(0)){
-              when(!stages(6).valid){
-                stages(6).valid := True
-                stages(6).reg.dest := stages(5).reg.dest
-                stages(6).reg.pss := stages(5).reg.pss
-                stages(6).reg.byte_map := stages(5).reg.byte_map
-                stages(6).reg.card_index := stages(5).reg.card_index
-                stages(6).reg.index := stages(5).reg.index
-                stages(6).reg.buffer:= s.responseData
-                stages(6).reg.res := stages(5).reg.res
-                stages(6).reg.ct_ptr := stages(5).reg.ct_ptr
-              }
-            }.elsewhen(!stages(7).valid){
-              stages(7).valid := True
-              stages(7).reg.dest := stages(5).reg.dest
-              stages(7).reg.pss := stages(5).reg.pss
-              stages(7).reg.byte_map := stages(5).reg.byte_map
-              stages(7).reg.card_index := stages(5).reg.card_index
-              stages(7).reg.index := stages(5).reg.index
-              stages(7).reg.buffer:= s.responseData
-              stages(7).reg.res := stages(5).reg.res
-              stages(7).reg.ct_ptr := stages(5).reg.ct_ptr
-            }
-          }
-        case 6 =>
-          // @todo: interrupt
-        case 9 =>
-          when(s.reqDone){
-            resetStage(9)
-          }
-        case _ =>
-          when(s.reqDone){
-            when(!stages(i+1).valid){
-              transferStage(i, i+1)
-            }
-          }
-
+  // stage advancement logic
+  // stage0 -> stage1: byte_map from responseData
+  advance(0, 1, changeByteMap = Some(stages(0).responseData))
+  // stage1 -> stage2: compute card_index/res using responseData and dest
+  advance(1, 2, changeCardIndex = Some((stages(1).responseData + (stages(1).reg.dest >> 9) - stages(1).reg.byte_map).resize(MMUDataWidth bits)))
+  // stage2: check equality with responseData vs card_index
+  when(stages(2).valid && stages(2).reqDone){
+    val s2 = stages(2)
+    when(s2.responseData === s2.reg.card_index){
+      resetStage(2)
+    }.otherwise{
+      when(!stages(3).valid){
+        resetStage(2)
+        stages(3).valid := True
+        stages(3).reg := s2.reg
       }
+    }
+  }
+  // stage3 -> either stage4 or stage5 depending on responseData(index == 0)
+  when(stages(3).valid && stages(3).reqDone) {
+    val s3 = stages(3)
+    when(s3.responseData === U(0)) {
+      // interrupt in stages(5)
+      advance(3, 4, changeIndex = Some((s3.responseData / U(8)).resize(MMUDataWidth bits)))
+    } .otherwise {
+      advance(3, 5, changeIndex = Some((s3.responseData / U(8)).resize(MMUDataWidth bits)))
+    }
+  }
+
+  // interrupt
+  when(stages(4).valid){
+    if(DebugEnable){
+      report(Seq(
+        "[GCAop<", io.DebugTimeStamp,
+        ">]issue interrupt call enqueue_failed function",
+        "\n"
+      ))
+    }
+  }
+
+  // stage5 -> stage6 copy buffer from responseData
+  advance(5, 6, changeBuffer = Some(stages(5).responseData.resize(MMUAddrWidth bits)))
+
+  advance(6, 7)
+  advance(7, 8)
+
+  // stage9 is final
+  when(stages(8).valid && stages(8).reqDone) {
+    resetStage(8)
+    if(DebugEnable){
+      report(Seq(
+        "[GCAop<", io.DebugTimeStamp,
+        ">]the task ", stages(8).reg.dest,
+        "has done",
+        "\n"
+      ))
     }
   }
 }
