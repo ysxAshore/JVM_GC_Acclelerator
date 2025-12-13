@@ -1,3 +1,6 @@
 [submodule "jdk17u"]
 	path = jdk17u
 	url = git@github.com:ysxAshore/jdk17u.git
+[submodule "qemu"]
+	path = qemu
+	url = git@github.com:ysxAshore/QEMU.git

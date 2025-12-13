@@ -418,7 +418,7 @@ class AopParameters extends Bundle with HWParameters with IMasterSlave{
   val Done = out Bool()
 
   val ParScanThreadStatePtr = in UInt(MMUAddrWidth bits)
-  val CardTablePtr = UInt(MMUAddrWidth bits)
+  val CardTablePtr = in UInt(MMUAddrWidth bits)
   val RegionAttr = in UInt(16 bits)
   val Task = in UInt(MMUAddrWidth bits)
 
