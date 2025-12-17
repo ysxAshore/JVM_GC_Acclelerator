@@ -10,6 +10,34 @@
 #define TEST_DEV_NAME "test"
 #define DEVICE_NAME "TESTDEV0"
 
+// 兼容缺失的writeh（16位写）
+#ifndef writeh
+static inline void writeh(u16 val, volatile void __iomem *addr)
+{
+    // little endian
+    writeb((u8)val, addr);
+    writeb((u8)(val >> 8), addr + 1);
+    // big endian
+    // writeb((u8)(val >> 8), addr);
+    // writeb((u8)val, addr + 1);
+}
+#endif
+
+// 兼容缺失的readh（16位读）
+#ifndef readh
+static inline u16 readh(const volatile void __iomem *addr)
+{
+    // little endian
+    u16 val = 0;
+    val |= (u16)readb(addr);
+    val |= (u16)readb(addr + 1) << 8;
+    // big endian：
+    // val |= (u16)readb(addr) << 8;
+    // val |= (u16)readb(addr + 1);
+    return val;
+}
+#endif
+
 struct test_acpi_dev
 {
     void __iomem *base; // MMIO 映射基地址
@@ -19,54 +47,87 @@ struct test_acpi_dev
     struct class *cls;
 };
 
-/* 寄存器字节读 */
-static u8 test_reg_read(struct test_acpi_dev *test_dev, u32 offset)
-{
-    return readb(test_dev->base + offset);
-}
-
-/* 寄存器字节写 */
-static void test_reg_write(struct test_acpi_dev *test_dev, u32 offset, u8 value)
-{
-    writeb(value, test_dev->base + offset);
-}
-
-/* 字符设备 read：读 1 字节寄存器 */
+/* 字符设备 read */
 static ssize_t test_dev_read(struct file *file, char __user *buf,
                              size_t count, loff_t *ppos)
 {
     struct test_acpi_dev *test_dev = file->private_data;
-    u32 reg_offset = *ppos;
-    u8 val;
+    u32 offset = *ppos;
+    u64 val;
 
-    if (count != 1)
+    if (offset % count != 0)
+    {
+        pr_err("unaligned read: offset 0x%x, count %zu\n", offset, count);
         return -EINVAL;
+    }
 
-    val = test_reg_read(test_dev, reg_offset);
+    void __iomem *addr = test_dev->base + offset;
 
-    if (copy_to_user(buf, &val, 1))
+    switch (count)
+    {
+    case 1:
+        val = readb(addr);
+        break;
+    case 2:
+        val = readh(addr);
+        break;
+    case 4:
+        val = readl(addr);
+        break;
+    case 8:
+        val = readq(addr);
+        break;
+    default:
+        pr_err("unsupported read count: %zu (only 1/2/4/8 allowed)\n", count);
+        return -EINVAL;
+    }
+
+    if (copy_to_user(buf, &val, count))
         return -EFAULT;
 
-    *ppos += 1;
-    return 1;
+    *ppos += count;
+    return count;
 }
 
 static ssize_t test_dev_write(struct file *file, const char __user *buf,
                               size_t count, loff_t *ppos)
 {
     struct test_acpi_dev *test_dev = file->private_data;
-    u32 reg_offset = *ppos;
-    u8 val;
+    u32 offset = *ppos;
+    u64 val;
 
-    if (count != 1)
+    if (offset % count != 0)
+    {
+        pr_err("unaligned read: offset 0x%x, count %zu\n", offset, count);
         return -EINVAL;
+    }
 
-    if (copy_from_user(&val, buf, 1))
+    if (copy_from_user(&val, buf, count))
         return -EFAULT;
 
-    test_reg_write(test_dev, reg_offset, val);
-    *ppos += 1;
-    return 1;
+    void __iomem *addr = test_dev->base + offset;
+
+    switch (count)
+    {
+    case 1:
+        writeb((u8)val, addr);
+        break;
+    case 2:
+        writeh((u16)val, addr);
+        break;
+    case 4:
+        writel((u32)val, addr);
+        break;
+    case 8:
+        writeq(val, addr);
+        break;
+    default:
+        pr_err("unsupported write count: %zu (only 1/2/4/8 allowed)\n", count);
+        return -EINVAL;
+    }
+
+    *ppos += count;
+    return count;
 }
 
 static int test_dev_open(struct inode *inode, struct file *file)
