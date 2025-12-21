@@ -184,6 +184,7 @@ static void edu_remove(struct pci_dev *pdev)
 
 static const struct pci_device_id edu_pci_ids[] = {
     {PCI_DEVICE(0x1234, 0x11e8)},
+    {},
 };
 MODULE_DEVICE_TABLE(pci, edu_pci_ids);
 
