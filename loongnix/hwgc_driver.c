@@ -1,20 +1,12 @@
 // hwgc_driver.c
-#include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/io.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
-#include <linux/uaccess.h>
 #include <linux/interrupt.h>
 #include <linux/wait.h>
 #include <linux/sched.h>
-
-#define REG_DEVICE_ID 0x0
-#define REG_STATUS 0x4
-#define REG_INT_STATUS 0x8
-#define REG_CLEAR_IRQ 0xc
-#define REG_PAR 0x10
-#define REG_START_WORK 0x80
+#include "hwgc_ioctl.h"
 
 #define IRQ_ALLOC_SLOW 0x00000001
 #define IRQ_ENQUEUE_FAILED 0x00000100
@@ -25,35 +17,17 @@
 
 #define HWGC_DEV_NAME "hwgc"
 
-struct HWGCParameter
-{
-    uint32_t chunkSize;
-    uint32_t ageThreshold;
-    uint32_t heapRegionBias;
-    uint32_t regionAttrShiftBy;
-    uint32_t heapRegionShiftBy;
-    uint32_t logOfHRGrainBytes;
-    uint64_t stepperOffset;
-    uint64_t youngWordsBase;
-    uint64_t regionAttrBase;
-    uint64_t plabAllocatorPtr;
-    uint64_t regionAttrBiasedBase;
-    uint64_t heapRegionBiasedBase;
-    uint64_t parScanThreadStatePtr;
-    uint64_t taskQueueBottomAddr;
-    uint64_t taskQueueAgeTopAddr;
-    uint64_t taskQueueElemsBase;
-    uint64_t humogousReclaimCandidateBoolBase;
-};
-
 struct hwgc_dev
 {
-    void __iomem *mmio;
-    struct pci_dev *pdev;
     dev_t devno;
     struct cdev cdev;
     struct class *cls;
-    struct completion done;
+    struct pci_dev *pdev;
+
+    spinlock_t lock;
+    void __iomem *mmio;
+    enum hwgc_state state;
+    wait_queue_head_t waitq;
 };
 
 /* 中断处理 */
@@ -61,78 +35,65 @@ static irqreturn_t hwgc_irq_handler(int irq, void *dev_id)
 {
     struct hwgc_dev *hwgc = dev_id;
     u32 irq_status = ioread32(hwgc->mmio + REG_INT_STATUS);
-    if (irq_status & IRQ_ALLOC_SLOW)
+    unsigned long flags;
+
+    if (!irq_status)
+        return IRQ_NONE;
+
+    spin_lock_irqsave(&hwgc->lock, flags);
+
+    struct
     {
-        iowrite32(IRQ_ALLOC_SLOW, hwgc->mmio + REG_CLEAR_IRQ);
-        // handler alloc_slow to user program
-    }
-    else if (irq_status & IRQ_ENQUEUE_FAILED)
+        u32 mask;
+        enum hwgc_state new_state;
+    } irq_map[] = {
+        {IRQ_ALLOC_SLOW, HWGC_WAIT_MALLOC},
+        {IRQ_ENQUEUE_FAILED, HWGC_WAIT_ENQUEUED},
+        {IRQ_COMPLETE, HWGC_DONE},
+    };
+
+    // 一次只处理一个中断
+    for (int i = 0; i < ARRAY_SIZE(irq_map), ++i)
     {
-        iowrite32(IRQ_ENQUEUE_FAILED, hwgc->mmio + REG_CLEAR_IRQ);
-        // handler enqueue failed to user program
+        if (irq_status & irq_map[i].mask)
+        {
+            iowrite32(irq_map[i].mask, hwgc->mmio + REG_CLEAR_IRQ);
+            hwgc->state = irq_map[i].new_state;
+            wake_up_interruptible(&hwgc->waitq);
+            break;
+        }
     }
-    else if (irq_status & IRQ_COMPLETE)
-    {
-        iowrite32(IRQ_COMPLETE, hwgc->mmio + REG_CLEAR_IRQ);
-        complete(&hwgc->done);
-    }
+
+    spin_unlock_irqrestore(&hwgc->lock, flags);
     return IRQ_HANDLED;
-}
-
-static ssize_t hwgc_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
-{
-    struct hwgc_dev *hwgc = file->private_data;
-    u32 offset = *ppos;
-    printk("offset: %x\n", offset);
-
-    void __iomem *addr = hwgc->mmio + offset;
-    struct HWGCParameter hwgc_par;
-    switch (offset)
-    {
-    case REG_PAR:
-        if (count != sizeof(hwgc_par))
-            return -EINVAL;
-        if (copy_from_user(&hwgc_par, buf, count))
-            return -EFAULT;
-        writeq((u64)hwgc_par.chunkSize | (u64)hwgc_par.ageThreshold << 32, addr);
-        writeq((u64)hwgc_par.heapRegionBias | (u64)hwgc_par.regionAttrShiftBy << 32, addr + 0x8);
-        writeq((u64)hwgc_par.heapRegionShiftBy | (u64)hwgc_par.logOfHRGrainBytes << 32, addr + 0x10);
-        writeq(hwgc_par.stepperOffset, addr + 0x18);
-        writeq(hwgc_par.youngWordsBase, addr + 0x20);
-        writeq(hwgc_par.regionAttrBase, addr + 0x28);
-        writeq(hwgc_par.plabAllocatorPtr, addr + 0x30);
-        writeq(hwgc_par.regionAttrBiasedBase, addr + 0x38);
-        writeq(hwgc_par.heapRegionBiasedBase, addr + 0x40);
-        writeq(hwgc_par.parScanThreadStatePtr, addr + 0x48);
-        writeq(hwgc_par.taskQueueBottomAddr, addr + 0x50);
-        writeq(hwgc_par.taskQueueAgeTopAddr, addr + 0x58);
-        writeq(hwgc_par.taskQueueElemsBase, addr + 0x60);
-        writeq(hwgc_par.humogousReclaimCandidateBoolBase, addr + 0x68);
-        printk("1111\n");
-        break;
-    case REG_START_WORK:
-        writel(HWGC_STATUS_IRQ, hwgc->mmio + REG_STATUS);
-        writeq(1, addr);
-        break;
-    default:
-        break;
-    }
-    *ppos += count;
-    return count;
 }
 
 static ssize_t hwgc_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
     struct hwgc_dev *hwgc = file->private_data;
-    u32 offset = *ppos;
+    loff_t offset = *ppos;
     u64 val = ~0ULL;
-    void __iomem *addr = hwgc->mmio + offset;
     switch (offset)
     {
     case REG_DEVICE_ID:
-        val = readl(addr);
+        val = readl(hwgc->mmio + offset);
+        hwgc->state = HWGC_IDLE;
         break;
-
+    case REG_STATUS:
+        val = hwgc->state;
+        break;
+    case REG_SOFT_PAR0:
+        val = readq(hwgc->mmio + offset);
+        break;
+    case REG_SOFT_PAR1:
+        val = readq(hwgc->mmio + offset);
+        break;
+    case REG_SOFT_PAR2:
+        val = readq(hwgc->mmio + offset);
+        break;
+    case REG_SOFT_PAR3:
+        val = readq(hwgc->mmio + offset);
+        break;
     default:
         break;
     }
@@ -141,6 +102,81 @@ static ssize_t hwgc_read(struct file *file, char __user *buf, size_t count, loff
 
     *ppos += count;
     return count;
+}
+
+static void hwgc_write_params(struct hwgc_dev *hwgc, const struct HWGCParameter *par)
+{
+    void __iomem *base = hwgc->mmio + REG_PAR;
+    writeq(FIELD64(par->chunkSize, par->ageThreshold), base + 0x00);
+    writeq(FIELD64(par->heapRegionBias, par->regionAttrShiftBy), base + 0x08);
+    writeq(FIELD64(par->heapRegionShiftBy, par->logOfHRGrainBytes), base + 0x10);
+    writeq(par->stepperOffset, base + 0x18);
+    writeq(par->youngWordsBase, base + 0x20);
+    writeq(par->regionAttrBase, base + 0x28);
+    writeq(par->plabAllocatorPtr, base + 0x30);
+    writeq(par->regionAttrBiasedBase, base + 0x38);
+    writeq(par->heapRegionBiasedBase, base + 0x40);
+    writeq(par->parScanThreadStatePtr, base + 0x48);
+    writeq(par->taskQueueBottomAddr, base + 0x50);
+    writeq(par->taskQueueAgeTopAddr, base + 0x58);
+    writeq(par->taskQueueElemsBase, base + 0x60);
+    writeq(par->humogousReclaimCandidateBoolBase, base + 0x68);
+}
+
+static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    struct hwgc_dev *hwgc = file->private_data;
+    struct HWGCParameter hwgc_par;
+    int state;
+    uint64_t res;
+    unsigned long flags;
+
+    switch (cmd)
+    {
+    case HWGC_IOC_START:
+        if (copy_from_user(&hwgc_par, (void __user *)arg, sizeof(hwgc_par)))
+            return -EFAULT;
+
+        hwgc_write_params(hwgc, &hwgc_par);
+
+        writel(HWGC_STATUS_IRQ, hwgc->mmio + REG_STATUS); // 使能中断
+        writel(1, hwgc->mmio + REG_START_WORK);
+
+        spin_lock_irqsave(&hwgc->lock, flags);
+        hwgc->state = HWGC_RUNNING;
+        spin_unlock_irqrestore(&hwgc->lock, flags);
+        break;
+
+    case HWGC_IOC_WAIT_EVENT:
+        wait_event_interruptible(hwgc->waitq,
+                                 hwgc->state != HWGC_IDLE && hwgc->state != HWGC_RUNNING);
+        spin_lock_irqsave(&hwgc->lock, flags);
+        state = hwgc->state;
+        if (state == HWGC_DONE)
+            hwgc->state = HWGC_IDLE;
+        spin_unlock_irqrestore(&hwgc->lock, flags);
+
+        if (copy_to_user((void __user *)arg, &state, sizeof(state)))
+            return -EFAULT;
+        break;
+
+    case HWGC_IOC_SOFT_PROVIDE:
+        spin_lock_irqsave(&hwgc->lock, flags);
+        if (hwgc->state == HWGC_WAIT_MALLOC)
+        {
+            if (copy_from_user(&res, (void __user *)arg, sizeof(res)))
+                return -EFAULT;
+            writeq(res, hwgc->mmio + REG_SOFT_RES);
+        }
+        hwgc->state = HWGC_RUNNING;
+        spin_lock_irqrestore(&hwgc->lock, flags);
+        writel(1, hwgc->mmio + REG_CONTINUE_WORK);
+        break;
+
+    default:
+        break;
+    }
+    return 0;
 }
 
 static int hwgc_open(struct inode *inode, struct file *file)
@@ -154,7 +190,7 @@ static const struct file_operations hwgc_fops = {
     .owner = THIS_MODULE,
     .open = hwgc_open,
     .read = hwgc_read,
-    .write = hwgc_write,
+    .unlocked_ioctl = hwgc_ioctl,
     .llseek = default_llseek, // support lseek function
 };
 
@@ -168,9 +204,10 @@ static int hwgc_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (!hwgc)
         return -ENOMEM;
 
-    // initial completion to identify interrupt done
-    init_completion(&hwgc->done);
     hwgc->pdev = pdev;
+    hwgc->state = HWGC_IDLE;
+    spin_lock_init(&hwgc->lock);
+    init_waitqueue_head(&hwgc->waitq);
 
     // enable pci/pcie device
     ret = pcim_enable_device(pdev);
@@ -265,18 +302,7 @@ static struct pci_driver hwgc_pci_driver = {
     .remove = hwgc_remove,
 };
 
-static int __init hwgc_init(void)
-{
-    return pci_register_driver(&hwgc_pci_driver);
-}
-
-static void __exit hwgc_exit(void)
-{
-    pci_unregister_driver(&hwgc_pci_driver);
-}
-
-module_init(hwgc_init);
-module_exit(hwgc_exit);
+module_pci_driver(hwgc_pci_driver);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("QEMU hwgc driver with user-space test support");

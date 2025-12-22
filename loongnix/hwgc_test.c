@@ -7,50 +7,8 @@
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
-
-struct HWGCParameter
-{
-    uint32_t chunkSize;
-    uint32_t ageThreshold;
-    uint32_t heapRegionBias;
-    uint32_t regionAttrShiftBy;
-    uint32_t heapRegionShiftBy;
-    uint32_t logOfHRGrainBytes;
-    uint64_t stepperOffset;
-    uint64_t youngWordsBase;
-    uint64_t regionAttrBase;
-    uint64_t plabAllocatorPtr;
-    uint64_t regionAttrBiasedBase;
-    uint64_t heapRegionBiasedBase;
-    uint64_t parScanThreadStatePtr;
-    uint64_t taskQueueBottomAddr;
-    uint64_t taskQueueAgeTopAddr;
-    uint64_t taskQueueElemsBase;
-    uint64_t humogousReclaimCandidateBoolBase;
-};
-
-#define REG_DEVICE_ID 0x0
-#define REG_PAR 0x10
-#define REG_START_WORK 0x80
-
-// 辅助函数：安全地执行 lseek 并验证
-off_t safe_lseek(int fd, off_t offset, const char *reg_name)
-{
-    off_t pos = lseek(fd, offset, SEEK_SET);
-    if (pos == (off_t)-1)
-    {
-        perror("lseek failed");
-        return -1;
-    }
-    if (pos != offset)
-    {
-        fprintf(stderr, "lseek to %s (0x%lx) returned unexpected position: 0x%lx\n",
-                reg_name, (unsigned long)offset, (unsigned long)pos);
-        return -1;
-    }
-    printf("✅ Successfully seeked to %s (offset=0x%lx)\n", reg_name, (unsigned long)pos);
-    return pos;
-}
+#include <sys/ioctl.h>
+#include "hwgc_ioctl.h"
 
 int main(void)
 {
@@ -61,25 +19,15 @@ int main(void)
         return EXIT_FAILURE;
     }
 
-    // 1. 读取设备 ID
-    printf("Reading device ID...\n");
-    if (safe_lseek(fd, REG_DEVICE_ID, "REG_DEVICE_ID") == (off_t)-1)
-    {
-        close(fd);
-        return EXIT_FAILURE;
-    }
+    if (lseek(fd, REG_DEVICE_ID, SEEK_SET) == (off_t)-1)
+        goto lseek_failed;
 
     uint32_t dev_id = 0;
     ssize_t ret = read(fd, &dev_id, sizeof(dev_id));
     if (ret != sizeof(dev_id))
-    {
-        perror("Read device ID failed");
-        close(fd);
-        return EXIT_FAILURE;
-    }
+        goto read_failed;
     printf("Device ID: 0x%08x\n", dev_id);
 
-    // 2. 构造测试参数
     struct HWGCParameter par = {0};
     par.chunkSize = 1024;
     par.ageThreshold = 15;
@@ -88,42 +36,48 @@ int main(void)
     par.heapRegionShiftBy = 21;
     par.logOfHRGrainBytes = 20;
 
-    // 3. 写入参数到 REG_PAR
-    printf("\nWriting HWGC parameters...\n");
-    if (safe_lseek(fd, REG_PAR, "REG_PAR") == (off_t)-1)
+    int state;
+    do
     {
-        close(fd);
-        return EXIT_FAILURE;
-    }
+        ssize_t ret = read(fd, &state, sizeof(state));
+        if (ret != sizeof(state))
+            goto read_failed;
+    } while (state != HWGC_IDLE);
 
-    ret = write(fd, &par, sizeof(par));
-    if (ret != sizeof(par))
-    {
-        perror("Write parameters failed");
-        close(fd);
-        return EXIT_FAILURE;
-    }
-    printf("✅ Parameters written successfully.\n");
+    printf("device driver is free, can start new work\n");
+    ioctl(fd, HWGC_IOC_START, &par);
 
-    // 4. 触发硬件开始工作
-    printf("\nStarting HWGC work...\n");
-    if (safe_lseek(fd, REG_START_WORK, "REG_START_WORK") == (off_t)-1)
+    while (1)
     {
-        close(fd);
-        return EXIT_FAILURE;
+        ioctl(fd, HWGC_IOC_WAIT_EVENT, &state);
+        if (state == HWGC_DONE)
+        {
+            printf("the work is done\n");
+            break;
+        }
+        if (state == HWGC_WAIT_MALLOC)
+        {
+            printf("do malloc\n");
+            if (lseek(fd, REG_SOFT_PAR0, SEEK_SET) == (off_t)-1)
+                goto lseek_failed;
+            uint64_t par0, par1;
+            read(fd, &par0, sizeof(par0));
+            read(fd, &par1, sizeof(par1));
+            uint64_t res = par0 + par1;
+            printf("%lld %lld soft res is %lx\n", par0, par1, res);
+            ioctl(fd, HWGC_IOC_SOFT_PROVIDE, &res);
+        }
     }
-
-    uint64_t start_val = 1;
-    ret = write(fd, &start_val, sizeof(start_val));
-    if (ret != sizeof(start_val))
-    {
-        perror("Start work failed");
-        close(fd);
-        return EXIT_FAILURE;
-    }
-    printf("✅ Work started.\n");
 
     close(fd);
-    printf("\nTest completed.\n");
+    printf("Test completed\n");
     return EXIT_SUCCESS;
+lseek_failed:
+    perror("lseek failed");
+    close(fd);
+    return EXIT_FAILURE;
+read_failed:
+    perror("read failed");
+    close(fd);
+    return EXIT_FAILURE;
 }
