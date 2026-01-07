@@ -1,4 +1,5 @@
 // hwgc_driver.c
+#include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/io.h>
 #include <linux/fs.h>
@@ -6,16 +7,40 @@
 #include <linux/interrupt.h>
 #include <linux/wait.h>
 #include <linux/sched.h>
+#include <linux/uaccess.h>
 #include "hwgc_ioctl.h"
 
 #define IRQ_ALLOC_SLOW 0x00000001
-#define IRQ_ENQUEUE_FAILED 0x00000100
-#define IRQ_COMPLETE 0x00010000
+#define IRQ_ENQUEUE_FAILED 0x00000010
+#define IRQ_PAGEFAULT 0x00000100
+#define IRQ_COMPLETE 0x00001000
 
-#define HWGC_STATUS_IRQ 0x80
 #define HWGC_STATUS_COMPUTING 0x01
+#define HWGC_STATUS_WAKE 0x02
+#define HWGC_STATUS_IRQ 0x04
 
 #define HWGC_DEV_NAME "hwgc"
+
+struct HWGCParameter
+{
+    u32 chunkSize;
+    u32 ageThreshold;
+    u32 heapRegionBias;
+    u32 regionAttrShiftBy;
+    u32 heapRegionShiftBy;
+    u32 logOfHRGrainBytes;
+    u64 stepperOffset;
+    u64 youngWordsBase;
+    u64 regionAttrBase;
+    u64 plabAllocatorPtr;
+    u64 regionAttrBiasedBase;
+    u64 heapRegionBiasedBase;
+    u64 parScanThreadStatePtr;
+    u64 taskQueueBottomAddr;
+    u64 taskQueueElemsBase;
+    u64 humogousReclaimCandidateBoolBase;
+    u64 cardTablePtr;
+};
 
 struct hwgc_dev
 {
@@ -49,14 +74,17 @@ static irqreturn_t hwgc_irq_handler(int irq, void *dev_id)
     } irq_map[] = {
         {IRQ_ALLOC_SLOW, HWGC_WAIT_MALLOC},
         {IRQ_ENQUEUE_FAILED, HWGC_WAIT_ENQUEUED},
+        {IRQ_PAGEFAULT, HWGC_WAIT_PAGEFAULT},
         {IRQ_COMPLETE, HWGC_DONE},
     };
 
     // 一次只处理一个中断
-    for (int i = 0; i < ARRAY_SIZE(irq_map), ++i)
+    int i = 0;
+    for (; i < ARRAY_SIZE(irq_map); ++i)
     {
         if (irq_status & irq_map[i].mask)
         {
+            printk("receive %x %x\n", irq_map[i].new_state);
             iowrite32(irq_map[i].mask, hwgc->mmio + REG_CLEAR_IRQ);
             hwgc->state = irq_map[i].new_state;
             wake_up_interruptible(&hwgc->waitq);
@@ -118,13 +146,14 @@ static void hwgc_write_params(struct hwgc_dev *hwgc, const struct HWGCParameter 
     writeq(par->heapRegionBiasedBase, base + 0x40);
     writeq(par->parScanThreadStatePtr, base + 0x48);
     writeq(par->taskQueueBottomAddr, base + 0x50);
-    writeq(par->taskQueueAgeTopAddr, base + 0x58);
-    writeq(par->taskQueueElemsBase, base + 0x60);
-    writeq(par->humogousReclaimCandidateBoolBase, base + 0x68);
+    writeq(par->taskQueueElemsBase, base + 0x58);
+    writeq(par->humogousReclaimCandidateBoolBase, base + 0x60);
+    writeq(par->cardTablePtr, base + 0x68);
 }
 
 static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+    printk("the cmd is %x\n", cmd);
     struct hwgc_dev *hwgc = file->private_data;
     struct HWGCParameter hwgc_par;
     int state;
@@ -137,10 +166,10 @@ static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         if (copy_from_user(&hwgc_par, (void __user *)arg, sizeof(hwgc_par)))
             return -EFAULT;
 
-        hwgc_write_params(hwgc, &hwgc_par);
+        hwgc_write_params(hwgc, &hwgc_par); // write parameters
 
-        writel(HWGC_STATUS_IRQ, hwgc->mmio + REG_STATUS); // 使能中断
-        writel(1, hwgc->mmio + REG_START_WORK);
+        writel(HWGC_STATUS_IRQ, hwgc->mmio + REG_STATUS); // enable interrupts
+        writel(1, hwgc->mmio + REG_START_WORK);           // start work
 
         spin_lock_irqsave(&hwgc->lock, flags);
         hwgc->state = HWGC_RUNNING;
@@ -162,14 +191,14 @@ static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     case HWGC_IOC_SOFT_PROVIDE:
         spin_lock_irqsave(&hwgc->lock, flags);
-        if (hwgc->state == HWGC_WAIT_MALLOC)
+        if (hwgc->state == HWGC_WAIT_MALLOC || hwgc->state == HWGC_WAIT_PAGEFAULT)
         {
             if (copy_from_user(&res, (void __user *)arg, sizeof(res)))
                 return -EFAULT;
             writeq(res, hwgc->mmio + REG_SOFT_RES);
         }
         hwgc->state = HWGC_RUNNING;
-        spin_lock_irqrestore(&hwgc->lock, flags);
+        spin_unlock_irqrestore(&hwgc->lock, flags);
         writel(1, hwgc->mmio + REG_CONTINUE_WORK);
         break;
 

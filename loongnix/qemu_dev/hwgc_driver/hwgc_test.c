@@ -9,7 +9,26 @@
 #include <errno.h>
 #include <sys/ioctl.h>
 #include "hwgc_ioctl.h"
-
+struct HWGCParameter
+{
+    uint32_t chunkSize;
+    uint32_t ageThreshold;
+    uint32_t heapRegionBias;
+    uint32_t regionAttrShiftBy;
+    uint32_t heapRegionShiftBy;
+    uint32_t logOfHRGrainBytes;
+    uint64_t stepperOffset;
+    uint64_t youngWordsBase;
+    uint64_t regionAttrBase;
+    uint64_t plabAllocatorPtr;
+    uint64_t regionAttrBiasedBase;
+    uint64_t heapRegionBiasedBase;
+    uint64_t parScanThreadStatePtr;
+    uint64_t taskQueueBottomAddr;
+    uint64_t taskQueueElemsBase;
+    uint64_t humogousReclaimCandidateBoolBase;
+    uint64_t cardTablePtr;
+};
 int main(void)
 {
     int fd = open("/dev/hwgc", O_RDWR);
@@ -29,12 +48,8 @@ int main(void)
     printf("Device ID: 0x%08x\n", dev_id);
 
     struct HWGCParameter par = {0};
-    par.chunkSize = 1024;
-    par.ageThreshold = 15;
-    par.heapRegionBias = 0x100000;
-    par.regionAttrShiftBy = 20;
-    par.heapRegionShiftBy = 21;
-    par.logOfHRGrainBytes = 20;
+    uint localBot = 0;
+    par.taskQueueBottomAddr = (uintptr_t)&localBot;
 
     int state;
     do

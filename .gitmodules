@@ -4,3 +4,6 @@
 [submodule "qemu"]
 	path = qemu
 	url = git@github.com:ysxAshore/QEMU.git
+[submodule "loongnix/jdk17u"]
+	path = loongnix/jdk/jdk17u
+	url = git@github.com:ysxAshore/JDK17u.git
