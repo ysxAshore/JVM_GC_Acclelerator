@@ -14,6 +14,7 @@
 #define IRQ_ENQUEUE_FAILED 0x00000010
 #define IRQ_PAGEFAULT 0x00000100
 #define IRQ_COMPLETE 0x00001000
+#define IRQ_DEBUG 0x00010000
 
 #define HWGC_STATUS_COMPUTING 0x01
 #define HWGC_STATUS_WAKE 0x02
@@ -40,6 +41,13 @@ struct HWGCParameter
     u64 taskQueueElemsBase;
     u64 humogousReclaimCandidateBoolBase;
     u64 cardTablePtr;
+    u64 g1h;
+    u64 intArrayKlassObj;
+    u64 objectKlass;
+    u64 lockPtr;
+    u64 thread;
+    u64 dummyRegion;
+    u64 numaPtr;
 };
 
 struct hwgc_dev
@@ -76,6 +84,7 @@ static irqreturn_t hwgc_irq_handler(int irq, void *dev_id)
         {IRQ_ENQUEUE_FAILED, HWGC_WAIT_ENQUEUED},
         {IRQ_PAGEFAULT, HWGC_WAIT_PAGEFAULT},
         {IRQ_COMPLETE, HWGC_DONE},
+        {IRQ_DEBUG, HWGC_DEBUG},
     };
 
     // 一次只处理一个中断
@@ -84,7 +93,6 @@ static irqreturn_t hwgc_irq_handler(int irq, void *dev_id)
     {
         if (irq_status & irq_map[i].mask)
         {
-            printk("receive %x %x\n", irq_map[i].new_state);
             iowrite32(irq_map[i].mask, hwgc->mmio + REG_CLEAR_IRQ);
             hwgc->state = irq_map[i].new_state;
             wake_up_interruptible(&hwgc->waitq);
@@ -149,11 +157,17 @@ static void hwgc_write_params(struct hwgc_dev *hwgc, const struct HWGCParameter 
     writeq(par->taskQueueElemsBase, base + 0x58);
     writeq(par->humogousReclaimCandidateBoolBase, base + 0x60);
     writeq(par->cardTablePtr, base + 0x68);
+    writeq(par->g1h, base + 0x70);
+    writeq(par->intArrayKlassObj, base + 0x78);
+    writeq(par->objectKlass, base + 0x80);
+    writeq(par->lockPtr, base + 0x88);
+    writeq(par->thread, base + 0x90);
+    writeq(par->dummyRegion, base + 0x98);
+    writeq(par->numaPtr, base + 0xa0);
 }
 
 static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    printk("the cmd is %x\n", cmd);
     struct hwgc_dev *hwgc = file->private_data;
     struct HWGCParameter hwgc_par;
     int state;
@@ -189,9 +203,15 @@ static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return -EFAULT;
         break;
 
+    case HWGC_IOC_DEBUG_WRITE:
+        if (copy_from_user(&res, (void __user *)arg, sizeof(res)))
+            return -EFAULT;
+        writeq(res, hwgc->mmio + REG_SOFT_PAR3);
+        break;
+
     case HWGC_IOC_SOFT_PROVIDE:
         spin_lock_irqsave(&hwgc->lock, flags);
-        if (hwgc->state == HWGC_WAIT_MALLOC || hwgc->state == HWGC_WAIT_PAGEFAULT)
+        if (hwgc->state == HWGC_WAIT_MALLOC || hwgc->state == HWGC_WAIT_PAGEFAULT || hwgc->state == HWGC_WAIT_ENQUEUED || hwgc->state == HWGC_DEBUG)
         {
             if (copy_from_user(&res, (void __user *)arg, sizeof(res)))
                 return -EFAULT;
