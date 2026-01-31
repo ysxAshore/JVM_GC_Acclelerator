@@ -22,13 +22,13 @@ enum hwgc_state
 #define REG_INT_STATUS 0x8
 #define REG_CLEAR_IRQ 0xc
 #define REG_PAR 0x10
-#define REG_START_WORK 0xc0
-#define REG_CONTINUE_WORK 0xc4
-#define REG_SOFT_RES 0xc8
-#define REG_SOFT_PAR0 0xd0
-#define REG_SOFT_PAR1 0xd8
-#define REG_SOFT_PAR2 0xe0
-#define REG_SOFT_PAR3 0xe8
+#define REG_START_WORK 0xd0
+#define REG_CONTINUE_WORK 0xd4
+#define REG_SOFT_RES 0xd8
+#define REG_SOFT_PAR0 0xe0
+#define REG_SOFT_PAR1 0xe8
+#define REG_SOFT_PAR2 0xf0
+#define REG_SOFT_PAR3 0xf8
 
 // get array size
 

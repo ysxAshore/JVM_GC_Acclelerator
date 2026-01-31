@@ -48,6 +48,12 @@ struct HWGCParameter
     u64 thread;
     u64 dummyRegion;
     u64 numaPtr;
+    u64 compressedOopBase;
+    u64 compressedKlassPointerBase;
+    u8 compressedOopShift;
+    u8 compressedKlassPointerShift;
+    u8 useCompressedOops;
+    u8 useCompressedKlassPointers;
 };
 
 struct hwgc_dev
@@ -164,6 +170,9 @@ static void hwgc_write_params(struct hwgc_dev *hwgc, const struct HWGCParameter 
     writeq(par->thread, base + 0x90);
     writeq(par->dummyRegion, base + 0x98);
     writeq(par->numaPtr, base + 0xa0);
+    writeq(par->compressedOopBase, base + 0xa8);
+    writeq(par->compressedKlassPointerBase, base + 0xb0);
+    writeq((((u64)(par->compressedOopShift) << 24) | ((u64)(par->compressedKlassPointerShift) << 16) | ((u64)(par->useCompressedOops) << 8) | ((u64)(par->useCompressedKlassPointers))), base + 0xb8);
 }
 
 static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
