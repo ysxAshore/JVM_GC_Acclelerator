@@ -9,9 +9,9 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
   val io = new Bundle{
     val Mreq = master(new LocalMMUIO)
     val Fetch2Process = slave(new GCFetch2ProcessUnit)
-    val Process2Trace = master(new GCProcess2Trace)
+    val Process2Trace = master(new GCToTrace)
     val ConfigIO = slave(new GCArrayProcessConfigIO)
-    val DebugTimeStamp = in(UInt(MMUDataWidth bits))
+    val DebugTimeStamp = in(UInt(64 bits))
   }
 
   // default value
@@ -40,30 +40,18 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
 
   val state = RegInit(overall_state.s_idle)
 
-  val chunk_size = RegInit(U(0, 32 bits))
-  val task_limit = RegInit(U(0, 32 bits))
-  val task_fanout = RegInit(U(0, 32 bits))
-  val heapRegionShiftBy = RegInit(U(0, 32 bits))
-  val heapRegionBiasedBase = RegInit(U(0, MMUAddrWidth bits))
-
   val oopType = RegInit(U(0, GCOopTypeWidth bits))
-  val srcOopPtr = RegInit(U(0, MMUAddrWidth bits))
-  val destOopPtr = RegInit(U(0,MMUAddrWidth bits))
-  val markWord = RegInit(U(0, MMUDataWidth bits))
+  val srcOopPtr = RegInit(U(0, GCElementWidth bits))
+  val destOopPtr = RegInit(U(0, GCElementWidth bits))
+  val markWord = RegInit(U(0, GCElementWidth bits))
 
   when(state === overall_state.s_idle){
     io.Fetch2Process.Ready := True
     when(io.Fetch2Process.Valid && io.Fetch2Process.Ready){
-      chunk_size := io.ConfigIO.ChunkSize
-      task_limit := io.ConfigIO.StepperOffset(31 downto 0)
-      task_fanout := io.ConfigIO.StepperOffset(63 downto 32)
-      heapRegionShiftBy := io.ConfigIO.HeapRegionShiftBy
-      heapRegionBiasedBase := io.ConfigIO.HeapRegionBiasedBase
-
       oopType := io.Fetch2Process.OopType
       srcOopPtr := io.Fetch2Process.SrcOopPtr
       markWord := io.Fetch2Process.MarkWord
-      destOopPtr := io.Fetch2Process.MarkWord & ~U(LOCK_MASK_IN_PLACE, MMUDataWidth bits)
+      destOopPtr := io.Fetch2Process.MarkWord & ~U(x"3", GCElementWidth bits)
 
       state := overall_state.s_readSrcLen
 
@@ -73,7 +61,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
           ">]Receive task from Fetch Module",
           ", the srcOopPtr is ", io.Fetch2Process.SrcOopPtr,
           ", the markWord is ", io.Fetch2Process.MarkWord,
-          ", the destOopPtr is ", io.Fetch2Process.MarkWord & ~U(LOCK_MASK_IN_PLACE, MMUDataWidth bits),
+          ", the destOopPtr is ", io.Fetch2Process.MarkWord & ~U"x3".resize(GCElementWidth bits),
           "\n"
         ))
       }
@@ -83,7 +71,8 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
   val srcLength = RegInit(U(0, 32 bits))
   val reqIssued = RegInit(False)
   when(state === overall_state.s_readSrcLen){
-    issueReq(io.Mreq, (srcOopPtr + U(ArrayLenOff)).resize(MMUAddrWidth bits), False, U(0), U(0), reqIssued) { rd =>
+    val addr = (srcOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(12), U(16))).resize(MMUAddrWidth bits)
+    issueReq(io.Mreq, addr, False, U(0), U(0), reqIssued) { rd =>
       srcLength := rd(31 downto 0)
       state := overall_state.s_readDestLen
     }
@@ -94,30 +83,33 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
   val stepNCreate = RegInit(U(0, 32 bits))
   val destLenWriteDone = RegInit(False)
   when(state === overall_state.s_readDestLen){
-    issueReq(io.Mreq, (destOopPtr + U(ArrayLenOff)).resize(MMUAddrWidth bits), False, U(0), U(0), reqIssued) { rd =>
+    val addr = (destOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(12), U(16))).resize(MMUAddrWidth bits)
+    issueReq(io.Mreq, addr, False, U(0), U(0), reqIssued) { rd =>
       destLength := rd(31 downto 0)
-      val task_num = (rd(31 downto 0) / chunk_size).resize(32 bits)
-      val remaining_tasks = ((srcLength - rd(31 downto 0)) / chunk_size).resize(32 bits)
-      val max_pending = ((task_fanout - U(1)) * task_num + U(1)).resize(32 bits)
-      val pending = max_pending.min(remaining_tasks).min(task_limit)
-      stepNCreate := task_fanout.min(remaining_tasks.min(task_limit + U(1)) - pending).resize(32 bits)
-      stepIndex := destLength + chunk_size
+      val task_num = (rd(31 downto 0) / io.ConfigIO.ChunkSize).resize(32 bits)
+      val remaining_tasks = ((srcLength - rd(31 downto 0)) / io.ConfigIO.ChunkSize).resize(32 bits)
+      val max_pending = ((io.ConfigIO.StepperOffset(63 downto 32) - U(1)) * task_num + U(1)).resize(32 bits)
+      val pending = max_pending.min(remaining_tasks).min(io.ConfigIO.StepperOffset(31 downto 0))
+      stepNCreate := io.ConfigIO.StepperOffset(63 downto 32).min(remaining_tasks.min(io.ConfigIO.StepperOffset(31 downto 0) + U(1)) - pending).resize(32 bits)
+      stepIndex := destLength + io.ConfigIO.ChunkSize
       destLenWriteDone := False
       state := overall_state.s_readHeapRegionPtr
     }
   }
 
-  val heap_region = RegInit(U(0,MMUAddrWidth bits))
+  val heap_region = RegInit(U(0, GCElementWidth bits))
   when(state === overall_state.s_readHeapRegionPtr){
-    issueReq(io.Mreq, (heapRegionBiasedBase + (destOopPtr >> heapRegionShiftBy) * U(GCObjectPtr_Size)).resize(MMUAddrWidth bits), False, U(0), U(0), reqIssued){ rd =>
-      heap_region := rd
+    val addr = (io.ConfigIO.HeapRegionBiasedBase + (destOopPtr >> io.ConfigIO.HeapRegionShiftBy) * U(8)).resize(MMUAddrWidth bits)
+    issueReq(io.Mreq, addr, False, U(0), U(0), reqIssued){ rd =>
+      heap_region := rd(GCElementWidth - 1 downto 0)
       state := overall_state.s_readHeapRegionType
     }
   }
 
   val scanning_in_young = RegInit(False)
   when(state === overall_state.s_readHeapRegionType){
-    issueReq(io.Mreq, (heap_region + U(HEAP_REGION_TYPE_OFFSET)).resize(MMUAddrWidth bits), False, U(0), U(0), reqIssued){ rd =>
+    val addr = (heap_region + U"xbc").resize(MMUAddrWidth bits)
+    issueReq(io.Mreq, addr, False, U(0), U(0), reqIssued){ rd =>
       scanning_in_young := (rd(31 downto 0) & U(2, 32 bits)) =/= U(0)
       state := overall_state.s_doTrace
     }
@@ -131,7 +123,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
     io.Process2Trace.ScanningInYoung := scanning_in_young
     io.Process2Trace.StepIndex := stepIndex
     io.Process2Trace.StepNCreate := stepNCreate
-    io.Process2Trace.ArrayLength := destLength + chunk_size
+    io.Process2Trace.ArrayLength := destLength + io.ConfigIO.ChunkSize
     io.Process2Trace.PartialArrayStart := destLength
 
     when(io.Process2Trace.Valid && io.Process2Trace.Ready){
@@ -147,22 +139,8 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
     }
   }
 
-  when(state === overall_state.s_doTrace || state === overall_state.s_waitDone){
-    when(!destLenWriteDone){
-      issueReq(io.Mreq, (destOopPtr + U(ArrayLenOff)).resize(MMUAddrWidth bits), True, halfBytesOnes, (destLength + chunk_size).resize(MMUDataWidth bits), reqIssued) { rd =>
-        destLenWriteDone := True
-      }
-    }
-  }
-
-  val traceDone = RegInit(False)
   when(state === overall_state.s_waitDone){
     when(io.Process2Trace.Done){
-      traceDone := True
-    }
-
-    when(destLenWriteDone && (traceDone || io.Process2Trace.Done)){
-      traceDone := False
       io.Fetch2Process.Done := True
 
       state := overall_state.s_idle

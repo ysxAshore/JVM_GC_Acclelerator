@@ -8,11 +8,11 @@ import scala.language.postfixOps
 class GCOopProcess extends Module with HWParameters with GCParameters{
   val io = new Bundle{
     val Mreq = master(new LocalMMUIO)
-    val Process2Aop = master(new AopParameters)
+    val Process2Aop = master(new ToAopParameters)
     val Fetch2Process = slave(new GCFetch2ProcessUnit)
     val Process2CopySurvivor = master(new GCProcess2Survivor)
     val ConfigIO = slave(new GCOopProcessConfigIO)
-    val DebugTimeStamp = in(UInt(MMUDataWidth bits))
+    val DebugTimeStamp = in(UInt(64 bits))
   }
 
   // default value
@@ -31,8 +31,6 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
   io.Process2Aop.Valid := False
   io.Process2Aop.Task := U(0)
   io.Process2Aop.RegionAttr := U(0)
-  io.Process2Aop.CardTablePtr := U(0)
-  io.Process2Aop.ParScanThreadStatePtr := U(0)
 
   object overall_state extends SpinalEnum {
     val s_idle, s_sendCopy2Survivor, s_waitDone1, s_writeTask, s_readHR, s_readHRType, s_sendAop, s_waitDone2 = newElement()
@@ -40,18 +38,10 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
 
   val state = RegInit(overall_state.s_idle)
 
-  val pss = RegInit(U(0, MMUAddrWidth bits))
-  val ct_ptr = RegInit(U(0, MMUAddrWidth bits))
-  val regionAttrShiftBy = RegInit(U(0, 32 bits))
-  val regionAttrBiasedBase = RegInit(U(0, MMUAddrWidth bits))
-  val logOfHRGrainBytes = RegInit(U(0, 32 bits))
-  val heapRegionShiftBy = RegInit(U(0, 32 bits))
-  val heapRegionBiasedBase = RegInit(U(0, MMUAddrWidth bits))
-
-  val task = RegInit(U(0, MMUAddrWidth bits))
-  val srcOopPtr = RegInit(U(0, MMUAddrWidth bits))
-  val destOopPtr = RegInit(U(0,MMUAddrWidth bits))
-  val markWord = RegInit(U(0, MMUDataWidth bits))
+  val task = RegInit(U(0, GCElementWidth bits))
+  val srcOopPtr = RegInit(U(0, GCElementWidth bits))
+  val destOopPtr = RegInit(U(0, GCElementWidth bits))
+  val markWord = RegInit(U(0, GCElementWidth bits))
 
   def resetState(): Unit = {
     state := overall_state.s_idle
@@ -61,21 +51,13 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
   when(state === overall_state.s_idle){
     io.Fetch2Process.Ready := True
     when(io.Fetch2Process.Valid && io.Fetch2Process.Ready){
-      pss := io.ConfigIO.ParScanThreadStatePtr
-      ct_ptr := io.ConfigIO.CardTablePtr
-      regionAttrShiftBy := io.ConfigIO.RegionAttrShiftBy
-      regionAttrBiasedBase := io.ConfigIO.RegionAttrBiasedBase
-      logOfHRGrainBytes := io.ConfigIO.LogOfHRGrainBytes
-      heapRegionShiftBy := io.ConfigIO.HeapRegionShiftBy
-      heapRegionBiasedBase := io.ConfigIO.HeapRegionBiasedBase
-
       task := io.Fetch2Process.Task
       srcOopPtr := io.Fetch2Process.SrcOopPtr
       markWord := io.Fetch2Process.MarkWord
 
-      val doCopy2Survivor = (io.Fetch2Process.MarkWord & U(LOCK_MASK_IN_PLACE, MMUDataWidth bits)) =/= U(MARKED_VALUE, MMUDataWidth bits)
+      val doCopy2Survivor = (io.Fetch2Process.MarkWord & U(x"3", GCElementWidth bits)) =/= U(x"3", GCElementWidth bits)
       when(!doCopy2Survivor){
-        destOopPtr := io.Fetch2Process.MarkWord & ~U(LOCK_MASK_IN_PLACE, MMUDataWidth bits)
+        destOopPtr := io.Fetch2Process.MarkWord & ~U(x"3", GCElementWidth bits)
         state := overall_state.s_writeTask
       }.otherwise{
         state := overall_state.s_sendCopy2Survivor
@@ -87,7 +69,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
           ">]Receive task from Fetch Module",
           ", the srcOopPtr is ", io.Fetch2Process.SrcOopPtr,
           ", the markWord is ", io.Fetch2Process.MarkWord,
-          ", the destOopPtr is ", Mux(doCopy2Survivor, U(0), io.Fetch2Process.MarkWord & ~U(LOCK_MASK_IN_PLACE, MMUDataWidth bits)),
+          ", the destOopPtr is ", Mux(doCopy2Survivor, U(0), io.Fetch2Process.MarkWord & ~U(x"3", GCElementWidth bits)),
           ", the next state is ", Mux(doCopy2Survivor, overall_state.s_sendCopy2Survivor, overall_state.s_writeTask),
           "\n"
         ))
@@ -100,7 +82,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
 
     io.Process2CopySurvivor.SrcOopPtr := srcOopPtr
     io.Process2CopySurvivor.MarkWord := markWord
-    io.Process2CopySurvivor.RegionAttrPtr := (regionAttrBiasedBase + (srcOopPtr >> regionAttrShiftBy) * GCHeapRegionAttr_Size).resized
+    io.Process2CopySurvivor.RegionAttrPtr := (io.ConfigIO.RegionAttrBiasedBase + (srcOopPtr >> io.ConfigIO.RegionAttrShiftBy) * GCHeapRegionAttr_Size).resize(GCElementWidth bits)
 
     when(io.Process2CopySurvivor.Valid && io.Process2CopySurvivor.Ready){
       state := overall_state.s_waitDone1
@@ -133,8 +115,10 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
 
   val reqIssued = RegInit(False)
   when(state === overall_state.s_writeTask){
-    issueReq(io.Mreq, task, True, allBytesOnes, destOopPtr, reqIssued) { rd =>
-      when((task ^ destOopPtr) >> logOfHRGrainBytes === U(0)){
+    val writeObj = Mux(io.ConfigIO.UseCompressedOop, ((destOopPtr - io.ConfigIO.CompressedOopBase) >> io.ConfigIO.CompressedOopShift).resize(GCElementWidth bits), destOopPtr)
+    val writeMask = Mux(io.ConfigIO.UseCompressedOop, getWstrb(4), getWstrb(8))
+    issueReq(io.Mreq, task.resize(MMUAddrWidth bits), True, writeMask, writeObj, reqIssued) { rd =>
+      when((task ^ destOopPtr) >> io.ConfigIO.LogOfHRGrainBytes === U(0)){
         resetState()
       }.otherwise{
         state := overall_state.s_readHR
@@ -142,17 +126,17 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
     }
   }
 
-  val from_region = RegInit(U(0, MMUAddrWidth bits))
+  val heap_region = RegInit(U(0, MMUAddrWidth bits))
   when(state === overall_state.s_readHR){
-    issueReq(io.Mreq, (heapRegionBiasedBase + (task >> heapRegionShiftBy) * U(GCObjectPtr_Size)).resize(MMUAddrWidth bits), False, U(0), U(0), reqIssued){ rd =>
-      from_region := rd
+    issueReq(io.Mreq, (io.ConfigIO.HeapRegionBiasedBase + (task >> io.ConfigIO.HeapRegionShiftBy) * U(GCObjectPtr_Size)).resize(MMUAddrWidth bits), False, U(0), U(0), reqIssued){ rd =>
+      heap_region := rd(GCElementWidth -1 downto 0)
       state := overall_state.s_readHRType
     }
   }
 
   when(state === overall_state.s_readHRType){
-    issueReq(io.Mreq, (from_region + U(HEAP_REGION_TYPE_OFFSET)).resize(MMUAddrWidth bits), False, U(0), U(0), reqIssued){ rd =>
-      when((rd(31 downto 0) & U(YOUNG_MASK, 32 bits)) === U(0)){
+    issueReq(io.Mreq, (heap_region + U"xbc").resize(MMUAddrWidth bits), False, U(0), U(0), reqIssued){ rd =>
+      when((rd(31 downto 0) & U(x"2", 32 bits)) === U(0)){
         state := overall_state.s_sendAop
       }.otherwise{
         resetState()
@@ -164,7 +148,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
   val regionAttr = RegInit(U(0, 16 bits))
   when(state === overall_state.s_sendAop){
     when(!reqDone){
-      val regionAttrPtr = (regionAttrBiasedBase + (destOopPtr >> regionAttrShiftBy) * GCHeapRegionAttr_Size).resize(MMUAddrWidth bits)
+      val regionAttrPtr = (io.ConfigIO.RegionAttrBiasedBase + (destOopPtr >> io.ConfigIO.RegionAttrShiftBy) * GCHeapRegionAttr_Size).resize(MMUAddrWidth bits)
       issueReq(io.Mreq, regionAttrPtr, False, U(0), U(0), reqIssued){ rd =>
         reqDone := True
         regionAttr := rd(15 downto 0)
@@ -173,8 +157,6 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
 
     io.Process2Aop.Valid := reqDone
     io.Process2Aop.Task := task
-    io.Process2Aop.CardTablePtr := ct_ptr
-    io.Process2Aop.ParScanThreadStatePtr := pss
     io.Process2Aop.RegionAttr := regionAttr
 
     when(io.Process2Aop.Valid && io.Process2Aop.Ready){

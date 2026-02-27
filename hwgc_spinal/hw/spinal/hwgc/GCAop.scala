@@ -5,195 +5,242 @@ import spinal.lib._
 
 import scala.language.postfixOps
 
-case class AopStageData() extends Bundle with HWParameters{
-  val dest = UInt(MMUAddrWidth bits)
-  val pss = UInt(MMUAddrWidth bits)
-  val ct_ptr = UInt(MMUAddrWidth bits)
-  val byte_map = UInt(MMUAddrWidth bits)
-  val card_index = UInt(MMUDataWidth bits)
-  val index = UInt(MMUDataWidth bits)
-  val buffer = UInt(MMUAddrWidth bits)
-  val res = UInt(MMUDataWidth bits)
-}
-
 class GCAop extends Module with GCParameters with HWParameters {
   val io = new Bundle{
-    val Aop = slave (new AopParameters)
-    val aopMReqs = Vec.fill(GCaopWorkStages)(new LocalMMUIO)
-    val DebugTimeStamp = in(UInt(MMUDataWidth bits))
-    aopMReqs.foreach(master(_))
+    val Aop = slave (new ToAopParameters)
+    val Mreq = master(new LocalMMUIO)
+    val ConfigIO = slave(new GCAopConfigIO)
+    val DebugTimeStamp = in(UInt(64 bits))
   }
 
-  // default value
-  for(i <- 0 until GCaopWorkStages){
-    io.aopMReqs(i).Request.valid := False
-    io.aopMReqs(i).Request.payload.clearAll()
-    io.aopMReqs(i).Response.ready := False
-  }
+  io.Aop.Done := False
+  io.Aop.Ready := False
 
-  case class Stage() extends Area{
-    val valid = RegInit(False)
-    val reqDone = RegInit(False)
-    val reqIssued = RegInit(False)
-    val reg = RegInit(AopStageData().getZero)
-    val responseData = RegInit(U(0, MMUDataWidth bits))
-  }
+  io.Mreq.Request.valid := False
+  io.Mreq.Request.payload.clearAll()
+  io.Mreq.Response.ready := False
 
-  val stages = Seq.fill(GCaopWorkStages)(Stage())
-
-  io.Aop.Ready := !stages(0).valid
-  io.Aop.Done := !stages.map(_.valid).reduce(_ || _)
-
-  when(io.Aop.Valid && io.Aop.Ready){
-    val s0 = stages(0)
-    s0.valid := io.Aop.RegionAttr(7 downto 0) =/= U(0)
-    s0.reqDone := False
-    s0.reqIssued := False
-    s0.reg.pss := io.Aop.ParScanThreadStatePtr
-    s0.reg.dest := io.Aop.Task
-    s0.reg.ct_ptr := io.Aop.CardTablePtr
-    s0.reg.byte_map := U(0)
-    s0.reg.card_index := U(0)
-    s0.reg.index := U(0)
-    s0.reg.buffer := U(0)
-    s0.reg.res := U(0)
-    if(DebugEnable){
-      report(Seq(
-        "[GCAop<", io.DebugTimeStamp,
-        ">]Receive task",
-        "\n"
-      ))
+  object overall_state extends SpinalEnum {
+    val states = Array.tabulate(18)(i => newElement())
+    for((state, i) <- states.zipWithIndex){
+      state.setName(s"s$i")
     }
   }
 
-  def mmuOpForIndex(i: Int, s: AopStageData): (Bool, UInt, Bool, UInt, UInt) = {
-    val valid = if(i != 4) True else False
-    val write = if(i == 6 || i == 7 || i == 8) True else False
-    val addr = UInt(MMUAddrWidth bits)
-    val wdata = UInt(MMUDataWidth bits)
-    val wmask = Mux(write, allBytesOnes, U(0, MMUDataWidth / 8 bits))
-    i match {
-      case 0 => addr := (s.ct_ptr + BYTE_MAP_OFFSET).resize(MMUAddrWidth bits)
-      case 1 => addr := (s.ct_ptr + BYTE_MAP_BASE_OFFSET).resize(MMUAddrWidth bits)
-      case 2 => addr := (s.pss + LAST_ENQUEUED_CARD_OFFSET).resize(MMUAddrWidth bits)
-      case 3 => addr := (s.pss + QSET_OFFSET + QSET_QUEUE_OFFSET + INDEX_OFFSET).resize(MMUAddrWidth bits)
-      case 5 => addr := (s.pss + QSET_OFFSET + QSET_QUEUE_OFFSET + BUFFER_OFFSET).resize(MMUAddrWidth bits)
-      case 6 => addr := (s.buffer + (s.index - U(1)) * U(GCObjectPtr_Size)).resize(MMUAddrWidth bits)
-      case 7 => addr := (s.pss + QSET_OFFSET + QSET_QUEUE_OFFSET + INDEX_OFFSET).resize(MMUAddrWidth bits)
-      case 8 => addr := (s.pss + LAST_ENQUEUED_CARD_OFFSET).resize(MMUAddrWidth bits)
-      case _ => addr := U(0)
-    }
-    i match {
-      case 6 => wdata := s.res
-      case 7 => wdata := ((s.index - U(1)) * U(GCObjectPtr_Size)).resize(MMUDataWidth bits)
-      case 8 => wdata := s.card_index
-      case _ => wdata := U(0)
-    }
-    (valid, addr, write, wmask, wdata)
+  val state = RegInit(overall_state.states(0))
+  val issued = RegInit(False)
+
+  val dest = RegInit(U(0, GCElementWidth bits))
+  val region_attr = RegInit(U(0, 16 bits))
+
+  val byte_map = RegInit(U(0, GCElementWidth bits))
+  val byte_map_base = RegInit(U(0, GCElementWidth bits))
+  val res = RegInit(U(0, GCElementWidth bits))
+  val card_index = RegInit(U(0, GCElementWidth bits))
+  val last_index = RegInit(U(0, GCElementWidth bits))
+  val index = RegInit(U(0, GCElementWidth bits))
+  val buffer = RegInit(U(0, GCElementWidth bits))
+  val old_node = RegInit(U(0, GCElementWidth bits))
+  val node_allocator_ptr = RegInit(U(0, GCElementWidth bits))
+  val new_top = RegInit(U(0, GCElementWidth bits))
+  val node = RegInit(U(0, GCElementWidth bits))
+  val originValue = RegInit(U(0, GCElementWidth bits))
+  val parScanStateOff30 = RegInit(U(0, GCElementWidth bits))
+  val parScanStateOff38 = RegInit(U(0, GCElementWidth bits))
+  val parScanStateOff40 = RegInit(U(0, GCElementWidth bits))
+
+  def resetState(): Unit = {
+    io.Aop.Done := True
+    state := overall_state.states(0)
   }
 
-  // helper: reset stage
-  def resetStage(i: Int): Unit = {
-    stages(i).valid := False
-    stages(i).reqDone := False
-    stages(i).reqIssued := False
-  }
-
-  def advance(from: Int,
-              to: Int,
-              changeByteMap: Option[UInt] = None,
-              changeCardIndex: Option[UInt] = None,
-              changeRes: Option[UInt] = None,
-              changeIndex: Option[UInt] = None,
-              changeBuffer: Option[UInt] = None,
-             ): Unit = {
-    val sFrom = stages(from)
-    val sTo   = stages(to)
-
-    when(sFrom.valid && sFrom.reqDone && !sTo.valid) {
-      resetStage(from)
-
-      sTo.valid := True
-      sTo.reg.pss := sFrom.reg.pss
-      sTo.reg.dest := sFrom.reg.dest
-      sTo.reg.ct_ptr := sFrom.reg.ct_ptr
-      sTo.reg.byte_map := changeByteMap.getOrElse(sFrom.reg.byte_map)
-      sTo.reg.card_index := changeCardIndex.getOrElse(sFrom.reg.card_index)
-      sTo.reg.index := changeIndex.getOrElse(sFrom.reg.index)
-      sTo.reg.buffer := changeBuffer.getOrElse(sFrom.reg.buffer)
-      sTo.reg.res := changeRes.getOrElse(sFrom.reg.res)
-    }
-  }
-
-  // send and save response
-  for(i <- 0 until GCaopWorkStages){
-    val s = stages(i)
-    val mreq = io.aopMReqs(i)
-    val (want, addr, isWrite, wmask, wdata) = mmuOpForIndex(i, s.reg)
-    when(s.valid && !s.reqDone && want) {
-      issueReq(mreq, addr, isWrite, wmask, wdata, s.reqIssued) { rd =>
-        s.reqDone := True
-        s.responseData := rd
+  switch(state) {
+    is(overall_state.states(0)){
+      io.Aop.Ready := True
+      when(io.Aop.Ready && io.Aop.Valid){
+        dest := io.Aop.Task
+        region_attr := io.Aop.RegionAttr
+        when(io.Aop.RegionAttr(7 downto 0) === U(0, 8 bits)){
+          resetState()
+        }.otherwise{
+          val addr = (io.ConfigIO.CardTablePtr + U"x38").resize(MMUAddrWidth bits)
+          issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+            byte_map := rd(GCElementWidth -1 downto 0)
+            byte_map_base := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+            state := overall_state.states(1)
+          }
+        }
       }
     }
-  }
 
-  // stage advancement logic
-  // stage0 -> stage1: byte_map from responseData
-  advance(0, 1, changeByteMap = Some(stages(0).responseData))
-  // stage1 -> stage2: compute card_index/res using responseData and dest
-  advance(1, 2, changeCardIndex = Some((stages(1).responseData + (stages(1).reg.dest >> 9) - stages(1).reg.byte_map).resize(MMUDataWidth bits)))
-  // stage2: check equality with responseData vs card_index
-  when(stages(2).valid && stages(2).reqDone){
-    val s2 = stages(2)
-    when(s2.responseData === s2.reg.card_index){
-      resetStage(2)
-    }.otherwise{
-      when(!stages(3).valid){
-        resetStage(2)
-        stages(3).valid := True
-        stages(3).reg := s2.reg
+    is(overall_state.states(1)){
+      res := (byte_map_base + (dest >> U(9))).resize(GCElementWidth bits)
+      card_index := (byte_map_base + (dest >> U(9))).resize(GCElementWidth bits) - byte_map
+      val addr = (io.ConfigIO.ParScanThreadStatePtr + U"x1b0").resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        last_index := rd(GCElementWidth - 1 downto 0)
+        state := overall_state.states(2)
       }
     }
-  }
-  // stage3 -> either stage4 or stage5 depending on responseData(index == 0)
-  when(stages(3).valid && stages(3).reqDone) {
-    val s3 = stages(3)
-    when(s3.responseData === U(0)) {
-      // interrupt in stages(5)
-      advance(3, 4, changeIndex = Some((s3.responseData / U(8)).resize(MMUDataWidth bits)))
-    } .otherwise {
-      advance(3, 5, changeIndex = Some((s3.responseData / U(8)).resize(MMUDataWidth bits)))
+
+    is(overall_state.states(2)){
+      when(last_index === card_index){
+        resetState()
+      }.otherwise{
+        val addr = (io.ConfigIO.ParScanThreadStatePtr + U"x40").resize(MMUAddrWidth bits)
+        issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+          parScanStateOff40 := rd(GCElementWidth - 1 downto 0)
+          index := (rd(GCElementWidth * 2 - 1 downto GCElementWidth) / U(8)).resize(GCElementWidth bits)
+          buffer := rd(GCElementWidth * 4 -1 downto GCElementWidth * 3)
+          state := overall_state.states(3)
+        }
+      }
     }
-  }
 
-  // interrupt
-  when(stages(4).valid){
-    if(DebugEnable){
-      report(Seq(
-        "[GCAop<", io.DebugTimeStamp,
-        ">]issue interrupt call enqueue_failed function",
-        "\n"
-      ))
+    is(overall_state.states(3)){
+      when(index === U(0)){
+        old_node := U(0)
+        when(buffer =/= U(0)){
+          old_node := (buffer - U(10)).resize(GCElementWidth bits)
+          issueReq(io.Mreq, old_node.resize(MMUAddrWidth bits), True, getWstrb(8), U(0), issued) { rd =>
+            state := overall_state.states(6)
+          }
+        }.otherwise{
+          state := overall_state.states(6)
+        }
+      }.otherwise{
+        index := index - U(1)
+        val addr = (buffer + (index - U(1)) * U(8)).resize(MMUAddrWidth bits)
+        issueReq(io.Mreq, addr, True, getWstrb(8), res, issued) { rd =>
+          state := overall_state.states(4)
+        }
+      }
     }
-  }
 
-  // stage5 -> stage6 copy buffer from responseData
-  advance(5, 6, changeBuffer = Some(stages(5).responseData.resize(MMUAddrWidth bits)))
+    is(overall_state.states(4)){
+      val addr = (io.ConfigIO.ParScanThreadStatePtr + U"x48").resize(MMUAddrWidth bits)
+      val writeData = (index * U(8)).resize(GCElementWidth bits)
+      index := writeData
+      issueReq(io.Mreq, addr, True, getWstrb(8), writeData, issued) { rd =>
+        state := overall_state.states(5)
+      }
+    }
 
-  advance(6, 7)
-  advance(7, 8)
+    is(overall_state.states(5)){
+      val addr = (io.ConfigIO.ParScanThreadStatePtr + U"x1b0").resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, True, getWstrb(8), card_index, issued) { rd =>
+        resetState()
+      }
+    }
 
-  // stage9 is final
-  when(stages(8).valid && stages(8).reqDone) {
-    resetStage(8)
-    if(DebugEnable){
-      report(Seq(
-        "[GCAop<", io.DebugTimeStamp,
-        ">]the task ", stages(8).reg.dest,
-        "has done",
-        "\n"
-      ))
+    is(overall_state.states(6)){
+      val addr = (io.ConfigIO.ParScanThreadStatePtr + U"x20").resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        node_allocator_ptr := rd(GCElementWidth - 1 downto 0)
+        parScanStateOff30 := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
+        parScanStateOff38 := rd(GCElementWidth * 4 - 1 downto GCElementWidth * 3)
+        state := overall_state.states(7)
+      }
+    }
+
+    is(overall_state.states(7)){
+      new_top := U(0)
+      val addr = (node_allocator_ptr + U"x80").resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        node := rd(GCElementWidth - 1 downto 0)
+        state := overall_state.states(8)
+      }
+    }
+
+    is(overall_state.states(8)){
+      when(node =/= U(0)){
+        val addr = (node + U"x8").resize(MMUAddrWidth bits)
+        issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+          new_top := rd(GCElementWidth - 1 downto 0)
+          state := overall_state.states(9)
+        }
+      }.otherwise{
+        state := overall_state.states(9)
+      }
+    }
+
+    is(overall_state.states(9)){
+      val addr = (node_allocator_ptr + U"x80").resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, True, getWstrb(8), new_top, issued) { rd =>
+        state := overall_state.states(10)
+      }
+    }
+
+    is(overall_state.states(10)){
+      when(node =/= U(0)){
+        val addr = (node + U"x8").resize(MMUAddrWidth bits)
+        issueReq(io.Mreq, addr, True, getWstrb(8), U(0), issued) { rd =>
+          state := overall_state.states(11)
+        }
+      }.otherwise{
+        // interrupt
+      }
+    }
+
+    is(overall_state.states(11)){
+      // from interrupt get node
+      val writeValue = (node + U"x10").resize(GCElementWidth bits)
+      val addr = (io.ConfigIO.ParScanThreadStatePtr + U"x58").resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { rd =>
+        state := overall_state.states(12)
+      }
+    }
+
+    is(overall_state.states(12)){
+      issueReq(io.Mreq, node_allocator_ptr.resize(MMUAddrWidth bits), False, U(0), U(0), issued) { rd =>
+        index := rd(GCElementWidth - 1 downto 0)
+        state := overall_state.states(13)
+      }
+    }
+
+    is(overall_state.states(13)){
+      val addr = (io.ConfigIO.ParScanThreadStatePtr + U"x48").resize(MMUAddrWidth bits)
+      val writeValue = (index * U(8)).resize(GCElementWidth bits)
+      issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) {rd =>
+        state := overall_state.states(14)
+      }
+    }
+
+    is(overall_state.states(14)){
+      when(old_node === U(0)){
+        state := overall_state.states(3)
+      }.otherwise{
+        val addr = (io.ConfigIO.ParScanThreadStatePtr + U"x40").resize(MMUAddrWidth bits)
+        val writeValue = (parScanStateOff40 + index).resize(GCElementWidth bits)
+        issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued){ rd =>
+          state := overall_state.states(15)
+        }
+      }
+    }
+
+    is(overall_state.states(15)){
+      val addr = (old_node + U"x8").resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, True, getWstrb(8), parScanStateOff30, issued){ rd =>
+        state := overall_state.states(16)
+      }
+    }
+
+    is(overall_state.states(16)){
+      val addr = (io.ConfigIO.ParScanThreadStatePtr + U"x30").resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, True, getWstrb(8), old_node, issued) { rd =>
+        state := overall_state.states(17)
+      }
+    }
+
+    is(overall_state.states(17)){
+      when(parScanStateOff38 === U(0)){
+        val addr = (io.ConfigIO.ParScanThreadStatePtr + U"x38").resize(MMUAddrWidth bits)
+        issueReq(io.Mreq, addr, True, getWstrb(8), old_node, issued) { rd =>
+          state := overall_state.states(3)
+        }
+      }.otherwise{
+        state := overall_state.states(3)
+      }
     }
   }
 }

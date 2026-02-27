@@ -8,17 +8,18 @@ import scala.language.postfixOps
 /* GCFetch read task from TaskStack, the dispatch to arrayProcess and oopProcess */
 class GCFetch extends Module with HWParameters with GCParameters {
   val io = new Bundle{
-    val FetchMReq = master(new LocalMMUIO)
-    val Stack2Fetch = slave Stream UInt(MMUAddrWidth bits)
+    val Mreq = master(new LocalMMUIO)
+    val Stack2Fetch = slave Stream UInt(GCElementWidth bits)
     val Fetch2ArrayProcess = master(new GCFetch2ProcessUnit)
     val Fetch2OopProcess = master(new GCFetch2ProcessUnit)
-    val DebugTimeStamp = in(UInt(MMUDataWidth bits))
+    val ConfigIO = slave(new GCFetchConfigIO)
+    val DebugTimeStamp = in(UInt(64 bits))
   }
 
   // default value
-  io.FetchMReq.Request.valid := False
-  io.FetchMReq.Request.payload.clearAll()
-  io.FetchMReq.Response.ready := False
+  io.Mreq.Request.valid := False
+  io.Mreq.Request.payload.clearAll()
+  io.Mreq.Response.ready := False
 
   io.Stack2Fetch.ready := False
 
@@ -40,29 +41,29 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
   val state = RegInit(overall_state.s_idle)
 
-  val task = RegInit(U(0, MMUAddrWidth bits))
+  val task = RegInit(U(0, GCElementWidth bits))
   val oopType = RegInit(U(0, GCOopTypeWidth bits))
+  val from_obj = RegInit(U(0, GCElementWidth bits))
 
   // mem related regs
   val issued = RegInit(False)
-  val memData = RegInit(U(0, MMUAddrWidth bits))
 
   // idle: take task from stack and sub the tag
   when(state === overall_state.s_idle){
     io.Stack2Fetch.ready := True
     when(io.Stack2Fetch.fire){
       val payload = io.Stack2Fetch.payload
-      when(payload(GCOopTypeWidth - 1 downto 0) === U(OopTag, GCOopTypeWidth bits)){
-        oopType := U(CommonOop, GCOopTypeWidth bits)
-        task := (payload - U(OopTag)).resize(MMUAddrWidth bits)
-      }.otherwise{
+      when(payload(GCOopTagWidth - 1 downto 0) === U(PartialArrayTag, GCOopTagWidth bits)){
         oopType := U(PartialArrayOop, GCOopTypeWidth bits)
-        task := (payload - U(PartialArrayTag)).resize(MMUAddrWidth bits)
+        task := (payload - U(PartialArrayTag)).resize(GCElementWidth bits)
+      }.otherwise{
+        oopType := U(NotArrayOop, GCOopTypeWidth bits)
+        task := (payload - payload(GCOopTagWidth - 1 downto 0)).resize(GCElementWidth bits)
       }
 
       // reset mem flags for next task
       issued := False
-      memData := U(0)
+      from_obj := U(0)
 
       state := overall_state.s_readOop
 
@@ -78,43 +79,48 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
   // readOop: oopTag -> send mreq
   when(state === overall_state.s_readOop){
-    when(oopType === U(CommonOop, GCOopTypeWidth bits)){
-      issueReq(io.FetchMReq, task, False, U(0), U(0), issued){ rd =>
-        memData := rd
+    when(oopType === U(NotArrayOop, GCOopTypeWidth bits)){
+      issueReq(io.Mreq, task, False, U(0), U(0), issued){ rd =>
+        when(io.ConfigIO.UseCompressedOop){
+          from_obj := (io.ConfigIO.CompressedOopBase + (rd << io.ConfigIO.CompressedOopShift)).resize(GCElementWidth bits)
+        }.otherwise{
+          from_obj := rd(GCElementWidth - 1 downto 0)
+        }
         state := overall_state.s_readMW
       }
     }.otherwise{
-      memData := task
+      from_obj := task
       state := overall_state.s_readMW
     }
   }
 
-  val markWord = RegInit(U(0, MMUDataWidth bits))
+  val markWord = RegInit(U(0, GCElementWidth bits))
   when(state === overall_state.s_readMW){
-    issueReq(io.FetchMReq, memData + MarkWordOff, False, U(0), U(0), issued){ rd =>
-      markWord := rd
+    issueReq(io.Mreq, from_obj.resize(MMUAddrWidth bits), False, U(0), U(0), issued){ rd =>
+      markWord := rd(GCElementWidth - 1 downto 0)
       state := overall_state.s_send
     }
   }
 
 
   // send
-  val processUnit = Mux(oopType === U(CommonOop, GCOopTypeWidth bits), io.Fetch2OopProcess, io.Fetch2ArrayProcess)
+  val processUnit = Mux(oopType === U(NotArrayOop, GCOopTypeWidth bits), io.Fetch2OopProcess, io.Fetch2ArrayProcess)
   when(state === overall_state.s_send){
     // Mux(cond, A, B) could read, but not support write
-    when(oopType === U(CommonOop, GCOopTypeWidth bits)){
+    when(oopType === U(NotArrayOop, GCOopTypeWidth bits)){
       io.Fetch2OopProcess.Valid := True
       io.Fetch2OopProcess.Task := task
       io.Fetch2OopProcess.OopType := oopType
-      io.Fetch2OopProcess.SrcOopPtr := memData
+      io.Fetch2OopProcess.SrcOopPtr := from_obj
       io.Fetch2OopProcess.MarkWord := markWord
     }.otherwise{
       io.Fetch2ArrayProcess.Valid := True
       io.Fetch2ArrayProcess.Task := task
       io.Fetch2ArrayProcess.OopType := oopType
-      io.Fetch2ArrayProcess.SrcOopPtr := memData
+      io.Fetch2ArrayProcess.SrcOopPtr := from_obj
       io.Fetch2ArrayProcess.MarkWord := markWord
     }
+
     when(processUnit.Valid && processUnit.Ready){
       state := overall_state.s_waitDone
 
@@ -123,7 +129,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
           "[GCFetch<", io.DebugTimeStamp,
           ">]Dispatch Task ", task,
           ", OopType ", oopType,
-          ", SrcOopPtr ", memData,
+          ", SrcOopPtr ", from_obj,
           ", MarkWord ", markWord,
           "success!",
           "\n"

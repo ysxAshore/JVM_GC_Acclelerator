@@ -17,21 +17,24 @@ object Config {
 }
 
 trait GCParameters {
+  // 和MMUAddrWidth一样
+  val GCElementWidth = 64
+
   val GCTaskStack_Entry = 64
   val GCTaskStack_SpillNeed = 63
   val GCTaskStack_ReadNeed = 8
+
   val GCoopWorkStages = 7
   val GCaopWorkStages = 9
   val GCCopyEntry = 64
 
   /* ----------------- ScannerTask Tag ----------------- */
-  val OopTag = 0
-  val NarrowOopTag = 1
   val PartialArrayTag = 2
-  val CommonOop = 0
-  val CompressedOop = 1
-  val PartialArrayOop = 2
-  val GCOopTypeWidth = 2
+  val GCOopTagWidth = 2
+
+  val NotArrayOop = 0
+  val PartialArrayOop = 1
+  val GCOopTypeWidth = 1
 
   val InstanceKlassID = 0
   val InstanceRefKlassID = 1
@@ -43,7 +46,6 @@ trait GCParameters {
   // OopDesc
   // --- Common Oop
   val MarkWordOff = 0
-  val KlassOff = 8
   val ElementOff = 16
   // --- Array Oop
   val ArrayLenOff = 16
@@ -68,86 +70,6 @@ trait GCParameters {
   val Type_Humongous = -2
   val Type_NoInCset = -1
 
-  /*-------------- MarkWord ------------------------*/
-  val LOCK_MASK_IN_PLACE = 3
-  val LOCKED_VALUE = 0
-  val UNLOCKED_VALUE = 1
-  val MONITOR_VALUE = 2
-  val MARKED_VALUE = 3
-  val AGE_SHIFT = 3
-  val AGE_MASK = 15
-  val AGE_MASK_IN_PLACE = AGE_MASK << AGE_SHIFT
-  val NO_LOCK_IN_PLACE = 1 // UNLOCJED_VALUE
-  val NO_HASH_IN_PLACE = 0
-
-  /*-------------- G1ParScanThreadState ------------*/
-  val QSET_OFFSET = 24
-  val PSS_CARD_TABLE_OFFSET = 96
-  val PLAB_ALLOCATOR_OFFSET = 112
-  val AGE_TABLE_OFFSET = 120
-  val REGION_ATTR_DEST_OFFSET = 376
-  val TENURING_THRESHOLD_OFFSET = 380
-  val OBJCLOSURE_OFFSET = 384
-  val LAST_ENQUEUED_CARD_OFFSET = 432
-  val SURVIVING_YOUNG_WORDS_BASE_OFFSET = 464
-  val OLD_GEN_IS_FULL_OFFSET = 488
-  val PARTIAL_ARRAY_CHUNK_SIZE_OFFSET = 492
-  val PARTIAL_ARRAY_STEPPER_OFFSET = 496
-  val OBJ_ALLOC_STAT_OFFSET = 560
-
-  /*------------------ HeapRegion -------------------*/
-  val REGION_BOTTOM_OFFSET = 0x0
-  val REGION_END_OFFSET = 0x8
-  val REGION_TOP_OFFSET = 0x10
-  val REGION_COMPACTION_TOP_OFFSET = 0x18
-  val REGION_BOT_PART_OFFSET = 0x20
-  val REGION_PAR_ALLOC_LOCK_OFFSET = 0x40
-  val REGION_PRE_DUMMY_TOP_OFFSET = 0xa8
-  val NEXT_TOP_AT_MARK_START_OFFSET = 0xe8
-  val REGION_REM_SET_OFFSET = 0xb0
-  val REGION_HRM_INDEX_OFFSET = 0xb8
-  val HEAP_REGION_TYPE_OFFSET = 0xbc
-  val HEAP_NEXT_OFFSET = 0xd0
-  val HEAP_PREV_OFFSET = 0xd8
-  val NODE_INDEX_OFFSET = 0x120
-  val YOUND_INDEX_IN_CSET_OFFSET = 0x100
-  val YOUNG_MASK = 0x2
-  val OLD_MASK = 0x10
-  val HEAPREGION_TYPE_SURVIVOR = 0x3
-  val HEAPREGION_TYPE_OLD = 0x10
-
-  /*----------------- Plab Allocator ----------------*/
-  val COLLECTEDHEAP_OFFSET = 0x0
-  val ALLOCATOR_OFFSET = 0x8
-  val ALLOC_BUFFERS_OFFSET = 0x10
-  val DIRECT_ALLOCATED_OFFSET = 0x20
-  val NUM_PLAB_FILLS = 0x30
-  val NUM_DIRECT_ALLOCATIONS = 0x40
-
-  /*------------------- PLAB ------------------------*/
-  val WORDSZ_OFFSET = 0x20
-  val BOTTOM_OFFSET = 0x28
-  val TOP_OFFSET = 0x30
-  val END_OFFSET = 0x38
-  val HARD_END_OFFSET = 0x40
-  val ALLOCATED_OFFSET = 0x48
-  val WASTED_OFFSET = 0x50
-
-  /*-------------------- ObjClosure -----------------*/
-  val SCANNING_IN_YOUNG_OFFSET = 32
-
-
-  /*------------------- RDC Qset --------------------*/
-  val QSET_QUEUE_OFFSET = 48
-
-  /*--------------------- CardTable -----------------*/
-  val BYTE_MAP_OFFSET = 56
-  val BYTE_MAP_BASE_OFFSET = 64
-
-  /*------------------- PtrQueue --------------------*/
-  val INDEX_OFFSET = 0
-  val BUFFER_OFFSET = 16
-
   val GCTaskQueue_Size = 1 << 17
   val GCScannerTask_Size = 8
   val GCObjectPtr_Size = 8
@@ -160,14 +82,10 @@ trait HWParameters {
   val DebugEnable = true
 
   val MMUAddrWidth = 64
-  val MMUDataWidth = 64
+  val MMUDataWidth = 256
 
   val LLCSourceMaxNum = 64
   val LLCSourceMaxNumBitSize = log2Up(LLCSourceMaxNum) + 1
-
-  val allBytesOnes = U((BigInt(1) << (MMUDataWidth / 8)) - 1, MMUDataWidth / 8 bits)
-  val halfBytesOnes = U((BigInt(1) << (MMUDataWidth / 8 / 2)) - 1, MMUDataWidth / 8 bits)
-  val oneByteOnes = U(1, MMUDataWidth / 8 bits)
 
   // helper: issueReq
   def issueReq(port: LocalMMUIO, addr: UInt, Write: Bool, WriteStrb: UInt, WriteData: UInt, reqIssued: Bool)(onResp: UInt => Unit): Unit = {
@@ -184,7 +102,7 @@ trait HWParameters {
       port.Request.payload.RequestSourceID := port.ConherentRequsetSourceID.payload
       port.Request.payload.RequestType_isWrite := Write
       port.Request.payload.RequestWStrb := WriteStrb
-      port.Request.payload.RequestData := WriteData
+      port.Request.payload.RequestData := WriteData.resize(MMUDataWidth bits)
       port.Response.ready := True
 
       // mark as issued when downstream accepts the request
@@ -201,48 +119,23 @@ trait HWParameters {
     }
   }
 
-  def process2stream(p : GCProcess2Trace): Stream[GCTracePayload] = {
-    val s = Stream(GCTracePayload())
-
-    s.valid := p.Valid
-    s.payload.OopType := p.OopType
-    s.payload.KlassPtr := p.KlassPtr
-    s.payload.SrcOopPtr := p.SrcOopPtr
-    s.payload.DestOopPtr := p.DestOopPtr
-    s.payload.Kid := p.Kid
-    s.payload.ScanningInYoung := p.ScanningInYoung
-    s.payload.ArrayLength := p.ArrayLength
-    s.payload.PartialArrayStart := p.PartialArrayStart
-    s.payload.StepIndex := p.StepIndex
-    s.payload.StepNCreate := p.StepNCreate
-
-    p.Ready := s.ready
-    s
-  }
-
-  def aop2stream(p : AopParameters) : Stream[GCAopPayload] = {
-    val s = Stream(GCAopPayload())
-    s.valid := p.Valid
-    s.payload.ParScanThreadStatePtr := p.ParScanThreadStatePtr
-    s.payload.CardTablePtr := p.CardTablePtr
-    s.payload.RegionAttr := p.RegionAttr
-    s.payload.Task := p.Task
-
-    p.Ready := s.ready
-    s
+  def getWstrb(bytes: UInt): UInt = {
+    val mask = Bits(MMUDataWidth / 8 bits)
+    mask := Mux(bytes >= U(MMUDataWidth / 8), B(MMUDataWidth / 8 bits, default -> true), ((U(1) << bytes.resize(6 bits)) - U(1)).asBits.resize(MMUDataWidth / 8 bits))
+    mask.asUInt
   }
 }
 
-class GCFetch2ProcessUnit extends Bundle with HWParameters with GCParameters with IMasterSlave {
+class GCFetch2ProcessUnit extends Bundle with GCParameters with IMasterSlave {
   val Valid = in Bool()
   val Ready = out Bool()
 
   val Done = out Bool()
 
-  val Task = in UInt(MMUAddrWidth bits)
+  val Task = in UInt(GCElementWidth bits)
   val OopType = in UInt(GCOopTypeWidth bits)
-  val SrcOopPtr = in UInt(MMUAddrWidth bits)
-  val MarkWord = in UInt(MMUDataWidth bits)
+  val SrcOopPtr = in UInt(GCElementWidth bits)
+  val MarkWord = in UInt(GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done)
@@ -250,16 +143,16 @@ class GCFetch2ProcessUnit extends Bundle with HWParameters with GCParameters wit
   }
 }
 
-class GCProcess2Survivor extends Bundle with HWParameters with GCParameters with IMasterSlave {
+class GCProcess2Survivor extends Bundle with GCParameters with IMasterSlave {
   val Valid = in Bool()
   val Ready = out Bool()
 
   val Done = out Bool()
-  val DestOopPtr = out UInt(MMUAddrWidth bits)
+  val DestOopPtr = out UInt(GCElementWidth bits)
 
-  val MarkWord = in UInt(MMUDataWidth bits)
-  val SrcOopPtr = in UInt(MMUAddrWidth bits)
-  val RegionAttrPtr = in UInt(MMUAddrWidth bits)
+  val MarkWord = in UInt(GCElementWidth bits)
+  val SrcOopPtr = in UInt(GCElementWidth bits)
+  val RegionAttrPtr = in UInt(GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done, DestOopPtr)
@@ -267,11 +160,11 @@ class GCProcess2Survivor extends Bundle with HWParameters with GCParameters with
   }
 }
 
-case class GCTracePayload() extends Bundle with HWParameters with GCParameters {
+case class GCTracePayload() extends Bundle with GCParameters {
   val OopType = UInt(GCOopTypeWidth bits)
-  val KlassPtr = UInt(MMUAddrWidth bits)
-  val SrcOopPtr = UInt(MMUAddrWidth bits)
-  val DestOopPtr = UInt(MMUAddrWidth bits)
+  val KlassPtr = UInt(GCElementWidth bits)
+  val SrcOopPtr = UInt(GCElementWidth bits)
+  val DestOopPtr = UInt(GCElementWidth bits)
   val Kid = UInt(32 bits)
   val ScanningInYoung = Bool()
   val ArrayLength = UInt(32 bits)
@@ -280,7 +173,50 @@ case class GCTracePayload() extends Bundle with HWParameters with GCParameters {
   val StepNCreate = UInt(32 bits)
 }
 
-class GCProcess2Trace extends Bundle with HWParameters with GCParameters with IMasterSlave{
+class GCToAllocate extends Bundle with GCParameters with IMasterSlave{
+  val Valid = in Bool()
+  val Ready = out Bool()
+  val Done = out Bool()
+
+  val Size = in UInt(32 bits)
+  val DestAttrType = in UInt(8 bits)
+  val DestObjPtr = out UInt(GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    in(Ready, Done, DestObjPtr)
+    out(Valid, Size, DestAttrType)
+  }
+}
+
+class GCToParAllocate extends Bundle with GCParameters with IMasterSlave{
+  val Valid = in Bool()
+  val Ready = out Bool()
+  val Done = out Bool()
+
+  val DestObjPtr = out UInt(GCElementWidth bits)
+  val ActualPlabSize = out UInt(GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    in(Ready, Done, DestObjPtr, ActualPlabSize)
+    out(Valid)
+  }
+}
+
+class GCToAttemptAllocate extends Bundle with GCParameters with IMasterSlave {
+  val Valid = in Bool()
+  val Ready = out Bool()
+  val Done = out Bool()
+
+  val DestObjPtr = out UInt(GCElementWidth bits)
+  val ActualPlabSize = out UInt(GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    in(Ready, Done, DestObjPtr, ActualPlabSize)
+    out(Valid)
+  }
+}
+
+class GCToTrace extends Bundle with GCParameters with IMasterSlave{
   val Valid = in Bool()
   val Ready = out Bool()
   val Done = out Bool()
@@ -288,9 +224,9 @@ class GCProcess2Trace extends Bundle with HWParameters with GCParameters with IM
   // some parse module caculate parameters
   val Kid = in UInt(32 bits)
   val OopType = in UInt(GCOopTypeWidth bits)
-  val KlassPtr = in UInt(MMUAddrWidth bits)
-  val SrcOopPtr = in UInt(MMUAddrWidth bits)
-  val DestOopPtr = in UInt(MMUAddrWidth bits)
+  val KlassPtr = in UInt(GCElementWidth bits)
+  val SrcOopPtr = in UInt(GCElementWidth bits)
+  val DestOopPtr = in UInt(GCElementWidth bits)
   val ScanningInYoung = in Bool()
 
   val StepIndex = in UInt(32 bits)
@@ -304,15 +240,15 @@ class GCProcess2Trace extends Bundle with HWParameters with GCParameters with IM
   }
 }
 
-class GCProcess2Copy extends Bundle with HWParameters with GCParameters with IMasterSlave{
+class GCToCopy extends Bundle with GCParameters with IMasterSlave{
   val Valid = in Bool()
   val Ready = out Bool()
 
   val Done = out Bool()
 
   // some parse module caculate parameters
-  val DestOopPtr = in UInt(MMUAddrWidth bits)
-  val SrcOopPtr = in UInt(MMUAddrWidth bits)
+  val DestOopPtr = in UInt(GCElementWidth bits)
+  val SrcOopPtr = in UInt(GCElementWidth bits)
   val Size = in UInt(32 bits)
 
   override def asMaster(): Unit = {
@@ -321,76 +257,123 @@ class GCProcess2Copy extends Bundle with HWParameters with GCParameters with IMa
   }
 }
 
-class GCArrayProcessConfigIO extends Bundle with HWParameters with IMasterSlave{
-  val ChunkSize = in UInt(32 bits)
-  val StepperOffset = in UInt(MMUDataWidth bits)
-  val HeapRegionShiftBy = in UInt(32 bits)
-  val HeapRegionBiasedBase = in UInt(MMUAddrWidth bits)
-
-  override def asMaster(): Unit = {
-    out(ChunkSize, StepperOffset, HeapRegionBiasedBase, HeapRegionShiftBy)
-    in()
-  }
-}
-
-class GCOopProcessConfigIO extends Bundle with HWParameters with IMasterSlave{
-  val CardTablePtr = in UInt(MMUAddrWidth bits)
-  val ParScanThreadStatePtr = in UInt(MMUAddrWidth bits)
-  val RegionAttrShiftBy = in UInt(32 bits)
-  val RegionAttrBiasedBase = in UInt(MMUAddrWidth bits)
-  val LogOfHRGrainBytes = in UInt(32 bits)
-  val HeapRegionShiftBy = in UInt(32 bits)
-  val HeapRegionBiasedBase = in UInt(MMUAddrWidth bits)
-  override def asMaster(): Unit = {
-    out(CardTablePtr, ParScanThreadStatePtr, RegionAttrBiasedBase, RegionAttrShiftBy, HeapRegionBiasedBase, HeapRegionShiftBy, LogOfHRGrainBytes)
-    in()
-  }
-}
-
-class GCCopy2SurvivorConfigIO extends Bundle with HWParameters with GCParameters with IMasterSlave {
-  val ChunkSize = in UInt(32 bits)
-  val AgeThreshold = in UInt(32 bits)
-  val YoungWordsBase = in UInt(MMUAddrWidth bits)
-  val PlabAllocatorPtr = in UInt(MMUAddrWidth bits)
-  val HeapRegionShiftBy = in UInt(32 bits)
-  val HeapRegionBiasedBase = in UInt(MMUAddrWidth bits)
-  val ParScanThreadStatePtr = in UInt(MMUAddrWidth bits)
-
-  override def asMaster(): Unit = {
-    out(ParScanThreadStatePtr, PlabAllocatorPtr, AgeThreshold, HeapRegionBiasedBase, HeapRegionShiftBy, ChunkSize, YoungWordsBase)
-    in()
-  }
-}
-
-class GCTraceConfigIO extends Bundle with HWParameters with IMasterSlave{
-  val CardTablePtr = in UInt(MMUAddrWidth bits)
-  val RegionAttrBase = in UInt(MMUAddrWidth bits)
-  val RegionAttrShiftBy = in UInt(32 bits)
-  val RegionAttrBiasedBase = in UInt(MMUAddrWidth bits)
-  val HeapRegionBias = in UInt(32 bits)
-  val HeapRegionShiftBy = in UInt(32 bits)
-  val LogOfHRGrainBytes = in UInt(32 bits)
-  val ParScanThreadStatePtr = in UInt(MMUAddrWidth bits)
-  val HumongousReclaimCandidatesBoolBase = in UInt(MMUAddrWidth bits)
-
-  override def asMaster(): Unit = {
-    out(CardTablePtr, RegionAttrBase, RegionAttrBiasedBase, RegionAttrShiftBy, HeapRegionBias, HeapRegionShiftBy, HumongousReclaimCandidatesBoolBase, ParScanThreadStatePtr, LogOfHRGrainBytes)
-    in()
-  }
-}
-
-class GCTaskStackConfigIO extends Bundle with HWParameters with IMasterSlave{
-  val TaskQueue_BottomAddr = in UInt(MMUAddrWidth bits)
-  val TaskQueue_AgeTopAddr = in UInt(MMUAddrWidth bits)
-  val TaskQueue_ElemsBase = in UInt(MMUAddrWidth bits)
+class GCTaskStackConfigIO extends Bundle with GCParameters with IMasterSlave{
+  val TaskQueue_BottomAddr = in UInt(GCElementWidth bits)
+  val TaskQueue_ElemsBase = in UInt(GCElementWidth bits)
 
   val TaskValid = in Bool()
   val TaskReady = out Bool()
   val Done = out Bool()
 
   override def asMaster(): Unit = {
-    out(TaskQueue_BottomAddr, TaskQueue_AgeTopAddr, TaskQueue_ElemsBase, TaskValid)
+    out(TaskQueue_BottomAddr, TaskQueue_ElemsBase, TaskValid)
     in(TaskReady, Done)
+  }
+}
+
+class GCFetchConfigIO extends Bundle with GCParameters with IMasterSlave{
+  val UseCompressedOop = in Bool()
+  val CompressedOopBase = in UInt(GCElementWidth bits)
+  val CompressedOopShift = in UInt(8 bits)
+
+  override def asMaster(): Unit = {
+    out(UseCompressedOop, CompressedOopBase, CompressedOopShift)
+    in()
+  }
+}
+
+class GCArrayProcessConfigIO extends Bundle with GCParameters with IMasterSlave {
+  val ChunkSize = in UInt(32 bits)
+  val StepperOffset = in UInt(GCElementWidth bits)
+  val HeapRegionShiftBy = in UInt(32 bits)
+  val HeapRegionBiasedBase = in UInt(GCElementWidth bits)
+  val UseCompressedKlassPointers = in Bool()
+
+  override def asMaster(): Unit = {
+    out(ChunkSize, StepperOffset, HeapRegionBiasedBase, HeapRegionShiftBy, UseCompressedKlassPointers)
+    in()
+  }
+}
+
+class GCOopProcessConfigIO extends Bundle with GCParameters with IMasterSlave{
+  val RegionAttrShiftBy = in UInt(32 bits)
+  val RegionAttrBiasedBase = in UInt(GCElementWidth bits)
+  val LogOfHRGrainBytes = in UInt(32 bits)
+  val HeapRegionShiftBy = in UInt(32 bits)
+  val HeapRegionBiasedBase = in UInt(GCElementWidth bits)
+  val UseCompressedOop = in Bool()
+  val CompressedOopBase = in UInt(GCElementWidth bits)
+  val CompressedOopShift = in UInt(8 bits)
+
+  override def asMaster(): Unit = {
+    out(RegionAttrBiasedBase, RegionAttrShiftBy, HeapRegionBiasedBase, HeapRegionShiftBy, LogOfHRGrainBytes, UseCompressedOop, CompressedOopBase, CompressedOopShift)
+    in()
+  }
+}
+
+class GCCopy2SurvivorConfigIO extends Bundle with GCParameters with IMasterSlave {
+  val ChunkSize = in UInt(32 bits)
+  val AgeThreshold = in UInt(32 bits)
+  val YoungWordsBase = in UInt(GCElementWidth bits)
+  val PlabAllocatorPtr = in UInt(GCElementWidth bits)
+  val HeapRegionShiftBy = in UInt(32 bits)
+  val HeapRegionBiasedBase = in UInt(GCElementWidth bits)
+  val ParScanThreadStatePtr = in UInt(GCElementWidth bits)
+  val UseCompressedKlassPointer = in Bool()
+  val CompressedKlassPointerBase = in UInt(GCElementWidth bits)
+  val CompressedKlassPointerShift = in UInt(8 bits)
+
+  override def asMaster(): Unit = {
+    out(ParScanThreadStatePtr, PlabAllocatorPtr, AgeThreshold, HeapRegionBiasedBase, HeapRegionShiftBy, ChunkSize, YoungWordsBase, UseCompressedKlassPointer, CompressedKlassPointerBase, CompressedKlassPointerShift)
+    in()
+  }
+}
+
+class GCAllocateConfigIO extends Bundle with GCParameters with IMasterSlave{
+  val G1h = in UInt(GCElementWidth bits)
+  val Thread = in UInt(GCElementWidth bits)
+  val LockPtr = in UInt(GCElementWidth bits)
+  val objectKlassObj = in UInt((GCElementWidth bits))
+  val intArrayKlassObj = in UInt((GCElementWidth bits))
+  val PlabAllocatorPtr = in UInt(GCElementWidth bits)
+  val UseCompressedKlassPointers = in Bool()
+  val CompressedKlassPointerBase = in UInt(GCElementWidth bits)
+  val CompressedKlassPointerShift = in UInt(8 bits)
+
+  override def asMaster(): Unit = {
+    out(G1h, Thread, LockPtr, objectKlassObj, intArrayKlassObj, PlabAllocatorPtr, UseCompressedKlassPointers, CompressedKlassPointerBase, CompressedKlassPointerShift)
+    in()
+  }
+}
+
+class GCTraceConfigIO extends Bundle with GCParameters with IMasterSlave{
+  val ChunkSize = in UInt(32 bits)
+  val RegionAttrBase = in UInt(GCElementWidth bits)
+  val RegionAttrShiftBy = in UInt(32 bits)
+  val RegionAttrBiasedBase = in UInt(GCElementWidth bits)
+  val HeapRegionBias = in UInt(32 bits)
+  val HeapRegionShiftBy = in UInt(32 bits)
+  val LogOfHRGrainBytes = in UInt(32 bits)
+  val UseCompressedOops = in Bool()
+  val CompressedOopBase = in UInt(GCElementWidth bits)
+  val CompressedOopShift = in UInt(8 bits)
+  val UseCompressedKlassPointers = in Bool()
+  val HumongousReclaimCandidatesBoolBase = in UInt(GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    out(ChunkSize, UseCompressedOops, CompressedOopBase, CompressedOopShift, UseCompressedKlassPointers, RegionAttrBase, RegionAttrBiasedBase, RegionAttrShiftBy, HeapRegionBias, HeapRegionShiftBy, HumongousReclaimCandidatesBoolBase, LogOfHRGrainBytes)
+    in()
+  }
+}
+
+
+class GCAopConfigIO extends Bundle with GCParameters with IMasterSlave{
+  val CardTablePtr = in UInt(GCElementWidth bits)
+  val ParScanThreadStatePtr = in UInt(GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    out(CardTablePtr, ParScanThreadStatePtr)
+    in()
   }
 }
 
@@ -404,27 +387,23 @@ class TraceMReq2MMU(oopWorkStage:Int) extends Bundle with IMasterSlave {
   }
 }
 
-case class GCAopPayload() extends Bundle with HWParameters with GCParameters{
-  val ParScanThreadStatePtr = UInt(MMUAddrWidth bits)
-  val CardTablePtr = UInt(MMUAddrWidth bits)
+case class GCAopPayload() extends Bundle with GCParameters{
   val RegionAttr = UInt(16 bits)
-  val Task = UInt(MMUAddrWidth bits)
+  val Task = UInt(GCElementWidth bits)
 }
 
-class AopParameters extends Bundle with HWParameters with IMasterSlave{
+class ToAopParameters extends Bundle with GCParameters with IMasterSlave{
   val Valid = in Bool()
   val Ready = out Bool()
 
   val Done = out Bool()
 
-  val ParScanThreadStatePtr = in UInt(MMUAddrWidth bits)
-  val CardTablePtr = in UInt(MMUAddrWidth bits)
   val RegionAttr = in UInt(16 bits)
-  val Task = in UInt(MMUAddrWidth bits)
+  val Task = in UInt(GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done)
-    out(Valid, ParScanThreadStatePtr, CardTablePtr, RegionAttr, Task)
+    out(Valid, RegionAttr, Task)
   }
 }
 
@@ -495,32 +474,41 @@ object LocalMMUTaskType {
   val TaskTypeBitWidth = log2Up(TaskTypeMax)
 }
 
-class Ctrl2Top extends Bundle with HWParameters with IMasterSlave {
+class Ctrl2Top extends Bundle with GCParameters with IMasterSlave {
   val ChunkSize = in UInt(32 bits)
-  val CardTablePtr = in UInt(MMUAddrWidth bits)
   val AgeThreshold = in UInt(32 bits)
-  val StepperOffset = in UInt(MMUDataWidth bits)
-  val YoungWordsBase = in UInt(MMUAddrWidth bits)
-  val RegionAttrBase = in UInt(MMUAddrWidth bits)
   val HeapRegionBias = in UInt(32 bits)
-  val PlabAllocatorPtr = in UInt(MMUAddrWidth bits)
   val RegionAttrShiftBy = in UInt(32 bits)
   val HeapRegionShiftBy = in UInt(32 bits)
   val LogOfHRGrainBytes = in UInt(32 bits)
-  val RegionAttrBiasedBase = in UInt(MMUAddrWidth bits)
-  val HeapRegionBiasedBase = in UInt(MMUAddrWidth bits)
-  val ParScanThreadStatePtr = in UInt(MMUAddrWidth bits)
-  val TaskQueue_BottomAddr = in UInt(MMUAddrWidth bits)
-  val TaskQueue_AgeTopAddr = in UInt(MMUAddrWidth bits)
-  val TaskQueue_ElemsBase = in UInt(MMUAddrWidth bits)
-  val HumongousReclaimCandidatesBoolBase = in UInt(MMUAddrWidth bits)
+  val StepperOffset = in UInt(GCElementWidth bits)
+  val YoungWordsBase = in UInt(GCElementWidth bits)
+  val RegionAttrBase = in UInt(GCElementWidth bits)
+  val PlabAllocatorPtr = in UInt(GCElementWidth bits)
+  val RegionAttrBiasedBase = in UInt(GCElementWidth bits)
+  val HeapRegionBiasedBase = in UInt(GCElementWidth bits)
+  val ParScanThreadStatePtr = in UInt(GCElementWidth bits)
+  val TaskQueue_BottomAddr = in UInt(GCElementWidth bits)
+  val TaskQueue_ElemsBase = in UInt(GCElementWidth bits)
+  val HumongousReclaimCandidatesBoolBase = in UInt(GCElementWidth bits)
+  val CardTablePtr = in UInt(GCElementWidth bits)
+  val G1h = in UInt(GCElementWidth bits)
+  val IntArrayKlassObj = in UInt(GCElementWidth bits)
+  val ObjectKlass = in UInt(GCElementWidth bits)
+  val LockPtr = in UInt(GCElementWidth bits)
+  val Thread = in UInt(GCElementWidth bits)
+  val DummyRegion = in UInt(GCElementWidth bits)
+  val NumaPtr = in UInt(GCElementWidth bits)
+  val CompressedOopBase = in UInt(GCElementWidth bits)
+  val CompressedKlassPointerBase = in UInt(GCElementWidth bits)
+  val CompressedFlag = in UInt(32 bits)
 
   val Valid = in Bool()
   val Ready = out Bool()
   val Done = out Bool()
 
   override def asMaster(): Unit = {
-    out(Valid, YoungWordsBase, RegionAttrBase, RegionAttrBiasedBase, RegionAttrShiftBy, HeapRegionBias, HeapRegionShiftBy, HeapRegionBiasedBase, HumongousReclaimCandidatesBoolBase, ParScanThreadStatePtr, TaskQueue_AgeTopAddr, TaskQueue_BottomAddr, TaskQueue_ElemsBase, StepperOffset, LogOfHRGrainBytes, AgeThreshold, ChunkSize, PlabAllocatorPtr, CardTablePtr)
+    out(Valid, AgeThreshold, HeapRegionBias, RegionAttrShiftBy, HeapRegionShiftBy, LogOfHRGrainBytes, StepperOffset, YoungWordsBase, RegionAttrBase, PlabAllocatorPtr, RegionAttrBiasedBase, HeapRegionBiasedBase, ParScanThreadStatePtr, TaskQueue_BottomAddr, TaskQueue_ElemsBase, HumongousReclaimCandidatesBoolBase, CardTablePtr, G1h, IntArrayKlassObj, ObjectKlass, LockPtr, Thread, DummyRegion, NumaPtr, CompressedOopBase, CompressedKlassPointerBase, CompressedFlag)
     in(Ready, Done)
   }
 }

@@ -6,26 +6,23 @@ import scala.language.postfixOps
 
 class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   val io = new Bundle{
-    val CommonMreq = master(new LocalMMUIO)
-    val SpecialMreq = Vec.fill(4)(new LocalMMUIO)
-    val Process2Copy = master(new GCProcess2Copy)
-    val Process2Trace = master(new GCProcess2Trace)
+    val Mreq = master(new LocalMMUIO)
+    val ToAllocate = master(new GCToAllocate)
+    val Process2Copy = master(new GCToCopy)
+    val Process2Trace = master(new GCToTrace)
     val Process2CopySurvivor = slave(new GCProcess2Survivor)
     val ConfigIO = slave(new GCCopy2SurvivorConfigIO)
-    val DebugTimeStamp = in(UInt(MMUDataWidth bits))
-    SpecialMreq.foreach(_.asMaster)
+    val DebugTimeStamp = in(UInt(64 bits))
   }
 
   // default value
-  io.CommonMreq.Request.valid := False
-  io.CommonMreq.Request.payload.clearAll()
-  io.CommonMreq.Response.ready := False
+  io.Mreq.Request.valid := False
+  io.Mreq.Request.payload.clearAll()
+  io.Mreq.Response.ready := False
 
-  for(i <- 0 until 4){
-    io.SpecialMreq(i).Request.valid := False
-    io.SpecialMreq(i).Request.payload.clearAll()
-    io.SpecialMreq(i).Response.ready := False
-  }
+  io.ToAllocate.Valid := False
+  io.ToAllocate.DestAttrType := U(0)
+  io.ToAllocate.Size := U(0)
 
   io.Process2Copy.Valid := False
   io.Process2Copy.SrcOopPtr := U(0)
@@ -49,411 +46,410 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   io.Process2Trace.PartialArrayStart := U(0)
 
   object overall_state extends SpinalEnum {
-    val s_idle, s_readKlassPtr, s_readLhKid, s_getSize, s_getAge, s_readDestAttr, s_getBuffer, s_getObjPtr, s_slowAllocate, s_doCopyAndTrace, s_waitDone = newElement()
+    val states = Array.tabulate(27)(i => newElement())
+    for((state, i) <- states.zipWithIndex){
+      state.setName(s"s$i")
+    }
   }
 
-  object partitial_state extends SpinalEnum {
-    val s_0, s_1, s_2 = newElement()
-  }
+  val state = RegInit(overall_state.states(0))
 
-  val state = RegInit(overall_state.s_idle)
-  val sub_state = RegInit(partitial_state.s_0)
+  val markWord = RegInit(U(0, GCElementWidth bits))
+  val srcOopPtr = RegInit(U(0, GCElementWidth bits))
+  val regionAttrPtr = RegInit(U(0, GCElementWidth bits))
 
-  val pss = RegInit(U(0, MMUAddrWidth bits))
-  val chunkSize = RegInit(U(0, 32 bits))
-  val ageThreshold = RegInit(U(0, 32 bits))
-  val youngWordsBase = RegInit(U(0, MMUAddrWidth bits))
-  val plabAllocatorPtr = RegInit(U(0, MMUAddrWidth bits))
-  val heapRegionShiftBy = RegInit(U(0, 32 bits))
-  val heapRegionBiasedBase = RegInit(U(0, MMUAddrWidth bits))
-
-  val markWord = RegInit(U(0, MMUDataWidth bits))
-  val srcOopPtr = RegInit(U(0, MMUAddrWidth bits))
-  val regionAttrPtr = RegInit(U(0, MMUAddrWidth bits))
-
-  val klass_ptr = RegInit(U(0, MMUAddrWidth bits))
+  val klass_ptr = RegInit(U(0, GCElementWidth bits))
   val lh = RegInit(U(0, 32 bits))
   val kid = RegInit(U(0, 32 bits))
   val arrayLength = RegInit(U(0, 32 bits))
   val size = RegInit(U(0, 32 bits))
   val srcRegionAttr = RegInit(U(0, 16 bits))
   val age = RegInit(U(0, 32 bits))
-  val new_mark = RegInit(U(0, MMUDataWidth bits))
-  val dest_attr_ptr = RegInit(U(0, MMUAddrWidth bits))
+  val new_mark = RegInit(U(0, GCElementWidth bits))
+  val dest_attr_ptr = RegInit(U(0, GCElementWidth bits))
   val destRegionAttr = RegInit(U(0, 16 bits))
-  val bufferPtr = RegInit(U(0, MMUAddrWidth bits))
-  val buffer = RegInit(U(0, MMUAddrWidth bits))
-  val region_top = RegInit(U(0, MMUAddrWidth bits))
-  val region_end = RegInit(U(0, MMUAddrWidth bits))
-  val destOopPtr = RegInit(U(0, MMUAddrWidth bits))
-  val from_region = RegInit(U(0, MMUAddrWidth bits))
+  val bufferPtr = RegInit(U(0, GCElementWidth bits))
+  val buffer = RegInit(U(0, GCElementWidth bits))
+  val region_top = RegInit(U(0, GCElementWidth bits))
+  val region_end = RegInit(U(0, GCElementWidth bits))
+  val destOopPtr = RegInit(U(0, GCElementWidth bits))
+  val from_region = RegInit(U(0, GCElementWidth bits))
+  val young_index = RegInit(U(0, 32 bits))
+  val originValue = RegInit(U(0, GCElementWidth bits))
 
-  val completedReadHR = RegInit(False)
-  val completedReadMW = RegInit(False)
-  val completedReadArrayLen = RegInit(False)
-  val completedReadRegionAttr = RegInit(False)
-
-  val issueCommonMreq = RegInit(False)
-  val issueSpecialMreq = Vec.fill(4)(RegInit(False))
-
-
-  when(state === overall_state.s_idle){
-    completedReadHR := False
-    completedReadMW := False
-    completedReadArrayLen := False
-    completedReadRegionAttr := False
-
-    io.Process2CopySurvivor.Ready := True
-    when(io.Process2CopySurvivor.Valid && io.Process2CopySurvivor.Ready){
-      srcOopPtr := io.Process2CopySurvivor.SrcOopPtr
-      markWord := io.Process2CopySurvivor.MarkWord
-      regionAttrPtr := io.Process2CopySurvivor.RegionAttrPtr
-
-      pss := io.ConfigIO.ParScanThreadStatePtr
-      chunkSize := io.ConfigIO.ChunkSize
-      ageThreshold := io.ConfigIO.AgeThreshold
-      youngWordsBase := io.ConfigIO.YoungWordsBase
-      plabAllocatorPtr := io.ConfigIO.PlabAllocatorPtr
-      heapRegionShiftBy := io.ConfigIO.HeapRegionShiftBy
-      heapRegionBiasedBase := io.ConfigIO.HeapRegionBiasedBase
-
-      state := overall_state.s_readKlassPtr
-
-      if(DebugEnable){
-        report(Seq(
-          "[GCOopCopy2Survivor<", io.DebugTimeStamp,
-          ">]Receive task from OopProcess",
-          "\n"
-        ))
-      }
-    }
-  }
-
-  when(state === overall_state.s_readKlassPtr){
-    val addr = (srcOopPtr + U(KlassOff)).resize(MMUAddrWidth bits)
-    issueReq(io.CommonMreq, addr, False, U(0), U(0), issueCommonMreq){ rd =>
-      klass_ptr := rd
-      state := overall_state.s_readLhKid
-    }
-  }
-
-  when(state === overall_state.s_readLhKid){
-    val addr = (klass_ptr + U(LhKidOff)).resize(MMUAddrWidth bits)
-    issueReq(io.CommonMreq, addr, False, U(0), U(0), issueCommonMreq){ rd =>
-      lh := rd(31 downto 0)
-      kid := rd(63 downto 32)
-      state := overall_state.s_getSize
-    }
-  }
-
-  when(state === overall_state.s_getSize){
-    val sizeComputedReady = lh.asSInt > 0 || completedReadArrayLen || io.SpecialMreq(0).Response.valid
-    when(sizeComputedReady){
-      when(completedReadRegionAttr || io.SpecialMreq(1).Response.valid){
-        state := overall_state.s_getAge
-      }
-    }
-    when(lh.asSInt > 0){
-      size := (lh >> LogHeapWordSize).resize(32 bits)
-    }.elsewhen(completedReadArrayLen || io.SpecialMreq(0).Response.valid){
-      val arrayLen = Mux(completedReadArrayLen, arrayLength, io.SpecialMreq(0).Response.payload.ResponseData(31 downto 0))
-      val size_in_bytes = ((arrayLen << lh(7 downto 0)) + lh(23 downto 16)).resize(32 bits)
-      size := Mux(size_in_bytes(LogHeapWordSize - 1 downto 0) =/= U(0), (size_in_bytes >> U(LogHeapWordSize)) + U(1), size_in_bytes >> U(LogHeapWordSize)).resize(32 bits)
-    }
-  }
-
-  val hasMonitor = (markWord & U(MONITOR_VALUE, MMUDataWidth bits)) =/= U(0, MMUDataWidth bits)
-  val ptr = Mux(hasMonitor, markWord ^ U(MONITOR_VALUE, MMUDataWidth bits), markWord)
-  when(state === overall_state.s_getAge){
-    dest_attr_ptr := (pss + U(REGION_ATTR_DEST_OFFSET) + srcRegionAttr(15 downto 8) * U(GCHeapRegionAttr_Size)).resize(MMUAddrWidth bits)
-    val isYoungRegion = srcRegionAttr(15 downto 8) === U(Type_Young, 8 bits)
-    val markWordReady = !hasMonitor || completedReadMW || io.SpecialMreq(2).Response.valid
-
-    when(isYoungRegion && markWordReady){
-      // 统一获取 mark word
-      val effectiveMark = Mux(hasMonitor && completedReadMW, new_mark,
-        Mux(hasMonitor, io.SpecialMreq(2).Response.payload.ResponseData,
-          markWord))
-      val extractedAge = ((effectiveMark >> U(AGE_SHIFT)) & U(AGE_MASK)).resize(32 bits)
-      age := extractedAge
-
-      when(extractedAge < ageThreshold){
-        dest_attr_ptr := regionAttrPtr
-        destRegionAttr := srcRegionAttr
-        state := overall_state.s_getBuffer
-      }.otherwise{
-        state := overall_state.s_readDestAttr
-      }
-    }.elsewhen(!isYoungRegion){
-      age := U(0)
-      state := overall_state.s_readDestAttr
-    }
-  }
-
-  when(state === overall_state.s_readDestAttr){
-    issueReq(io.CommonMreq, dest_attr_ptr, False, U(0), U(0), issueCommonMreq) { rd =>
-      destRegionAttr := rd(15 downto 0)
-      state := overall_state.s_getBuffer
-    }
-  }
-
-  val bufferPtrValid = RegInit(False)
-  when(state === overall_state.s_getBuffer){
-    when(!bufferPtrValid) {
-      val addr = (plabAllocatorPtr + U(ALLOC_BUFFERS_OFFSET) + destRegionAttr(15 downto 8) * U(GCObjectPtr_Size)).resize(MMUAddrWidth bits)
-      issueReq(io.CommonMreq, addr, False, U(0), U(0), issueCommonMreq) { rd =>
-        bufferPtr := rd
-        bufferPtrValid := True
-      }
-    }.elsewhen(bufferPtrValid){
-      issueReq(io.CommonMreq, bufferPtr, False, U(0), U(0), issueCommonMreq){ rd =>
-        buffer := rd
-        bufferPtrValid := False
-        state := overall_state.s_getObjPtr
-      }
-    }
-  }
-
-  val completedReadTop = RegInit(False)
-  val completedReadEnd = RegInit(False)
-  when(state === overall_state.s_getObjPtr){
-    when(!completedReadEnd && completedReadArrayLen){
-      issueReq(io.SpecialMreq(0), (buffer + U(REGION_END_OFFSET)).resize(MMUAddrWidth bits), False, U(0), U(0), issueSpecialMreq(0)) { rd =>
-        completedReadEnd := True
-        region_end := rd
-      }
-    }
-    when(!completedReadTop && completedReadRegionAttr){
-      issueReq(io.SpecialMreq(1), (buffer + U(REGION_TOP_OFFSET)).resize(MMUAddrWidth bits), False, U(0), U(0), issueSpecialMreq(1)){ rd =>
-        completedReadTop := True
-        region_top := rd
-      }
-    }
-    when((completedReadEnd || io.SpecialMreq(0).Response.valid) && (completedReadEnd || io.SpecialMreq(1).Response.valid)){
-      completedReadTop := False
-      completedReadEnd := False
-      val end = Mux(completedReadEnd, region_end, io.SpecialMreq(0).Response.payload.ResponseData)
-      val top = Mux(completedReadTop, region_top, io.SpecialMreq(1).Response.payload.ResponseData)
-      when(((end - top) / U(GCObjectPtr_Size)).resize(32 bits) >= size){
-        destOopPtr := top
-        issueReq(io.CommonMreq, (buffer + U(REGION_TOP_OFFSET)).resize(MMUAddrWidth bits), True, allBytesOnes, (top + size * U(GCObjectPtr_Size)).resize(MMUDataWidth bits), issueCommonMreq){ rd =>
-          state := overall_state.s_doCopyAndTrace
-        }
-      }.otherwise{
-        state := overall_state.s_slowAllocate
-      }
-    }
-  }
-
-  when(state === overall_state.s_slowAllocate){
-    if(DebugEnable){
-      report(Seq(
-        "[GCOopCopy2Survivor<", io.DebugTimeStamp,
-        ">]issue interrupt call allocate_copy_slow function",
-        "\n"
-      ))
-    }
-  }
-
+  val issued = RegInit(False)
   val issuedCopy = RegInit(False)
   val issuedTrace = RegInit(False)
-  when(state === overall_state.s_doCopyAndTrace){
-    val needTrace = kid =/= U(TypeArrayKlassID, 32 bits)
-
-    io.Process2Copy.Valid := !issuedCopy
-    io.Process2Copy.Size := size
-    io.Process2Copy.SrcOopPtr := srcOopPtr
-    io.Process2Copy.DestOopPtr := destOopPtr
-
-    io.Process2Trace.Valid := needTrace && !issuedTrace
-    io.Process2Trace.OopType := U(CommonOop)
-    io.Process2Trace.KlassPtr := klass_ptr
-    io.Process2Trace.SrcOopPtr := srcOopPtr
-    io.Process2Trace.DestOopPtr := destOopPtr
-
-    io.Process2Trace.Kid := kid
-    io.Process2Trace.ScanningInYoung := destRegionAttr(15 downto 8) === U(Type_Young, 8 bits)
-
-    io.Process2Trace.ArrayLength := arrayLength
-    io.Process2Trace.PartialArrayStart := U(0)
-    io.Process2Trace.StepIndex := (arrayLength % chunkSize).resize(32 bits)
-    io.Process2Trace.StepNCreate := Mux(arrayLength > (arrayLength % chunkSize), U(1), U(0)).resize(32 bits)
-
-    val copyFire = io.Process2Copy.Valid && io.Process2Copy.Ready
-    val traceFire = io.Process2Trace.Valid && io.Process2Trace.Ready
-
-    when(copyFire){
-      issuedCopy := True
-      if(DebugEnable){
-        report(Seq(
-          "[GCOopCopy2Survivor<", io.DebugTimeStamp,
-          ">]send the task to copy module",
-          "\n"
-        ))
-      }
-    }
-
-    when(traceFire){
-      issuedTrace := True
-      if(DebugEnable){
-        report(Seq(
-          "[GCOopCopy2Survivor<", io.DebugTimeStamp,
-          ">]send the task to trace module",
-          "\n"
-        ))
-      }
-    }
-
-    val copyIssuedDone  = copyFire || issuedCopy
-    val traceIssuedDone = traceFire || issuedTrace || !needTrace
-
-    when(copyIssuedDone && traceIssuedDone) {
-      issuedCopy  := False
-      issuedTrace := False
-      state := overall_state.s_waitDone
-    }
-  }
-
   val copyDone = RegInit(False)
   val traceDone = RegInit(False)
-  val completedWriteSrcMW = RegInit(False)
-  val completedWriteDestMW = RegInit(False)
-  val completedWriteDestLength = RegInit(False)
-  val completedWriteMonitorPtr = RegInit(False)
-  val completedUpdatedYoungWordsBase = RegInit(False)
-  val specialWriteDone = completedWriteSrcMW && completedWriteDestMW && completedWriteMonitorPtr && completedUpdatedYoungWordsBase && completedWriteDestLength
-  when(state === overall_state.s_waitDone){
-    val needTrace = kid =/= TypeArrayKlassID
-    val copyFinished  = copyDone  || io.Process2Copy.Done
-    val traceFinished = traceDone || io.Process2Trace.Done || !needTrace
+  val allocateSelect = RegInit(False)
 
-    when(io.Process2Copy.Done) {
-      copyDone := True
-    }
+  switch(state){
+    is(overall_state.states(0)){
+      io.Process2CopySurvivor.Ready := True
+      when(io.Process2CopySurvivor.Valid && io.Process2CopySurvivor.Ready){
+        srcOopPtr := io.Process2CopySurvivor.SrcOopPtr
+        markWord := io.Process2CopySurvivor.MarkWord
+        regionAttrPtr := io.Process2CopySurvivor.RegionAttrPtr
 
-    when(io.Process2Trace.Done) {
-      traceDone := True
-    }
+        state := overall_state.states(1)
 
-    when(specialWriteDone && copyFinished && traceFinished) {
-      if(DebugEnable){
-        report(Seq(
-          "[GCOopCopy2Survivor<", io.DebugTimeStamp,
-          ">]the copy2survivor has done",
-          "\n"
-        ))
-      }
-      copyDone  := False
-      traceDone := False
-
-      completedWriteSrcMW := False
-      completedWriteDestMW := False
-      completedWriteMonitorPtr := False
-      completedUpdatedYoungWordsBase := False
-      completedWriteDestLength := False
-
-      io.Process2CopySurvivor.Done := True
-      io.Process2CopySurvivor.DestOopPtr := destOopPtr
-
-      state := overall_state.s_idle
-    }
-  }
-
-  when(state =/= overall_state.s_idle){
-    when(!completedReadArrayLen){
-      val addr = (srcOopPtr + U(ArrayLenOff)).resize(MMUAddrWidth bits)
-      issueReq(io.SpecialMreq(0), addr, False, U(0), U(0), issueSpecialMreq(0)){ rd =>
-        arrayLength := rd(31 downto 0)
-        completedReadArrayLen := True
+        if(DebugEnable){
+          report(Seq(
+            "[GCOopCopy2Survivor<", io.DebugTimeStamp,
+            ">]Receive task from OopProcess",
+            "\n"
+          ))
+        }
       }
     }
-    when(!completedReadRegionAttr){
-      issueReq(io.SpecialMreq(1), regionAttrPtr, False, U(0), U(0), issueSpecialMreq(1)){ rd =>
+
+    is(overall_state.states(1)){
+      val addr = (srcOopPtr + U"x8").resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        klass_ptr := rd(GCElementWidth - 1 downto 0)
+        state := overall_state.states(2)
+      }
+    }
+
+    is(overall_state.states(2)){
+      val compressedKlassPtr = (io.ConfigIO.CompressedKlassPointerBase + klass_ptr << io.ConfigIO.CompressedKlassPointerShift).resize(GCElementWidth bits)
+      val addr = Mux(io.ConfigIO.UseCompressedKlassPointer, compressedKlassPtr, klass_ptr)
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        klass_ptr := addr
+        lh := rd(31 downto 0)
+        kid := rd(63 downto 32)
+        state := overall_state.states(3)
+      }
+    }
+
+    is(overall_state.states(3)){
+      when(lh > U(0)){
+        size := (lh >> U(3)).resize(32 bits)
+        state := overall_state.states(4)
+      }.otherwise{
+        val addr = (srcOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointer, U(12), U(16))).resize(MMUAddrWidth bits)
+        issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+          arrayLength := rd(31 downto 0)
+          state := overall_state.states(4)
+        }
+      }
+    }
+
+    is(overall_state.states(4)){
+      when(lh < U(0)){
+        val temp = ((arrayLength << lh(7 downto 0)) + lh(23 downto 16)).resize(32 bits)
+        size := Mux(temp(2 downto 0) =/= U(0), (temp >> U(3)) + U(1), temp >> U(3)).resize(32 bits)
+      }
+      issueReq(io.Mreq, regionAttrPtr, False, U(0), U(0), issued){ rd =>
         srcRegionAttr := rd(15 downto 0)
-        completedReadRegionAttr := True
-      }
-    }
-    when(!completedReadMW){
-      issueReq(io.SpecialMreq(2), ptr, False, U(0), U(0), issueSpecialMreq(2)){ rd =>
-        new_mark := rd
-        completedReadMW := True
-      }
-    }
-    when(!completedReadHR){
-      val addr = (heapRegionBiasedBase + (srcOopPtr >> heapRegionShiftBy) * U(GCObjectPtr_Size)).resize(MMUDataWidth bits)
-      issueReq(io.SpecialMreq(3), addr, False, U(0), U(0), issueSpecialMreq(3)){ rd =>
-        from_region := rd
-        completedReadHR := True
-      }
-    }
-  }
-
-  val young_index = RegInit(U(0, 32 bits))
-  val originValue = RegInit(U(0, MMUDataWidth bits))
-  val writeMonitor_state = RegInit(partitial_state.s_0)
-  val updatedYoungWordsBase_state = RegInit(partitial_state.s_0)
-  when(state === overall_state.s_doCopyAndTrace || state === overall_state.s_waitDone){
-    when(!completedWriteSrcMW && completedReadArrayLen){
-      val srcMW = (destOopPtr & ~U(LOCK_MASK_IN_PLACE, MMUAddrWidth bits)) | U(MARKED_VALUE, MMUAddrWidth bits)
-      issueReq(io.SpecialMreq(0), srcOopPtr + U(MarkWordOff), True, allBytesOnes, srcMW, issueSpecialMreq(0)){ rd =>
-        completedWriteSrcMW := True
+        state := overall_state.states(5)
       }
     }
 
-    when(!completedWriteDestMW && completedReadRegionAttr){
-      val hasChangedMW = destRegionAttr(15 downto 8) === U(Type_Young, 8 bits) && (markWord & U(UNLOCKED_VALUE, MMUDataWidth bits)) === U(0)
-      val oldMarkChanged = (markWord & ~U(AGE_MASK_IN_PLACE, MMUDataWidth bits)) | Mux(age < U(AGE_MASK), age + U(1), age).resize(MMUDataWidth bits) & (U(AGE_MASK) << U(AGE_SHIFT)).resize(MMUDataWidth bits)
-      val destMW = Mux(hasChangedMW, oldMarkChanged, markWord)
-      issueReq(io.SpecialMreq(1), destOopPtr + U(MarkWordOff), True, allBytesOnes, destMW, issueSpecialMreq(1)){ rd =>
-        completedWriteDestMW := True
-      }
-    }
+    is(overall_state.states(5)){
+      val region_attr_type = srcRegionAttr(15 downto 8)
+      dest_attr_ptr := (io.ConfigIO.ParScanThreadStatePtr + U"x178" + region_attr_type * U(2)).resize(GCElementWidth bits)
+      age := U(0)
 
-    val hasWriteMonitorPtr = destRegionAttr === U(Type_Young, 8 bits) && (markWord & U(UNLOCKED_VALUE, MMUDataWidth bits)) === U(0)
-    when(hasWriteMonitorPtr && !completedWriteMonitorPtr && completedReadMW){
-      when(writeMonitor_state === partitial_state.s_0){
-        issueReq(io.SpecialMreq(2), ptr, False, U(0), U(0), issueSpecialMreq(2)){ rd =>
-          new_mark := rd
-          writeMonitor_state := partitial_state.s_1
+      when(region_attr_type === U(0)){
+        when(!markWord(0)){
+          val addr = Mux(markWord(1), markWord ^ U(2), markWord).resize(MMUAddrWidth bits)
+          issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
+            new_mark := rd(GCElementWidth - 1 downto 0)
+            state := overall_state.states(6)
+          }
+        }.otherwise{
+          age := ((markWord >> U(3)) & U(x"1111", GCElementWidth bits)).resize(32 bits)
+          state := overall_state.states(6)
         }
-      }.elsewhen(writeMonitor_state === partitial_state.s_1){
-        val newMarkChanged = (new_mark & ~U(AGE_MASK_IN_PLACE, MMUDataWidth bits)) | Mux(age < U(AGE_MASK), age + U(1), age).resize(MMUDataWidth bits) & (U(AGE_MASK) << U(AGE_SHIFT)).resize(MMUDataWidth bits)
-        issueReq(io.SpecialMreq(2), ptr, True, allBytesOnes, newMarkChanged, issueSpecialMreq(2)) { rd =>
-          completedWriteMonitorPtr := True
-          writeMonitor_state := partitial_state.s_0
-        }
-      }
-    }.otherwise{
-      completedWriteMonitorPtr := True
-    }
-
-    when(!completedUpdatedYoungWordsBase && completedReadHR){
-      when(updatedYoungWordsBase_state === partitial_state.s_0){
-        issueReq(io.SpecialMreq(3), (from_region + U(YOUND_INDEX_IN_CSET_OFFSET)).resized, False, U(0), U(0), issueSpecialMreq(3)){ rd =>
-          young_index := rd(31 downto 0)
-          updatedYoungWordsBase_state := partitial_state.s_1
-        }
-      }.elsewhen(updatedYoungWordsBase_state === partitial_state.s_1){
-        issueReq(io.SpecialMreq(3), (youngWordsBase + young_index * U(GCObjectPtr_Size)).resized, False, U(0), U(0), issueSpecialMreq(3)){ rd =>
-          originValue := rd
-          updatedYoungWordsBase_state := partitial_state.s_2
-        }
-      }.elsewhen(updatedYoungWordsBase_state === partitial_state.s_2){
-        issueReq(io.SpecialMreq(3), (youngWordsBase + young_index * U(GCObjectPtr_Size)).resized, True, allBytesOnes, originValue + size, issueSpecialMreq(3)){ rd =>
-          updatedYoungWordsBase_state := partitial_state.s_0
-          completedUpdatedYoungWordsBase := True
+      }.otherwise{
+        val addr = (io.ConfigIO.ParScanThreadStatePtr + U"x178" + region_attr_type * U(2)).resize(MMUAddrWidth bits)
+        issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+          destRegionAttr := rd(15 downto 0)
+          state := overall_state.states(7)
         }
       }
     }
 
-    when(kid === ObjectArrayKlassID){
-      when(!completedWriteDestLength){
-        issueReq(io.CommonMreq, destOopPtr + U(ArrayLenOff), True, halfBytesOnes, (arrayLength % chunkSize).resized, issueCommonMreq){ rd =>
-          completedWriteDestLength := True
+    is(overall_state.states(6)){
+      val cond = srcRegionAttr(15 downto 8) === U(0) && !markWord(0)
+      val temp = Mux(cond, ((new_mark >> U(3)) & U(x"1111", GCElementWidth bits)).resize(32 bits), age)
+      when(cond){
+        age := ((new_mark >> U(3)) & U(x"1111", GCElementWidth bits)).resize(32 bits)
+      }
+
+      when(temp < io.ConfigIO.AgeThreshold){
+        dest_attr_ptr := regionAttrPtr
+        destRegionAttr := srcRegionAttr
+        state := overall_state.states(7)
+      }.otherwise{
+        issueReq(io.Mreq, dest_attr_ptr, False, U(0), U(0), issued) { rd =>
+          destRegionAttr := rd(15 downto 0)
+          state := overall_state.states(7)
         }
       }
-    }.otherwise{
-      completedWriteDestLength := True
+    }
+
+    is(overall_state.states(7)){
+      val addr = (io.ConfigIO.HeapRegionBiasedBase + (srcOopPtr >> io.ConfigIO.HeapRegionShiftBy) * U(8)).resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
+        from_region := rd(GCElementWidth - 1 downto 0)
+        state := overall_state.states(8)
+      }
+    }
+
+    is(overall_state.states(8)){
+      val dest_attr_type = destRegionAttr(15 downto 8)
+      val addr = (io.ConfigIO.PlabAllocatorPtr + U"x10" + dest_attr_type * 8).resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        bufferPtr := rd(GCElementWidth - 1 downto 0)
+        state := overall_state.states(9)
+      }
+    }
+
+    is(overall_state.states(9)){
+      issueReq(io.Mreq, bufferPtr, False, U(0), U(0), issued) { rd =>
+        buffer := rd(GCElementWidth - 1 downto 0)
+        state := overall_state.states(10)
+      }
+    }
+
+    is(overall_state.states(10)){
+      val addr = (buffer + U"x30").resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        region_top := rd(GCElementWidth - 1 downto 0)
+        region_end := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+        state := overall_state.states(11)
+      }
+    }
+
+    is(overall_state.states(11)){
+      when((region_end - region_top) / U(8) >= size){
+        destOopPtr := region_top
+        val addr = buffer + U"x30"
+        val writeValue = (region_top + size * U(8)).resize(GCElementWidth bits)
+        issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued){ rd =>
+          region_top := writeValue
+          state := overall_state.states(12)
+        }
+      }.otherwise{
+        allocateSelect := False
+        io.ToAllocate.Valid := True
+        io.ToAllocate.Size := size
+        io.ToAllocate.DestAttrType := destRegionAttr(15 downto 8)
+
+        when(io.ToAllocate.Valid && io.ToAllocate.Ready){
+          state := overall_state.states(21)
+        }
+      }
+    }
+
+    is(overall_state.states(12)){
+      // ALLOC return
+      val writeValue = Cat(destOopPtr(GCElementWidth - 1 downto 2), U(3)).resize(GCElementWidth bits)
+      issueReq(io.Mreq, srcOopPtr, True, getWstrb(8), writeValue.asUInt, issued) { rd =>
+        state := overall_state.states(13)
+      }
+    }
+
+    is(overall_state.states(13)){
+      val addr = (from_region + U(256)).resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        young_index := rd(31 downto 0)
+        state := overall_state.states(14)
+      }
+    }
+
+    is(overall_state.states(14)){
+      val addr = (io.ConfigIO.YoungWordsBase + young_index * U(8)).resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        originValue := rd(GCElementWidth - 1 downto 0)
+        state := overall_state.states(15)
+      }
+    }
+
+    is(overall_state.states(15)){
+      val addr = (io.ConfigIO.YoungWordsBase + young_index * U(8)).resize(MMUAddrWidth bits)
+      val writeValue = (originValue + size).resize(GCElementWidth bits)
+      issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { rd =>
+        state := overall_state.states(16)
+      }
+    }
+
+    is(overall_state.states(16)){
+      val cond = destRegionAttr(15 downto 8) === U(0) && !markWord(0)
+      val temp = (markWord & ~(U"x1111" << 3).resize(GCElementWidth bits)) | ((Mux(age + U(1) < U(15), age + U(1), age) & U(x"1111", 32 bits)) << 3).resize(GCElementWidth bits)
+      val writeValue = Mux(cond, temp, markWord)
+      issueReq(io.Mreq, destOopPtr, True, getWstrb(8), writeValue, issued){ rd =>
+        state := overall_state.states(17)
+      }
+    }
+
+    is(overall_state.states(17)){
+      val cond = destRegionAttr(15 downto 8) === U(0) && !markWord(0)
+      when(cond){
+        val addr = Mux(markWord(1), markWord ^ U(2), markWord).resize(MMUAddrWidth bits)
+        issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
+          originValue := rd(GCElementWidth - 1 downto 0)
+          state := overall_state.states(18)
+        }
+      }.otherwise{
+        state := overall_state.states(19)
+      }
+    }
+
+    is(overall_state.states(18)){
+      val addr = Mux(markWord(1), markWord ^ U(2), markWord).resize(MMUAddrWidth bits)
+      val writeValue = (originValue & ~(U"x1111" << 3).resize(GCElementWidth bits)) | ((Mux(age + U(1) < U(15), age + U(1), age) & U(x"1111", 32 bits)) << 3).resize(GCElementWidth bits)
+      issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued){ rd =>
+        state := overall_state.states(19)
+      }
+    }
+
+    is(overall_state.states(19)){
+      val needTrace = kid =/= U(TypeArrayKlassID, 32 bits)
+
+      io.Process2Copy.Valid := !issuedCopy
+      io.Process2Copy.Size := size - U(1)
+      io.Process2Copy.SrcOopPtr := srcOopPtr + U(8)
+      io.Process2Copy.DestOopPtr := destOopPtr + U(8)
+
+      io.Process2Trace.Valid := needTrace && !issuedTrace
+      io.Process2Trace.OopType := U(NotArrayOop)
+      io.Process2Trace.KlassPtr := klass_ptr
+      io.Process2Trace.SrcOopPtr := srcOopPtr
+      io.Process2Trace.DestOopPtr := destOopPtr
+
+      io.Process2Trace.Kid := kid
+      io.Process2Trace.ScanningInYoung := destRegionAttr(15 downto 8) === U(Type_Young, 8 bits)
+
+      io.Process2Trace.ArrayLength := arrayLength
+      io.Process2Trace.PartialArrayStart := U(0)
+      io.Process2Trace.StepIndex := (arrayLength % io.ConfigIO.ChunkSize).resize(32 bits)
+      io.Process2Trace.StepNCreate := Mux(arrayLength > (arrayLength % io.ConfigIO.ChunkSize), U(1), U(0)).resize(32 bits)
+
+      val copyFire = io.Process2Copy.Valid && io.Process2Copy.Ready
+      val traceFire = io.Process2Trace.Valid && io.Process2Trace.Ready
+
+      when(copyFire){
+        issuedCopy := True
+        if(DebugEnable){
+          report(Seq(
+            "[GCOopCopy2Survivor<", io.DebugTimeStamp,
+            ">]send the task to copy module",
+            "\n"
+          ))
+        }
+      }
+
+      when(traceFire){
+        issuedTrace := True
+        if(DebugEnable){
+          report(Seq(
+            "[GCOopCopy2Survivor<", io.DebugTimeStamp,
+            ">]send the task to trace module",
+            "\n"
+          ))
+        }
+      }
+
+      val copyIssuedDone  = copyFire || issuedCopy
+      val traceIssuedDone = traceFire || issuedTrace || !needTrace
+
+      when(copyIssuedDone && traceIssuedDone) {
+        issuedCopy  := False
+        issuedTrace := False
+        state := overall_state.states(20)
+      }
+    }
+
+    is(overall_state.states(20)){
+      when(io.Process2Copy.Done){
+        copyDone := True
+      }
+      when(io.Process2Trace.Done){
+        traceDone := True
+      }
+
+      val needTrace = kid =/= TypeArrayKlassID
+      val copyFinished = copyDone || io.Process2Copy.Done
+      val traceFinished = traceDone || io.Process2Trace.Done || !needTrace
+
+      when(copyFinished && traceFinished){
+        copyDone := False
+        traceDone := False
+
+        io.Process2CopySurvivor.Done := True
+        io.Process2CopySurvivor.DestOopPtr := destOopPtr
+
+        state := overall_state.states(0)
+      }
+    }
+
+    is(overall_state.states(21)){
+      when(io.ToAllocate.Done){
+        destOopPtr := io.ToAllocate.DestObjPtr
+        state := Mux(allocateSelect, overall_state.states(26), overall_state.states(22))
+      }
+    }
+
+    is(overall_state.states(22)){
+      when(destOopPtr === U(0)){
+        val addr = (io.ConfigIO.PlabAllocatorPtr + U"x18").resize(MMUAddrWidth bits)
+        issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+          bufferPtr := rd(GCElementWidth - 1 downto 0)
+          state := overall_state.states(23)
+        }
+      }.otherwise{
+        state := overall_state.states(12)
+      }
+    }
+
+    is(overall_state.states(23)){
+      issueReq(io.Mreq, bufferPtr, False, U(0), U(0), issued) { rd =>
+        buffer := rd(GCElementWidth - 1 downto 0)
+        state := overall_state.states(24)
+      }
+    }
+
+    is(overall_state.states(24)){
+      val addr = (buffer + U"x30").resize(MMUAddrWidth bits)
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        region_top := rd(GCElementWidth - 1 downto 0)
+        region_end := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+        destRegionAttr := (destRegionAttr & U(x"ff", 16 bits)) | U(x"100", 16 bits)
+
+        state := overall_state.states(25)
+      }
+    }
+
+    is(overall_state.states(25)){
+      when((region_end - region_top) / U(8) >= size){
+        destOopPtr := region_top
+        val addr = (buffer + U"x30").resize(MMUAddrWidth bits)
+        val writeValue = (region_top + size * U(8)).resize(GCElementWidth bits)
+        issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { rd =>
+          region_top := writeValue
+          state := overall_state.states(26)
+        }
+      }.otherwise{
+        allocateSelect := True
+        io.ToAllocate.Valid := True
+        io.ToAllocate.Size := size
+        io.ToAllocate.DestAttrType := destRegionAttr(15 downto 8)
+
+        when(io.ToAllocate.Valid && io.ToAllocate.Ready){
+          state := overall_state.states(21)
+        }
+      }
+    }
+
+    is(overall_state.states(26)){
+      val addr = dest_attr_ptr + U(1)
+      issueReq(io.Mreq, addr, True, getWstrb(1), U(1), issued) { rd =>
+        state := overall_state.states(12)
+      }
     }
   }
 }
