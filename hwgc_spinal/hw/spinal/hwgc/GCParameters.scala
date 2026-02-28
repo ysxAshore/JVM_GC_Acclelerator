@@ -160,19 +160,6 @@ class GCProcess2Survivor extends Bundle with GCParameters with IMasterSlave {
   }
 }
 
-case class GCTracePayload() extends Bundle with GCParameters {
-  val OopType = UInt(GCOopTypeWidth bits)
-  val KlassPtr = UInt(GCElementWidth bits)
-  val SrcOopPtr = UInt(GCElementWidth bits)
-  val DestOopPtr = UInt(GCElementWidth bits)
-  val Kid = UInt(32 bits)
-  val ScanningInYoung = Bool()
-  val ArrayLength = UInt(32 bits)
-  val PartialArrayStart = UInt(32 bits)
-  val StepIndex = UInt(32 bits)
-  val StepNCreate = UInt(32 bits)
-}
-
 class GCToAllocate extends Bundle with GCParameters with IMasterSlave{
   val Valid = in Bool()
   val Ready = out Bool()
@@ -193,12 +180,18 @@ class GCToParAllocate extends Bundle with GCParameters with IMasterSlave{
   val Ready = out Bool()
   val Done = out Bool()
 
+  val excuteAll = in Bool()
+  val botUpdates = in Bool()
+  val allocRegion = in UInt(GCElementWidth bits)
+  val minWordSize = in UInt(GCElementWidth bits)
+  val desiredWordSize = in UInt(GCElementWidth bits)
+
   val DestObjPtr = out UInt(GCElementWidth bits)
   val ActualPlabSize = out UInt(GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done, DestObjPtr, ActualPlabSize)
-    out(Valid)
+    out(Valid, excuteAll, botUpdates, allocRegion, minWordSize, desiredWordSize)
   }
 }
 
@@ -342,6 +335,16 @@ class GCAllocateConfigIO extends Bundle with GCParameters with IMasterSlave{
 
   override def asMaster(): Unit = {
     out(G1h, Thread, LockPtr, objectKlassObj, intArrayKlassObj, PlabAllocatorPtr, UseCompressedKlassPointers, CompressedKlassPointerBase, CompressedKlassPointerShift)
+    in()
+  }
+}
+
+class GCAttemptAllocConfigIO extends Bundle with GCParameters with IMasterSlave{
+  val G1h = in UInt(GCElementWidth bits)
+  val DummyRegion = in UInt(GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    out(G1h, DummyRegion)
     in()
   }
 }

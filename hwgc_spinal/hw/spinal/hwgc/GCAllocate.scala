@@ -23,6 +23,11 @@ class GCAllocate extends Module with GCParameters with HWParameters {
   io.ToAllocate.DestObjPtr := U(0)
 
   io.ToParAllocate.Valid := False
+  io.ToParAllocate.excuteAll := False
+  io.ToParAllocate.botUpdates := False
+  io.ToParAllocate.allocRegion := U(0)
+  io.ToParAllocate.minWordSize := U(0)
+  io.ToParAllocate.desiredWordSize := U(0)
 
   io.ToAttempAllocate.Valid := False
 
@@ -101,7 +106,6 @@ class GCAllocate extends Module with GCParameters with HWParameters {
           state := overall_state.states(4)
         }
       }.otherwise{
-        //send to allocate during gc
         duringGCSelect := True
         minWordSize := size.resize(GCElementWidth bits)
         desiredWordSize := size.resize(GCElementWidth bits)
@@ -134,7 +138,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
           state := overall_state.states(6)
         }
       }.otherwise{
-
+        state := overall_state.states(9)
       }
     }
 
@@ -175,7 +179,6 @@ class GCAllocate extends Module with GCParameters with HWParameters {
       var addr = (io.ConfigIO.PlabAllocatorPtr + U"x30" + destAttrType * U(8)).resize(MMUAddrWidth bits)
       val writeValue = tempValue + U(1)
       issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { rd =>
-        // send to allocate during gc
         duringGCSelect := False
         minWordSize := requiredInPlab
         desiredWordSize := plabWordSize
@@ -195,7 +198,6 @@ class GCAllocate extends Module with GCParameters with HWParameters {
           state := overall_state.states(12)
         }
       }.otherwise{
-        // send to allocate during gc
         duringGCSelect := True
         minWordSize := size.resize(GCElementWidth bits)
         desiredWordSize := size.resize(GCElementWidth bits)
@@ -237,7 +239,16 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.states(15)){
-      // send to par allocate
+      io.ToParAllocate.Valid := True
+      io.ToParAllocate.excuteAll := destAttrType =/= U(0)
+      io.ToParAllocate.botUpdates := True
+      io.ToParAllocate.allocRegion := allocRegion
+      io.ToParAllocate.minWordSize := minWordSize
+      io.ToParAllocate.desiredWordSize := desiredWordSize
+
+      when(io.ToParAllocate.Valid && io.ToParAllocate.Ready){
+        state := overall_state.states(16)
+      }
     }
 
     is(overall_state.states(16)){
@@ -284,7 +295,16 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.states(19)){
-      // send to par allocate
+      io.ToParAllocate.Valid := True
+      io.ToParAllocate.excuteAll := destAttrType =/= U(0)
+      io.ToParAllocate.botUpdates := True
+      io.ToParAllocate.allocRegion := allocRegion
+      io.ToParAllocate.minWordSize := minWordSize
+      io.ToParAllocate.desiredWordSize := desiredWordSize
+
+      when(io.ToParAllocate.Valid && io.ToParAllocate.Ready){
+        state := overall_state.states(16)
+      }
     }
 
     is(overall_state.states(20)){
