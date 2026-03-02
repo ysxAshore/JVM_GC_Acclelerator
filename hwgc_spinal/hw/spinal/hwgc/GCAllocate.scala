@@ -30,6 +30,9 @@ class GCAllocate extends Module with GCParameters with HWParameters {
   io.ToParAllocate.desiredWordSize := U(0)
 
   io.ToAttempAllocate.Valid := False
+  io.ToAttempAllocate.regionPtr := U(0)
+  io.ToAttempAllocate.allocRegion := U(0)
+  io.ToAttempAllocate.desiredWordSize := U(0)
 
   object overall_state extends SpinalEnum {
     val states = Array.tabulate(25)(i => newElement())
@@ -317,7 +320,14 @@ class GCAllocate extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(21)){
       when(destObjPtr === U(0)){
-        //send attempt alloc
+        io.ToAttempAllocate.Valid := True
+        io.ToAttempAllocate.regionPtr := regionPtr
+        io.ToAttempAllocate.allocRegion := allocRegion
+        io.ToAttempAllocate.desiredWordSize := desiredWordSize
+
+        when(io.ToAttempAllocate.Valid && io.ToAttempAllocate.Ready){
+          state := overall_state.states(22)
+        }
       }.otherwise{
         state := overall_state.states(24)
       }

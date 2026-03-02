@@ -75,6 +75,8 @@ trait GCParameters {
   val GCObjectPtr_Size = 8
   val LogHeapWordSize = log2Up(GCObjectPtr_Size)
   val GCHeapRegionAttr_Size = 2
+
+  val UINT_MAX = U(BigInt(2147483647L * 2 + 1), 32 bits)
 }
 
 trait HWParameters {
@@ -200,13 +202,49 @@ class GCToAttemptAllocate extends Bundle with GCParameters with IMasterSlave {
   val Ready = out Bool()
   val Done = out Bool()
 
+  val regionPtr = in UInt(GCElementWidth bits)
+  val allocRegion = in UInt(GCElementWidth bits)
+  val desiredWordSize = in UInt(GCElementWidth bits)
+
   val DestObjPtr = out UInt(GCElementWidth bits)
   val ActualPlabSize = out UInt(GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done, DestObjPtr, ActualPlabSize)
-    out(Valid)
+    out(Valid, regionPtr, allocRegion, desiredWordSize)
   }
+}
+
+class GCToNewGCAlloc extends Bundle with GCParameters with IMasterSlave {
+  val Valid = in Bool()
+  val Ready = out Bool()
+  val Done = out Bool()
+
+  val regionPtr = in UInt(GCElementWidth bits)
+
+  val newAllocRegion = out UInt(GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    in(Ready, Done, newAllocRegion)
+    out(Valid, regionPtr)
+  }
+}
+
+class GCToAllocFreeRegion extends Bundle with GCParameters with IMasterSlave{
+  val Valid = in Bool()
+  val Ready = out Bool()
+  val Done = out Bool()
+
+  val heapRegionType = in UInt(8 bits)
+  val regionNodeIndex = in UInt(32 bits)
+
+  val newAllocRegion = out UInt(GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    in(Ready, Done, newAllocRegion)
+    out(Valid, heapRegionType, regionNodeIndex)
+  }
+
 }
 
 class GCToTrace extends Bundle with GCParameters with IMasterSlave{
@@ -345,6 +383,26 @@ class GCAttemptAllocConfigIO extends Bundle with GCParameters with IMasterSlave{
 
   override def asMaster(): Unit = {
     out(G1h, DummyRegion)
+    in()
+  }
+}
+
+class GCNewGCAllocConfigIO extends Bundle with GCParameters with IMasterSlave{
+  val G1h = in UInt(GCElementWidth bits)
+  val DummyRegion = in UInt(GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    out(G1h, DummyRegion)
+    in()
+  }
+}
+
+class GCAllocFreeRegionConfigIO extends Bundle with GCParameters with IMasterSlave{
+  val G1h = in UInt(GCElementWidth bits)
+  val NumaPtr = in UInt(GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    out(G1h, NumaPtr)
     in()
   }
 }
