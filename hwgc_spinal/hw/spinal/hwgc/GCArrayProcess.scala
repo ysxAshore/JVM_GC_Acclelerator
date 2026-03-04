@@ -19,138 +19,108 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
   io.Mreq.Request.payload.clearAll()
   io.Mreq.Response.ready := False
 
-  io.Fetch2Process.Ready := False
-  io.Fetch2Process.Done := False
-
-  io.Process2Trace.Valid := False
-  io.Process2Trace.Kid := U(0)
-  io.Process2Trace.OopType := U(0)
-  io.Process2Trace.KlassPtr := U(0)
-  io.Process2Trace.SrcOopPtr := U(0)
-  io.Process2Trace.DestOopPtr := U(0)
-  io.Process2Trace.ScanningInYoung := False
-  io.Process2Trace.StepIndex := U(0)
-  io.Process2Trace.StepNCreate := U(0)
-  io.Process2Trace.ArrayLength := U(0)
-  io.Process2Trace.PartialArrayStart := U(0)
+  io.Fetch2Process.clearOut()
+  io.Process2Trace.clearIn()
 
   object overall_state extends SpinalEnum {
     val s_idle, s_readSrcLen, s_readDestLen, s_readHeapRegionPtr, s_readHeapRegionType, s_doTrace, s_waitDone = newElement()
   }
 
   val state = RegInit(overall_state.s_idle)
+  val issued = RegInit(False)
 
   val oopType = RegInit(U(0, GCOopTypeWidth bits))
   val srcOopPtr = RegInit(U(0, GCElementWidth bits))
   val destOopPtr = RegInit(U(0, GCElementWidth bits))
   val markWord = RegInit(U(0, GCElementWidth bits))
 
-  when(state === overall_state.s_idle){
-    io.Fetch2Process.Ready := True
-    when(io.Fetch2Process.Valid && io.Fetch2Process.Ready){
-      oopType := io.Fetch2Process.OopType
-      srcOopPtr := io.Fetch2Process.SrcOopPtr
-      markWord := io.Fetch2Process.MarkWord
-      destOopPtr := io.Fetch2Process.MarkWord & ~U(x"3", GCElementWidth bits)
-
-      state := overall_state.s_readSrcLen
-
-      if(DebugEnable){
-        report(Seq(
-          "[GCArrayProcess<", io.DebugTimeStamp,
-          ">]Receive task from Fetch Module",
-          ", the srcOopPtr is ", io.Fetch2Process.SrcOopPtr,
-          ", the markWord is ", io.Fetch2Process.MarkWord,
-          ", the destOopPtr is ", io.Fetch2Process.MarkWord & ~U"x3".resize(GCElementWidth bits),
-          "\n"
-        ))
-      }
-    }
-  }
-
-  val srcLength = RegInit(U(0, 32 bits))
-  val reqIssued = RegInit(False)
-  when(state === overall_state.s_readSrcLen){
-    val addr = (srcOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(12), U(16))).resize(MMUAddrWidth bits)
-    issueReq(io.Mreq, addr, False, U(0), U(0), reqIssued) { rd =>
-      srcLength := rd(31 downto 0)
-      state := overall_state.s_readDestLen
-    }
-  }
-
-  val stepIndex = RegInit(U(0, 32 bits))
-  val destLength = RegInit(U(0, 32 bits))
-  val stepNCreate = RegInit(U(0, 32 bits))
-  val destLenWriteDone = RegInit(False)
-  when(state === overall_state.s_readDestLen){
-    val addr = (destOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(12), U(16))).resize(MMUAddrWidth bits)
-    issueReq(io.Mreq, addr, False, U(0), U(0), reqIssued) { rd =>
-      destLength := rd(31 downto 0)
-      val task_num = (rd(31 downto 0) / io.ConfigIO.ChunkSize).resize(32 bits)
-      val remaining_tasks = ((srcLength - rd(31 downto 0)) / io.ConfigIO.ChunkSize).resize(32 bits)
-      val max_pending = ((io.ConfigIO.StepperOffset(63 downto 32) - U(1)) * task_num + U(1)).resize(32 bits)
-      val pending = max_pending.min(remaining_tasks).min(io.ConfigIO.StepperOffset(31 downto 0))
-      stepNCreate := io.ConfigIO.StepperOffset(63 downto 32).min(remaining_tasks.min(io.ConfigIO.StepperOffset(31 downto 0) + U(1)) - pending).resize(32 bits)
-      stepIndex := destLength + io.ConfigIO.ChunkSize
-      destLenWriteDone := False
-      state := overall_state.s_readHeapRegionPtr
-    }
-  }
-
+  val src_length = RegInit(U(0, 32 bits))
   val heap_region = RegInit(U(0, GCElementWidth bits))
-  when(state === overall_state.s_readHeapRegionPtr){
-    val addr = (io.ConfigIO.HeapRegionBiasedBase + (destOopPtr >> io.ConfigIO.HeapRegionShiftBy) * U(8)).resize(MMUAddrWidth bits)
-    issueReq(io.Mreq, addr, False, U(0), U(0), reqIssued){ rd =>
-      heap_region := rd(GCElementWidth - 1 downto 0)
-      state := overall_state.s_readHeapRegionType
-    }
-  }
-
   val scanning_in_young = RegInit(False)
-  when(state === overall_state.s_readHeapRegionType){
-    val addr = (heap_region + U"xbc").resize(MMUAddrWidth bits)
-    issueReq(io.Mreq, addr, False, U(0), U(0), reqIssued){ rd =>
-      scanning_in_young := (rd(31 downto 0) & U(2, 32 bits)) =/= U(0)
-      state := overall_state.s_doTrace
-    }
-  }
+  val step_index = RegInit(U(0, 32 bits))
+  val dest_length = RegInit(U(0, 32 bits))
+  val step_ncreate = RegInit(U(0, 32 bits))
 
-  when(state === overall_state.s_doTrace){
-    io.Process2Trace.Valid := True
-    io.Process2Trace.OopType := oopType
-    io.Process2Trace.SrcOopPtr := srcOopPtr
-    io.Process2Trace.DestOopPtr := destOopPtr
-    io.Process2Trace.ScanningInYoung := scanning_in_young
-    io.Process2Trace.StepIndex := stepIndex
-    io.Process2Trace.StepNCreate := stepNCreate
-    io.Process2Trace.ArrayLength := destLength + io.ConfigIO.ChunkSize
-    io.Process2Trace.PartialArrayStart := destLength
+  def dbg(msg: Seq[Any]): Unit =
+    if (DebugEnable) report(Seq("[GCArrayProcess<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
 
-    when(io.Process2Trace.Valid && io.Process2Trace.Ready){
-      state := overall_state.s_waitDone
+  switch(state){
+    is(overall_state.s_idle){
+      io.Fetch2Process.Ready := True
+      when(io.Fetch2Process.Valid && io.Fetch2Process.Ready){
+        oopType := io.Fetch2Process.OopType
+        srcOopPtr := io.Fetch2Process.SrcOopPtr
+        markWord := io.Fetch2Process.MarkWord
+        destOopPtr := io.Fetch2Process.MarkWord & ~U(3, GCElementWidth bits)
 
-      if(DebugEnable){
-        report(Seq(
-          "[GCArrayProcess<", io.DebugTimeStamp,
-          ">]This task has sent to Trace Module",
-          "\n"
-        ))
+        state := overall_state.s_readSrcLen
+
+        dbg(Seq("Receive task from Fetch Module, the srcOopPtr is ", io.Fetch2Process.SrcOopPtr, ", the markWord is ", io.Fetch2Process.MarkWord))
       }
     }
-  }
 
-  when(state === overall_state.s_waitDone){
-    when(io.Process2Trace.Done){
-      io.Fetch2Process.Done := True
+    is(overall_state.s_readSrcLen){
+      val addr = srcOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(12), U(16))
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        src_length := rd(31 downto 0)
+        state := overall_state.s_readDestLen
+      }
+    }
 
-      state := overall_state.s_idle
+    is(overall_state.s_readDestLen){
+      val addr = destOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(12), U(16))
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        dest_length := rd(31 downto 0)
+        state := overall_state.s_readHeapRegionPtr
+      }
+    }
 
-      if(DebugEnable){
-        report(Seq(
-          "[GCArrayProcess<", io.DebugTimeStamp,
-          ">]This task done",
-          "\n"
-        ))
+    is(overall_state.s_readHeapRegionPtr){
+      val task_num = (dest_length / io.ConfigIO.ChunkSize).resize(32)
+      val remaining_tasks = ((src_length - dest_length) / io.ConfigIO.ChunkSize).resize(32)
+      val max_pending = ((io.ConfigIO.StepperOffset(63 downto 32) - U(1)) * task_num + U(1)).resize(32)
+      val pending = max_pending.min(remaining_tasks).min(io.ConfigIO.StepperOffset(31 downto 0))
+      step_ncreate := io.ConfigIO.StepperOffset(63 downto 32).min(remaining_tasks.min(io.ConfigIO.StepperOffset(31 downto 0) + U(1)) - pending).resize(32)
+      step_index := dest_length + io.ConfigIO.ChunkSize
+
+      val addr = (io.ConfigIO.HeapRegionBiasedBase + (destOopPtr >> io.ConfigIO.HeapRegionShiftBy) * U(8)).resize(MMUAddrWidth)
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
+        heap_region := rd(GCElementWidth - 1 downto 0)
+        state := overall_state.s_readHeapRegionType
+      }
+    }
+
+    is(overall_state.s_readHeapRegionType){
+      val addr = heap_region + U"xbc"
+      issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
+        scanning_in_young := (rd(31 downto 0) & U(2, 32 bits)) =/= U(0)
+        state := overall_state.s_doTrace
+      }
+    }
+
+    is(overall_state.s_doTrace){
+      io.Process2Trace.Valid := True
+      io.Process2Trace.OopType := oopType
+      io.Process2Trace.SrcOopPtr := srcOopPtr
+      io.Process2Trace.DestOopPtr := destOopPtr
+      io.Process2Trace.ScanningInYoung := scanning_in_young
+      io.Process2Trace.StepIndex := step_index
+      io.Process2Trace.StepNCreate := step_ncreate
+      io.Process2Trace.ArrayLength := dest_length + io.ConfigIO.ChunkSize
+      io.Process2Trace.PartialArrayStart := dest_length
+
+      when(io.Process2Trace.Valid && io.Process2Trace.Ready){
+        state := overall_state.s_waitDone
+        dbg(Seq("This task has sent to Trace Module"))
+      }
+    }
+
+    is(overall_state.s_waitDone){
+      when(io.Process2Trace.Done){
+        io.Fetch2Process.Done := True
+        state := overall_state.s_idle
+
+        dbg(Seq("This task done"))
       }
     }
   }

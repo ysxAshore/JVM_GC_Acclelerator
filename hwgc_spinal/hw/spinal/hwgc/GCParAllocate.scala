@@ -15,16 +15,24 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
   io.Mreq.Request.payload.clearAll()
   io.Mreq.Response.ready := False
 
-  io.ToParAllocate.ActualPlabSize := U(0)
-  io.ToParAllocate.DestObjPtr := U(0)
-  io.ToParAllocate.Done := False
-  io.ToParAllocate.Ready := False
+  io.ToParAllocate.clearOut()
 
   object overall_state extends SpinalEnum {
-    val states = Array.tabulate(25)(i => newElement())
+    val states = Array.tabulate(11)(_ => newElement())
     for((state, i) <- states.zipWithIndex){
       state.setName(s"s$i")
     }
+  }
+
+  def dbg(msg: Seq[Any]): Unit =
+    if (DebugEnable) report(Seq("[GCParAllocate<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
+
+  def resetState(): Unit = {
+    io.ToParAllocate.Done := True
+    io.ToParAllocate.DestObjPtr := destObjPtr
+    io.ToParAllocate.ActualPlabSize := actualPlabSize
+    state := overall_state.states(0)
+    dbg(Seq("The task in par_allocate module has done"))
   }
 
   val state = RegInit(overall_state.states(0))
@@ -71,6 +79,7 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
         desiredWordSize := io.ToParAllocate.desiredWordSize
 
         state := overall_state.states(1)
+        dbg(Seq("The task enter the par_allocate module, excuteAll = ", excuteAll, "botUpdates = ", botUpdates, "allocRegion = ", allocRegion, "minWordSize = ", minWordSize, "desiredWordsize = ", desiredWordSize ))
       }
     }
 
@@ -90,8 +99,8 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
         actualPlabSize := want_to_allocate
         destObjPtr := alloc_top
         val addr = allocRegion + U"x10"
-        val writeValue = (alloc_top + want_to_allocate * U(8)).resize(GCElementWidth bits)
-        issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { rd =>
+        val writeValue = (alloc_top + want_to_allocate * U(8)).resize(GCElementWidth)
+        issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { _ =>
           state := overall_state.states(3)
         }
       }.otherwise{
@@ -102,10 +111,7 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(3)){
       when(!excuteAll){
-        io.ToParAllocate.Done := True
-        io.ToParAllocate.DestObjPtr := destObjPtr
-        io.ToParAllocate.ActualPlabSize := actualPlabSize
-        state := overall_state.states(0)
+        resetState()
       }.otherwise{
         state := overall_state.states(4)
       }
@@ -114,21 +120,17 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
     is(overall_state.states(4)){
       when(destObjPtr =/= U(0) && botUpdates){
         blk_start := destObjPtr
-        blk_end := (destObjPtr + actualPlabSize * U(8)).resize(GCElementWidth bits)
+        blk_end := (destObjPtr + actualPlabSize * U(8)).resize(GCElementWidth)
         val addr = allocRegion + U"x20"
         issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
           bot_part_ptr := addr
           next_offset_threshold := rd(GCElementWidth - 1 downto 0)
           index := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
           bot_ptr := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
-
           state := overall_state.states(5)
         }
       }.otherwise{
-        io.ToParAllocate.Done := True
-        io.ToParAllocate.DestObjPtr := destObjPtr
-        io.ToParAllocate.ActualPlabSize := actualPlabSize
-        state := overall_state.states(0)
+        resetState()
       }
     }
 
@@ -140,27 +142,24 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
           state := overall_state.states(6)
         }
       }.otherwise{
-        io.ToParAllocate.Done := True
-        io.ToParAllocate.DestObjPtr := destObjPtr
-        io.ToParAllocate.ActualPlabSize := actualPlabSize
-        state := overall_state.states(0)
+        resetState()
       }
     }
 
     is(overall_state.states(6)){
-      val addr = (array + index).resize(MMUAddrWidth bits)
-      val writeValue = ((next_offset_threshold - blk_start) / U(8)).resize(8 bits)
-      issueReq(io.Mreq, addr, True, getWstrb(1), writeValue, issued) { rd =>
+      val addr = array + index
+      val writeValue = ((next_offset_threshold - blk_start) / U(8)).resize(8)
+      issueReq(io.Mreq, addr, True, getWstrb(1), writeValue, issued) { _ =>
         state := overall_state.states(7)
       }
     }
 
     is(overall_state.states(7)){
-      val end_index = ((blk_end - U(8) - reserved_start) >> U(9)).resize(GCElementWidth bits)
-      val rem_st = (reserved_start + ((index + U(1)) << U(6)) * U(8)).resize(GCElementWidth bits)
-      val rem_end = (reserved_start + ((end_index << U(6)) + U(64)) * U(8)).resize(GCElementWidth bits)
-      start_card := ((rem_st - reserved_start) >> U(9)).resize(GCElementWidth bits)
-      end_card := ((rem_end - U(8) - reserved_start) >> U(9)).resize(GCElementWidth bits)
+      val end_index = ((blk_end - U(8) - reserved_start) >> U(9)).resize(GCElementWidth)
+      val rem_st = (reserved_start + ((index + U(1)) << U(6)) * U(8)).resize(GCElementWidth)
+      val rem_end = (reserved_start + ((end_index << U(6)) + U(64)) * U(8)).resize(GCElementWidth)
+      start_card := ((rem_st - reserved_start) >> U(9)).resize(GCElementWidth)
+      end_card := ((rem_end - U(8) - reserved_start) >> U(9)).resize(GCElementWidth)
       offset0 := rem_end
       offset8 := end_index + U(1)
       when(index + U(1) <= end_index && rem_st < rem_end && start_card <= end_card){
@@ -169,20 +168,20 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
         iterator := U(0)
         state := overall_state.states(8)
       }.otherwise{
-        state := overall_state.states(11)
+        state := overall_state.states(10)
       }
     }
 
     is(overall_state.states(8)){
       when(iterator < U(14)){
-        reach := (start_card - U(1) + ((U(1) << (U(4) * (iterator + U(1)))) - U(1))).resize(GCElementWidth bits)
+        reach := (start_card - U(1) + ((U(1) << (U(4) * (iterator + U(1)))) - U(1))).resize(GCElementWidth)
         ct_offset := U(64, 8 bits) + iterator
         num_cards := Mux(reach >= end_card, end_card, reach) - start_card_for_region + U(1)
         begin := array + start_card_for_region
         iterator := iterator + U(1)
         state := overall_state.states(9)
       }.otherwise{
-        state := overall_state.states(11)
+        state := overall_state.states(10)
       }
     }
 
@@ -191,8 +190,8 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
         val addr = begin
         val busBytes = U(MMUDataWidth / 8)
         val writeBytes = Mux(num_cards >= busBytes, busBytes, num_cards).resize(5 bits)
-        val writeValue = Vec.fill(32)(ct_offset).asBits & ((U(1, MMUDataWidth bits) << (writeBytes << 3)) - 1).resize(MMUDataWidth bits).asBits
-        issueReq(io.Mreq, addr, True, getWstrb(writeBytes.resize(32 bits)), writeValue.asUInt, issued) { rd =>
+        val writeValue = Vec.fill(32)(ct_offset).asBits.asUInt
+        issueReq(io.Mreq, addr, True, getWstrb(writeBytes.resize(32 bits)), writeValue, issued) { _ =>
           begin := begin + writeBytes
           num_cards := num_cards - writeBytes
           state := overall_state.states(9)
@@ -209,11 +208,8 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(10)){
       val writeValue = Cat(offset8, offset0).asUInt
-      issueReq(io.Mreq, bot_part_ptr, True, getWstrb(U(16)), writeValue, issued) { rd =>
-        io.ToParAllocate.Done := True
-        io.ToParAllocate.DestObjPtr := destObjPtr
-        io.ToParAllocate.ActualPlabSize := actualPlabSize
-        state := overall_state.states(0)
+      issueReq(io.Mreq, bot_part_ptr, True, getWstrb(U(16)), writeValue, issued) { _ =>
+        resetState()
       }
     }
   }

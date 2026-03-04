@@ -18,16 +18,11 @@ class GCNewGCAlloc extends Module with GCParameters with HWParameters {
   io.Mreq.Request.payload.clearAll()
   io.Mreq.Response.ready := False
 
-  io.ToNewGCAlloc.Done := False
-  io.ToNewGCAlloc.Ready := False
-  io.ToNewGCAlloc.newAllocRegion := U(0)
-
-  io.ToAllocFreeRegion.Valid := False
-  io.ToAllocFreeRegion.regionNodeIndex := U(0)
-  io.ToAllocFreeRegion.heapRegionType := U(0)
+  io.ToNewGCAlloc.clearOut()
+  io.ToAllocFreeRegion.clearIn()
 
   object overall_state extends SpinalEnum {
-    val states = Array.tabulate(25)(i => newElement())
+    val states = Array.tabulate(18)(_ => newElement())
     for((state, i) <- states.zipWithIndex){
       state.setName(s"s$i")
     }
@@ -65,7 +60,7 @@ class GCNewGCAlloc extends Module with GCParameters with HWParameters {
       val addr = regionPtr + U"x30"
       issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
         region_node_index := rd(31 downto 0)
-        heap_region_type := Mux(rd(95 downto 64) === U(1), U(10), U(3)).resized
+        heap_region_type := Mux(rd(135 downto 128) === U(1), U(10), U(3)).resized
         state := overall_state.states(2)
       }
     }
@@ -111,7 +106,7 @@ class GCNewGCAlloc extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.states(7)){
-      when(newAllocRegion === U(0) && (expand_failure * U(x"ff", 8 bits)) =/= U(0)){
+      when(newAllocRegion === U(0) && expand_failure  =/= U(0)){
         // @todo send interrupt
       }.otherwise{
         state := overall_state.states(9)
@@ -125,7 +120,7 @@ class GCNewGCAlloc extends Module with GCParameters with HWParameters {
     is(overall_state.states(9)){
       when(newAllocRegion =/= U(0)){
         val addr = newAllocRegion + U"xbc"
-        issueReq(io.Mreq, addr, True, getWstrb(4), heap_region_type, issued) { rd =>
+        issueReq(io.Mreq, addr, True, getWstrb(4), heap_region_type, issued) { _ =>
           state := overall_state.states(10)
         }
       }.otherwise{
@@ -144,7 +139,7 @@ class GCNewGCAlloc extends Module with GCParameters with HWParameters {
           state := overall_state.states(11)
         }
       }.otherwise{
-        state := overall_state.states(11)
+        state := overall_state.states(14)
       }
     }
 
@@ -161,15 +156,15 @@ class GCNewGCAlloc extends Module with GCParameters with HWParameters {
       // @todo wait interrupt
       when(!callGrowIRQ){
         val writeValue = array_len + U(1)
-        issueReq(io.Mreq, grow_array_ptr, True, getWstrb(4), writeValue, issued){ rd =>
+        issueReq(io.Mreq, grow_array_ptr, True, getWstrb(4), writeValue, issued){ _ =>
           state := overall_state.states(13)
         }
       }
     }
 
     is(overall_state.states(13)){
-      val addr = (data_ptr + array_len * U(8)).resize(MMUAddrWidth bits)
-      issueReq(io.Mreq, addr, True, getWstrb(8), newAllocRegion, issued){ rd =>
+      val addr = (data_ptr + array_len * U(8)).resize(MMUAddrWidth)
+      issueReq(io.Mreq, addr, True, getWstrb(8), newAllocRegion, issued){ _ =>
         state := overall_state.states(14)
       }
     }
@@ -185,11 +180,11 @@ class GCNewGCAlloc extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.states(15)){
-      val tempValue = Mux((array_len & U(2)) =/= U(0), U(2),
+      val temp_value = Mux((array_len & U(2)) =/= U(0), U(2),
         Mux((array_len & U(10)) =/= U(0), U(0), U(1)))
-      when(tempValue =/= U(1)){
+      when(temp_value =/= U(1)){
         val addr = count_per_node + U"xf0"
-        issueReq(io.Mreq, addr, True, getWstrb(4), tempValue, issued) { rd =>
+        issueReq(io.Mreq, addr, True, getWstrb(4), temp_value, issued) { _ =>
           state := overall_state.states(16)
         }
       }.otherwise{
@@ -199,15 +194,15 @@ class GCNewGCAlloc extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(16)){
       val addr = io.ConfigIO.G1h + U"x590"
-      issueReq(io.Mreq, addr, True, getWstrb(8), count_per_node, issued) { rd =>
+      issueReq(io.Mreq, addr, True, getWstrb(8), count_per_node, issued) { _ =>
         state := overall_state.states(17)
       }
     }
 
     is(overall_state.states(17)){
       val needs_remset_update = (array_len & U(10)) === U(0)
-      val addr = (count_per_node + array_max * U(2)).resize(MMUAddrWidth bits)
-      issueReq(io.Mreq, addr, True, getWstrb(1), needs_remset_update.asUInt, issued) { rd =>
+      val addr = (count_per_node + array_max * U(2)).resize(MMUAddrWidth)
+      issueReq(io.Mreq, addr, True, getWstrb(1), needs_remset_update.asUInt, issued) { _ =>
         io.ToNewGCAlloc.Done := True
         io.ToNewGCAlloc.newAllocRegion := newAllocRegion
         state := overall_state.states(0)

@@ -7,7 +7,7 @@ import scala.language.postfixOps
 
 class GCCopy extends Module with HWParameters with GCParameters {
   val io = new Bundle{
-    val fromProcess = slave(new GCToCopy)
+    val ToCopy = slave(new GCToCopy)
     val readMReq = master(new LocalMMUIO)
     val writeMReq = master(new LocalMMUIO)
   }
@@ -32,30 +32,30 @@ class GCCopy extends Module with HWParameters with GCParameters {
   // 需要使用Vec来支持动态索引
   val copyDataQueue = Vec.fill(GCCopyEntry)(RegInit(U(0, MMUDataWidth bits)))
 
-  io.fromProcess.Ready := !task_valid
-  io.fromProcess.Done := task_valid && writeResRemainSize === U(0) && queue_empty
+  io.ToCopy.Ready := !task_valid
+  io.ToCopy.Done := task_valid && writeResRemainSize === U(0)
 
-  when(io.fromProcess.Valid && io.fromProcess.Ready){
+  when(io.ToCopy.Valid && io.ToCopy.Ready){
     task_valid := True
-    srcOopPtr := io.fromProcess.SrcOopPtr
-    destOopPtr := io.fromProcess.DestOopPtr
+    srcOopPtr := io.ToCopy.SrcOopPtr
+    destOopPtr := io.ToCopy.DestOopPtr
 
-    totalSize := io.fromProcess.Size
+    totalSize := io.ToCopy.Size
 
-    readRemainSize := io.fromProcess.Size
-    writeReqRemainSize := io.fromProcess.Size
-    writeResRemainSize := io.fromProcess.Size
+    readRemainSize := io.ToCopy.Size
+    writeReqRemainSize := io.ToCopy.Size
+    writeResRemainSize := io.ToCopy.Size
 
     head := U(0)
     tail := U(0)
-  }.elsewhen(io.fromProcess.Done){
+  }.elsewhen(io.ToCopy.Done){
     task_valid := False
   }
 
 
   val currentReadOffset = totalSize - readRemainSize
   io.readMReq.Request.valid := task_valid && readRemainSize > 0 && !queue_full
-  io.readMReq.Request.payload.RequestVirtualAddr := (srcOopPtr + currentReadOffset * U(GCObjectPtr_Size)).resize(MMUAddrWidth bits)
+  io.readMReq.Request.payload.RequestVirtualAddr := (srcOopPtr + currentReadOffset * U(GCObjectPtr_Size)).resize(MMUAddrWidth)
   io.readMReq.Request.payload.RequestSourceID := io.readMReq.ConherentRequsetSourceID.payload
   io.readMReq.Request.payload.RequestType_isWrite := False
   io.readMReq.Request.payload.RequestWStrb := U(0)
@@ -75,8 +75,8 @@ class GCCopy extends Module with HWParameters with GCParameters {
   val isLastWriteBeat = writeReqRemainSize <= BeatSize
   val thisBeatWriteLen = Mux(isLastWriteBeat, writeReqRemainSize, BeatSize) * U(8)
 
-  io.writeMReq.Request.valid := task_valid && (writeReqRemainSize > U(0)) && !queue_empty
-  io.writeMReq.Request.payload.RequestVirtualAddr := (destOopPtr + currentWriteOffset * U(GCObjectPtr_Size)).resize(MMUAddrWidth bits)
+  io.writeMReq.Request.valid := task_valid && writeReqRemainSize > U(0) && !queue_empty
+  io.writeMReq.Request.payload.RequestVirtualAddr := (destOopPtr + currentWriteOffset * U(GCObjectPtr_Size)).resize(MMUAddrWidth)
   io.writeMReq.Request.payload.RequestSourceID := io.writeMReq.ConherentRequsetSourceID.payload
   io.writeMReq.Request.payload.RequestType_isWrite := True
   io.writeMReq.Request.payload.RequestWStrb := getWstrb(thisBeatWriteLen)

@@ -8,23 +8,31 @@ import scala.language.postfixOps
 class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
   val io = new Bundle{
     val Mreq = master(new LocalMMUIO)
-    val ToAllocFreeRegion = slave(new GCToAllocFreeRegion)
     val ConfigIO = slave(new GCAllocFreeRegionConfigIO)
+    val ToAllocFreeRegion = slave(new GCToAllocFreeRegion)
     val DebugTimeStamp = in UInt(64 bits)
   }
+
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
   io.Mreq.Response.ready := False
 
-  io.ToAllocFreeRegion.Done := False
-  io.ToAllocFreeRegion.Ready := False
-  io.ToAllocFreeRegion.newAllocRegion := U(0)
+  io.ToAllocFreeRegion.clearOut()
 
   object overall_state extends SpinalEnum {
-    val states = Array.tabulate(25)(i => newElement())
+    val states = Array.tabulate(19)(_ => newElement())
     for((state, i) <- states.zipWithIndex){
       state.setName(s"s$i")
     }
+  }
+
+  def dbg(msg: Seq[Any]): Unit =
+    if (DebugEnable) report(Seq("[GCAllocFreeRegion<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
+
+  def resetState(): Unit = {
+    io.ToAllocFreeRegion.Done := True
+    io.ToAllocFreeRegion.newAllocRegion := newAllocRegion
+    state := overall_state.states(0)
   }
 
   val state = RegInit(overall_state.states(0))
@@ -72,7 +80,7 @@ class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
       newAllocRegion := U(0)
       free_list_ptr := io.ConfigIO.G1h + U"x130" + U"xb0"
       from_head := (heapRegionType & U(2, 8 bits)) === U(0)
-      when(regionNodeIndex =/= UINT_MAX && active_node_ids > U(1)){
+      when(regionNodeIndex =/= UINT_MAX - U(1) && active_node_ids > U(1)){
         state := overall_state.states(3)
       }.otherwise{
         state := overall_state.states(12)
@@ -81,7 +89,7 @@ class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(3)){
       cur_depth := U(0)
-      max_depth := (U(3) * Max(page_size / region_size, U(1)) * active_node_ids).resize(32 bits)
+      max_depth := (U(3) * Max(page_size / region_size, U(1)) * active_node_ids).resize(32)
       val addr = free_list_ptr + Mux(from_head, U"x28", U"x30")
       issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
         cur := rd(GCElementWidth - 1 downto 0)
@@ -130,22 +138,22 @@ class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.states(7)){
-      var addr = Mux(prev === U(0), free_list_ptr + U"x28", prev + U"xd0")
-      issueReq(io.Mreq, addr, True, getWstrb(8), next, issued) { rd =>
+      val addr = Mux(prev === U(0), free_list_ptr + U"x28", prev + U"xd0")
+      issueReq(io.Mreq, addr, True, getWstrb(8), next, issued) { _ =>
         state := overall_state.states(8)
       }
     }
 
     is(overall_state.states(8)){
-      var addr = Mux(prev === U(0), free_list_ptr + U"x30", prev + U"xd8")
-      issueReq(io.Mreq, addr, True, getWstrb(8), prev, issued) { rd =>
+      val addr = Mux(next === U(0), free_list_ptr + U"x30", prev + U"xd8")
+      issueReq(io.Mreq, addr, True, getWstrb(8), prev, issued) { _ =>
         state := overall_state.states(9)
       }
     }
 
     is(overall_state.states(9)){
       val addr = newAllocRegion + U"xd0"
-      issueReq(io.Mreq, addr, True, getWstrb(16), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, True, getWstrb(16), U(0), issued) { _ =>
         state := overall_state.states(10)
       }
     }
@@ -162,6 +170,7 @@ class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
       when(newAllocRegion === U(0)){
         when(active_node_ids === U(0)){
           newAllocRegion := U(0)
+          state := overall_state.states(16)
         }.otherwise{
           val addr = free_list_ptr + Mux(from_head, U"x28", U"x30")
           issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
@@ -184,7 +193,7 @@ class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(13)){
       val addr = free_list_ptr + Mux(from_head, U"x28", U"x30")
-      issueReq(io.Mreq, addr, True, getWstrb(8), temp_value, issued) { rd =>
+      issueReq(io.Mreq, addr, True, getWstrb(8), temp_value, issued) { _ =>
         state := overall_state.states(14)
       }
     }
@@ -193,23 +202,21 @@ class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
       val addr_head = Mux(temp_value === U(0), free_list_ptr + U"x30", temp_value + U"xd8")
       val addr_tail = Mux(temp_value === U(0), free_list_ptr + U"x28", temp_value + U"xd0")
       val addr = Mux(from_head, addr_head, addr_tail)
-      issueReq(io.Mreq, addr, True, getWstrb(8), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, True, getWstrb(8), U(0), issued) { _ =>
         state := overall_state.states(15)
       }
     }
 
     is(overall_state.states(15)){
       val addr = newAllocRegion + Mux(from_head, U"xd0", U"xd8")
-      issueReq(io.Mreq, addr, True, getWstrb(8), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, True, getWstrb(8), U(0), issued) { _ =>
         state := overall_state.states(16)
       }
     }
 
     is(overall_state.states(16)){
       when(newAllocRegion === U(0)){
-        io.ToAllocFreeRegion.Done := True
-        io.ToAllocFreeRegion.newAllocRegion := U(0)
-        state := overall_state.states(0)
+        resetState()
       }.otherwise{
         val addr = free_list_ptr + U"x38"
         issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
@@ -222,7 +229,7 @@ class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
     is(overall_state.states(17)){
       when(temp_value === newAllocRegion){
         val addr = free_list_ptr + U"x38"
-        issueReq(io.Mreq, addr, True, getWstrb(8), U(0), issued) { rd =>
+        issueReq(io.Mreq, addr, True, getWstrb(8), U(0), issued) { _ =>
           state := overall_state.states(18)
         }
       }.otherwise{
@@ -233,10 +240,8 @@ class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
     is(overall_state.states(18)){
       val addr = free_list_ptr + U"x10"
       val wrireValue = active_node_ids - U(1)
-      issueReq(io.Mreq, addr, True, getWstrb(4), wrireValue, issued) { rd =>
-        io.ToAllocFreeRegion.Done := True
-        io.ToAllocFreeRegion.newAllocRegion := U(0)
-        state := overall_state.states(0)
+      issueReq(io.Mreq, addr, True, getWstrb(4), wrireValue, issued) { _ =>
+        resetState()
       }
     }
   }

@@ -24,8 +24,6 @@ trait GCParameters {
   val GCTaskStack_SpillNeed = 63
   val GCTaskStack_ReadNeed = 8
 
-  val GCoopWorkStages = 7
-  val GCaopWorkStages = 9
   val GCCopyEntry = 64
 
   /* ----------------- ScannerTask Tag ----------------- */
@@ -138,10 +136,25 @@ class GCFetch2ProcessUnit extends Bundle with GCParameters with IMasterSlave {
   val OopType = in UInt(GCOopTypeWidth bits)
   val SrcOopPtr = in UInt(GCElementWidth bits)
   val MarkWord = in UInt(GCElementWidth bits)
+  val KlassPtr = in UInt(GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done)
-    out(Valid, Task, OopType, SrcOopPtr, MarkWord)
+    out(Valid, Task, OopType, SrcOopPtr, MarkWord, KlassPtr)
+  }
+
+  def clearIn(): Unit = {
+    Valid := False
+    Task := U(0)
+    OopType := U(0)
+    SrcOopPtr := U(0)
+    MarkWord := U(0)
+    KlassPtr := U(0)
+  }
+
+  def clearOut(): Unit = {
+    Done := False
+    Ready := False
   }
 }
 
@@ -153,12 +166,27 @@ class GCProcess2Survivor extends Bundle with GCParameters with IMasterSlave {
   val DestOopPtr = out UInt(GCElementWidth bits)
 
   val MarkWord = in UInt(GCElementWidth bits)
+  val KlassPtr = in UInt(GCElementWidth bits)
   val SrcOopPtr = in UInt(GCElementWidth bits)
   val RegionAttrPtr = in UInt(GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done, DestOopPtr)
-    out(Valid, SrcOopPtr, MarkWord, RegionAttrPtr)
+    out(Valid, SrcOopPtr, MarkWord, KlassPtr, RegionAttrPtr)
+  }
+
+  def clearIn(): Unit = {
+    Valid := False
+    MarkWord := U(0)
+    KlassPtr := U(0)
+    SrcOopPtr := U(0)
+    RegionAttrPtr := U(0)
+  }
+
+  def clearOut(): Unit = {
+    Ready := False
+    Done := False
+    DestOopPtr := U(0)
   }
 }
 
@@ -174,6 +202,18 @@ class GCToAllocate extends Bundle with GCParameters with IMasterSlave{
   override def asMaster(): Unit = {
     in(Ready, Done, DestObjPtr)
     out(Valid, Size, DestAttrType)
+  }
+
+  def clearIn(): Unit = {
+    Valid := False
+    Size := U(0)
+    DestAttrType := U(0)
+  }
+
+  def clearOut(): Unit = {
+    Ready := False
+    Done := False
+    DestObjPtr := U(0)
   }
 }
 
@@ -195,6 +235,22 @@ class GCToParAllocate extends Bundle with GCParameters with IMasterSlave{
     in(Ready, Done, DestObjPtr, ActualPlabSize)
     out(Valid, excuteAll, botUpdates, allocRegion, minWordSize, desiredWordSize)
   }
+
+  def clearIn(): Unit = {
+    Valid := False
+    excuteAll := False
+    botUpdates := False
+    allocRegion := U(0)
+    minWordSize := U(0)
+    desiredWordSize := U(0)
+  }
+
+  def clearOut(): Unit = {
+    Ready := False
+    Done := False
+    DestObjPtr := U(0)
+    ActualPlabSize := U(0)
+  }
 }
 
 class GCToAttemptAllocate extends Bundle with GCParameters with IMasterSlave {
@@ -213,6 +269,20 @@ class GCToAttemptAllocate extends Bundle with GCParameters with IMasterSlave {
     in(Ready, Done, DestObjPtr, ActualPlabSize)
     out(Valid, regionPtr, allocRegion, desiredWordSize)
   }
+
+  def clearIn(): Unit = {
+    Valid := False
+    regionPtr := U(0)
+    allocRegion := U(0)
+    desiredWordSize := U(0)
+  }
+
+  def clearOut(): Unit = {
+    Ready := False
+    Done := False
+    DestObjPtr := U(0)
+    ActualPlabSize := U(0)
+  }
 }
 
 class GCToNewGCAlloc extends Bundle with GCParameters with IMasterSlave {
@@ -228,9 +298,20 @@ class GCToNewGCAlloc extends Bundle with GCParameters with IMasterSlave {
     in(Ready, Done, newAllocRegion)
     out(Valid, regionPtr)
   }
+
+  def clearIn(): Unit = {
+    Valid := False
+    regionPtr := U(0)
+  }
+
+  def clearOut(): Unit = {
+    Ready := False
+    Done := False
+    newAllocRegion := U(0)
+  }
 }
 
-class GCToAllocFreeRegion extends Bundle with GCParameters with IMasterSlave{
+class GCToAllocFreeRegion extends Bundle with GCParameters with IMasterSlave {
   val Valid = in Bool()
   val Ready = out Bool()
   val Done = out Bool()
@@ -245,14 +326,25 @@ class GCToAllocFreeRegion extends Bundle with GCParameters with IMasterSlave{
     out(Valid, heapRegionType, regionNodeIndex)
   }
 
+  def clearIn(): Unit = {
+    Valid := False
+    heapRegionType := U(0)
+    regionNodeIndex := U(0)
+  }
+
+  def clearOut(): Unit = {
+    Ready := False
+    Done := False
+    newAllocRegion := U(0)
+  }
 }
 
-class GCToTrace extends Bundle with GCParameters with IMasterSlave{
+class GCToTrace extends Bundle with GCParameters with IMasterSlave {
   val Valid = in Bool()
   val Ready = out Bool()
   val Done = out Bool()
 
-  // some parse module caculate parameters
+  // some parse module calculate parameters
   val Kid = in UInt(32 bits)
   val OopType = in UInt(GCOopTypeWidth bits)
   val KlassPtr = in UInt(GCElementWidth bits)
@@ -269,15 +361,33 @@ class GCToTrace extends Bundle with GCParameters with IMasterSlave{
     out(Valid, OopType, KlassPtr, SrcOopPtr, DestOopPtr, Kid, ArrayLength, PartialArrayStart, StepIndex, StepNCreate, ScanningInYoung)
     in(Ready, Done)
   }
+
+  def clearIn(): Unit = {
+    Valid := False
+    Kid := U(0)
+    OopType := U(0)
+    KlassPtr := U(0)
+    SrcOopPtr := U(0)
+    DestOopPtr := U(0)
+    ScanningInYoung := False
+    StepIndex := U(0)
+    StepNCreate := U(0)
+    ArrayLength := U(0)
+    PartialArrayStart := U(0)
+  }
+
+  def clearOut(): Unit = {
+    Ready := False
+    Done := False
+  }
 }
 
-class GCToCopy extends Bundle with GCParameters with IMasterSlave{
+class GCToCopy extends Bundle with GCParameters with IMasterSlave {
   val Valid = in Bool()
   val Ready = out Bool()
-
   val Done = out Bool()
 
-  // some parse module caculate parameters
+  // some parse module calculate parameters
   val DestOopPtr = in UInt(GCElementWidth bits)
   val SrcOopPtr = in UInt(GCElementWidth bits)
   val Size = in UInt(32 bits)
@@ -285,6 +395,44 @@ class GCToCopy extends Bundle with GCParameters with IMasterSlave{
   override def asMaster(): Unit = {
     out(Valid, SrcOopPtr, DestOopPtr, Size)
     in(Ready, Done)
+  }
+
+  def clearIn(): Unit = {
+    Valid := False
+    SrcOopPtr := U(0)
+    DestOopPtr := U(0)
+    Size := U(0)
+  }
+
+  def clearOut(): Unit = {
+    Ready := False
+    Done := False
+  }
+}
+
+class GCToAopParameters extends Bundle with GCParameters with IMasterSlave{
+  val Valid = in Bool()
+  val Ready = out Bool()
+
+  val Done = out Bool()
+
+  val RegionAttr = in UInt(16 bits)
+  val Task = in UInt(GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    in(Ready, Done)
+    out(Valid, RegionAttr, Task)
+  }
+
+  def clearIn(): Unit = {
+    Valid := False
+    Task := U(0)
+    RegionAttr := U(0)
+  }
+
+  def clearOut(): Unit = {
+    Ready := False
+    Done := False
   }
 }
 
@@ -438,35 +586,6 @@ class GCAopConfigIO extends Bundle with GCParameters with IMasterSlave{
   }
 }
 
-class TraceMReq2MMU(oopWorkStage:Int) extends Bundle with IMasterSlave {
-  val commonMReq  = new LocalMMUIO
-  val oopWorkMReqs  = Vec.fill(oopWorkStage)(new LocalMMUIO)
-
-  override def asMaster(): Unit = {
-    master(commonMReq)
-    oopWorkMReqs.foreach(master(_))
-  }
-}
-
-case class GCAopPayload() extends Bundle with GCParameters{
-  val RegionAttr = UInt(16 bits)
-  val Task = UInt(GCElementWidth bits)
-}
-
-class ToAopParameters extends Bundle with GCParameters with IMasterSlave{
-  val Valid = in Bool()
-  val Ready = out Bool()
-
-  val Done = out Bool()
-
-  val RegionAttr = in UInt(16 bits)
-  val Task = in UInt(GCElementWidth bits)
-
-  override def asMaster(): Unit = {
-    in(Ready, Done)
-    out(Valid, RegionAttr, Task)
-  }
-}
 
 class LocalMMUIO extends Bundle with HWParameters with IMasterSlave{
   //发出的访存请求
@@ -523,15 +642,7 @@ object WrapDec {
 
 
 object LocalMMUTaskType {
-  //Aop 9
-  //ArrayProcess 1
-  //Copy 1write + 1read = 2
-  //Fetch 1
-  //OopCopy2Survivor 1 + 4special = 5
-  //OopProcess 1
-  //TaskStack 1
-  //Trace 7 + 1
-  val TaskTypeMax = 9 + 1 + 2 + 1 + 1 + 4 + 1 + 1 + 7 + 1
+  val TaskTypeMax = 12 + 2
   val TaskTypeBitWidth = log2Up(TaskTypeMax)
 }
 
