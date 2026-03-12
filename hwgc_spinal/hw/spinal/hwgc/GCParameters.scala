@@ -21,7 +21,7 @@ trait GCParameters {
   val GCElementWidth = 64
 
   val GCTaskStack_Entry = 64
-  val GCTaskStack_SpillNeed = 63
+  val GCTaskStack_SpillNeed = 56
   val GCTaskStack_ReadNeed = 8
 
   val GCCopyEntry = 64
@@ -41,38 +41,7 @@ trait GCParameters {
   val TypeArrayKlassID = 4
   val ObjectArrayKlassID = 5
 
-  // OopDesc
-  // --- Common Oop
-  val MarkWordOff = 0
-  val ElementOff = 16
-  // --- Array Oop
-  val ArrayLenOff = 16
-  val ArrayElementOff = 24
-  // --- Ref Oop
-  val REFERENT_OFFSET = 16
-  val DISCOVERED_OFFSET = 40
-  // --- mirror Oop
-  val OopSizeOff = 36
-  val staticOopFieldCountOff = 40
-
-  val LhKidOff = 8
-  val VTableLenOff = 160
-  val NonstaticOopMapSizeOff = 296
-  val ITableLenOff = 300
-  val REFERENCE_TYPE = 315
-  val VTableOff = 464
-  val StaticFieldOff = 184
-
-  val TypeOffSet = 1
-  val Type_Young = 0
-  val Type_Humongous = -2
-  val Type_NoInCset = -1
-
   val GCTaskQueue_Size = 1 << 17
-  val GCScannerTask_Size = 8
-  val GCObjectPtr_Size = 8
-  val LogHeapWordSize = log2Up(GCObjectPtr_Size)
-  val GCHeapRegionAttr_Size = 2
 
   val UINT_MAX = U(BigInt(2147483647L * 2 + 1), 32 bits)
 }
@@ -84,35 +53,35 @@ trait HWParameters {
   val MMUAddrWidth = 64
   val MMUDataWidth = 256
 
+  val LineBytesNum = MMUDataWidth / 8
+
   val LLCSourceMaxNum = 64
   val LLCSourceMaxNumBitSize = log2Up(LLCSourceMaxNum) + 1
 
   // helper: issueReq
-  def issueReq(port: LocalMMUIO, addr: UInt, Write: Bool, WriteStrb: UInt, WriteData: UInt, reqIssued: Bool)(onResp: UInt => Unit): Unit = {
+  def issueReq(port: LocalMMUIO, addr: UInt, Write: Bool, Size: UInt, WriteData: UInt, reqIssued: Bool)(onResp: UInt => Unit): Unit = {
 
     // ensure default safe values (caller may have already set globals; safe to reassign)
-    port.Request.valid := False
-    port.Response.ready := False
+    port.Request.valid := !reqIssued
+    port.Response.ready := reqIssued
 
-    // Issue request if not already issued
     when(!reqIssued) {
-      port.Request.valid := True
-      // payload fields (these must exist on your Request bundle)
+      port.RequestSize.valid := True
+      port.RequestSize.payload := Size.resize(8)
+
       port.Request.payload.RequestVirtualAddr := addr
       port.Request.payload.RequestSourceID := port.ConherentRequsetSourceID.payload
       port.Request.payload.RequestType_isWrite := Write
-      port.Request.payload.RequestWStrb := WriteStrb
+      port.Request.payload.RequestWStrb := getWstrb(Size.resize(6))
       port.Request.payload.RequestData := WriteData.resize(MMUDataWidth bits)
-      port.Response.ready := True
+    }
 
-      // mark as issued when downstream accepts the request
-      when(port.Request.fire) {
-        reqIssued := True
-      }
+    when(port.Request.fire) {
+      reqIssued := True
     }
 
     // handle response (when previously issued)
-    when(reqIssued && port.Response.fire) {
+    when(port.Response.fire) {
       val rd = port.Response.payload.ResponseData
       reqIssued := False
       onResp(rd) // callback to let caller handle response data
@@ -126,7 +95,7 @@ trait HWParameters {
   }
 }
 
-class GCFetch2ProcessUnit extends Bundle with GCParameters with IMasterSlave {
+class GCToProcessUnit extends Bundle with GCParameters with IMasterSlave {
   val Valid = in Bool()
   val Ready = out Bool()
 
@@ -158,7 +127,7 @@ class GCFetch2ProcessUnit extends Bundle with GCParameters with IMasterSlave {
   }
 }
 
-class GCProcess2Survivor extends Bundle with GCParameters with IMasterSlave {
+class GCToSurvivor extends Bundle with GCParameters with IMasterSlave {
   val Valid = in Bool()
   val Ready = out Bool()
 
@@ -386,6 +355,7 @@ class GCToCopy extends Bundle with GCParameters with IMasterSlave {
   val Valid = in Bool()
   val Ready = out Bool()
   val Done = out Bool()
+  val firstBeatDone = out Bool()
 
   // some parse module calculate parameters
   val DestOopPtr = in UInt(GCElementWidth bits)
@@ -394,7 +364,7 @@ class GCToCopy extends Bundle with GCParameters with IMasterSlave {
 
   override def asMaster(): Unit = {
     out(Valid, SrcOopPtr, DestOopPtr, Size)
-    in(Ready, Done)
+    in(Ready, Done, firstBeatDone)
   }
 
   def clearIn(): Unit = {
@@ -410,7 +380,7 @@ class GCToCopy extends Bundle with GCParameters with IMasterSlave {
   }
 }
 
-class GCToAopParameters extends Bundle with GCParameters with IMasterSlave{
+class GCToAop extends Bundle with GCParameters with IMasterSlave{
   val Valid = in Bool()
   val Ready = out Bool()
 
@@ -512,8 +482,8 @@ class GCAllocateConfigIO extends Bundle with GCParameters with IMasterSlave{
   val G1h = in UInt(GCElementWidth bits)
   val Thread = in UInt(GCElementWidth bits)
   val LockPtr = in UInt(GCElementWidth bits)
-  val objectKlassObj = in UInt((GCElementWidth bits))
-  val intArrayKlassObj = in UInt((GCElementWidth bits))
+  val objectKlassObj = in UInt(GCElementWidth bits)
+  val intArrayKlassObj = in UInt(GCElementWidth bits)
   val PlabAllocatorPtr = in UInt(GCElementWidth bits)
   val UseCompressedKlassPointers = in Bool()
   val CompressedKlassPointerBase = in UInt(GCElementWidth bits)
@@ -589,37 +559,39 @@ class GCAopConfigIO extends Bundle with GCParameters with IMasterSlave{
 
 class LocalMMUIO extends Bundle with HWParameters with IMasterSlave{
   //发出的访存请求
-  val Request = master Stream(new Bundle{
+  val Request = master Stream new Bundle{
     val RequestSourceID = UInt(LLCSourceMaxNumBitSize bits)
     val RequestVirtualAddr = UInt(MMUAddrWidth bits)
     val RequestType_isWrite = Bool()
     val RequestData = UInt(MMUDataWidth bits)
     val RequestWStrb = UInt(MMUDataWidth / 8 bits)
-  })
+  }
 
-  //读请求分发到的TL Link的事务编号
-  val ConherentRequsetSourceID    = slave Flow(UInt(LLCSourceMaxNumBitSize bits))
+  // add variable to describe the request need or not need split two request
+  val RequestSize = master Flow UInt(8 bits)
 
-  //Memoryloader一定能保证收回！
-  val Response = slave Stream(new Bundle{
+  val ConherentRequsetSourceID    = slave Flow UInt(LLCSourceMaxNumBitSize bits)
+
+  val Response = slave Stream new Bundle{
     val ResponseData = UInt(MMUDataWidth bits)
     val ResponseSourceID = UInt(LLCSourceMaxNumBitSize bits)
-  })
+  }
+
   override def asMaster(): Unit = {
-    master(Request)
-    slave(Response,ConherentRequsetSourceID)
+    master(Request, RequestSize)
+    slave(Response, ConherentRequsetSourceID)
   }
 }
 
 object WrapInc
 {
   // "n" is the number of increments, so we wrap at n-1.
-  def apply(value: UInt, n: Int): UInt = {
+  def apply(value: UInt, n: Int, Increment: UInt): UInt = {
     if (isPow2(n)) {
-      (value + U(1))(log2Up(n)-1 downto  0)
+      (value + Increment)(log2Up(n)-1 downto  0)
     } else {
-      val wrap = (value === U(n-1))
-      Mux(wrap, U(0), value + U(1))
+      val wrap = value === U(n-1)
+      Mux(wrap, U(0), value + Increment)
     }
   }
 }
@@ -628,14 +600,14 @@ object WrapDec {
   // Decrement with wrap:
   //    if value == 0 → n-1
   //    else          → value - 1
-  def apply(value: UInt, n: Int): UInt = {
+  def apply(value: UInt, n: Int, decrement: UInt): UInt = {
     if (isPow2(n)) {
       // 对于 2 的幂，直接做减法并截位即可
-      (value - U(1))(log2Up(n)-1 downto 0)
+      (value - decrement)(log2Up(n)-1 downto 0)
     } else {
       // 非 2 的幂，用条件判断
-      val wrap = (value === U(0))
-      Mux(wrap, U(n-1), value - U(1))
+      val wrap = value === U(0)
+      Mux(wrap, U(n-1), value - decrement)
     }
   }
 }
@@ -680,7 +652,7 @@ class Ctrl2Top extends Bundle with GCParameters with IMasterSlave {
   val Done = out Bool()
 
   override def asMaster(): Unit = {
-    out(Valid, AgeThreshold, HeapRegionBias, RegionAttrShiftBy, HeapRegionShiftBy, LogOfHRGrainBytes, StepperOffset, YoungWordsBase, RegionAttrBase, PlabAllocatorPtr, RegionAttrBiasedBase, HeapRegionBiasedBase, ParScanThreadStatePtr, TaskQueue_BottomAddr, TaskQueue_ElemsBase, HumongousReclaimCandidatesBoolBase, CardTablePtr, G1h, IntArrayKlassObj, ObjectKlass, LockPtr, Thread, DummyRegion, NumaPtr, CompressedOopBase, CompressedKlassPointerBase, CompressedFlag)
+    out(Valid, ChunkSize, AgeThreshold, HeapRegionBias, RegionAttrShiftBy, HeapRegionShiftBy, LogOfHRGrainBytes, StepperOffset, YoungWordsBase, RegionAttrBase, PlabAllocatorPtr, RegionAttrBiasedBase, HeapRegionBiasedBase, ParScanThreadStatePtr, TaskQueue_BottomAddr, TaskQueue_ElemsBase, HumongousReclaimCandidatesBoolBase, CardTablePtr, G1h, IntArrayKlassObj, ObjectKlass, LockPtr, Thread, DummyRegion, NumaPtr, CompressedOopBase, CompressedKlassPointerBase, CompressedFlag)
     in(Ready, Done)
   }
 }

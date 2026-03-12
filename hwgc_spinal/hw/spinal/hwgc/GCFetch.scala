@@ -10,8 +10,8 @@ class GCFetch extends Module with HWParameters with GCParameters {
   val io = new Bundle{
     val Mreq = master(new LocalMMUIO)
     val Stack2Fetch = slave Stream UInt(GCElementWidth bits)
-    val Fetch2ArrayProcess = master(new GCFetch2ProcessUnit)
-    val Fetch2OopProcess = master(new GCFetch2ProcessUnit)
+    val Fetch2ArrayProcess = master(new GCToProcessUnit)
+    val Fetch2OopProcess = master(new GCToProcessUnit)
     val ConfigIO = slave(new GCFetchConfigIO)
     val DebugTimeStamp = in(UInt(64 bits))
   }
@@ -19,6 +19,8 @@ class GCFetch extends Module with HWParameters with GCParameters {
   // default value
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
+  io.Mreq.RequestSize.valid := False
+  io.Mreq.RequestSize.payload.clearAll()
   io.Mreq.Response.ready := False
 
   io.Stack2Fetch.ready := False
@@ -41,13 +43,19 @@ class GCFetch extends Module with HWParameters with GCParameters {
   def dbg(msg: Seq[Any]): Unit =
     if (DebugEnable) report(Seq("[GCFetch<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
 
-  def driveProcessUnit(target: GCFetch2ProcessUnit): Unit = {
+  def driveProcessUnit(target: GCToProcessUnit): Unit = {
     target.Valid     := True
     target.Task      := task
     target.OopType   := oopType
     target.SrcOopPtr := fromObj
     target.MarkWord  := markWord
     target.KlassPtr  := klassPtr
+  }
+
+  val targetDone = Mux(oopType === U(NotArrayOop), io.Fetch2OopProcess.Done, io.Fetch2ArrayProcess.Done)
+  val targetDone_reg = RegInit(False)
+  when(targetDone){
+    targetDone_reg := True
   }
 
   switch(state){
@@ -73,7 +81,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
     is(overall_state.s_readOop){
       when(oopType === U(NotArrayOop)){
-        issueReq(io.Mreq, task, False, U(0), U(0), issued){ rd =>
+        issueReq(io.Mreq, task, False, U(8), U(0), issued){ rd =>
           fromObj := Mux(io.ConfigIO.UseCompressedOop, (io.ConfigIO.CompressedOopBase + (rd(31 downto 0) << io.ConfigIO.CompressedOopShift)).resize(GCElementWidth), rd(GCElementWidth - 1 downto 0))
           state := overall_state.s_readMW
         }
@@ -84,7 +92,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
     }
 
     is(overall_state.s_readMW){
-      issueReq(io.Mreq, fromObj, False, U(0), U(0), issued){ rd =>
+      issueReq(io.Mreq, fromObj, False, U(16), U(0), issued){ rd =>
         markWord := rd(GCElementWidth - 1 downto 0)
         klassPtr := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
         state := overall_state.s_send
@@ -107,8 +115,8 @@ class GCFetch extends Module with HWParameters with GCParameters {
     }
 
     is(overall_state.s_waitDone){
-      val targetDone = Mux(oopType === U(NotArrayOop), io.Fetch2OopProcess.Done, io.Fetch2ArrayProcess.Done)
-      when(targetDone) {
+      when(targetDone || targetDone_reg) {
+        targetDone_reg := False
         state := overall_state.s_idle
         dbg(Seq("Task=", task, " done"))
       }

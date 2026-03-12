@@ -22,6 +22,8 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
 
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
+  io.Mreq.RequestSize.valid := False
+  io.Mreq.RequestSize.payload.clearAll()
   io.Mreq.Response.ready := False
 
   io.ConfigIO.Done := False
@@ -57,20 +59,15 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
 
   val state = RegInit(overall_state.s_idle)
 
-  val stk_nextTop    = WrapInc(stack_top,    GCTaskStack_Entry)
-  val stk_prevTop    = WrapDec(stack_top,    GCTaskStack_Entry)
-  val stk_nextBottom = WrapInc(stack_bottom, GCTaskStack_Entry)
-  val stk_prevBottom = WrapDec(stack_bottom, GCTaskStack_Entry)
-
-  val que_nextBottom = WrapInc(queue_bottom, GCTaskQueue_Size).resize(32)
-  val que_prevBottom = WrapDec(queue_bottom, GCTaskQueue_Size).resize(32)
+  val stk_nextTop    = WrapInc(stack_top, GCTaskStack_Entry, U(1))
+  val stk_prevTop    = WrapDec(stack_top, GCTaskStack_Entry, U(1))
 
   val task_usage = (stack_top - stack_bottom) & stack_mask
   val task_free = U(GCTaskStack_Entry - 1, stackMaskWidth bits) - task_usage
   val task_exhausted = stack_top === stack_bottom && queue_bottom === U(0)
 
-  val need_spillOut = task_usage >= U(GCTaskStack_SpillNeed)
-  val need_readback = task_usage <= U(GCTaskStack_ReadNeed) && queue_bottom =/= U(0)
+  val need_spillOut = task_usage >= U(GCTaskStack_SpillNeed) + U(4)
+  val need_readback = task_usage + U(4) <= U(GCTaskStack_ReadNeed) && queue_bottom =/= U(0)
 
   io.Pop.valid := task_usage =/= U(0)
   io.Pop.payload := stack_data.readAsync(stack_top)
@@ -99,21 +96,33 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   val spillOutArea = new Area {
     val spillOut_state = RegInit(sub_state.s0)
     val issued = RegInit(False)
+    val reqNum_reg = RegInit(U(0, 4 bits))
 
     def run(): Unit = {
       switch(spillOut_state){
         is(sub_state.s0){
-          val offset = (queue_bottom * U(GCScannerTask_Size)).resize(MMUAddrWidth)
-          val addr = queue_elems_base + offset
-          issueReq(io.Mreq, addr, True, getWstrb(8), stack_data.readAsync(stk_nextBottom), issued) { _ =>
+          val addr = queue_elems_base + (queue_bottom * U(8)).resize(MMUAddrWidth)
+          val reqNum = U(4, 4 bits)
+          val e0 = stack_data.readAsync(WrapInc(stack_bottom, GCTaskStack_Entry, U(1)))
+          val e1 = stack_data.readAsync(WrapInc(stack_bottom, GCTaskStack_Entry, U(2)))
+          val e2 = stack_data.readAsync(WrapInc(stack_bottom, GCTaskStack_Entry, U(3)))
+          val e3 = stack_data.readAsync(WrapInc(stack_bottom, GCTaskStack_Entry, U(4)))
+          val packData = Cat(e3, e2, e1, e0).resize(MMUDataWidth bits).asUInt
+          issueReq(io.Mreq, addr, True, reqNum * U(8), packData, issued) { _ =>
+            reqNum_reg := reqNum
             spillOut_state := sub_state.s1
-            stack_bottom := stk_nextBottom
-            dbg(Seq("SpillOut stack index=", stk_nextBottom, " data=", stack_data.readAsync(stk_nextBottom), " -> queue index=", queue_bottom))
+            stack_bottom := WrapInc(stack_bottom, GCTaskStack_Entry, reqNum)
+
+            for(i <- 0 until 4){
+              when(i < reqNum) {
+                dbg(Seq("SpillOut stack index=", WrapInc(stack_bottom, GCTaskStack_Entry, i), " data=", stack_data.readAsync(WrapInc(stack_bottom, GCTaskStack_Entry, i)), " -> queue index=", WrapInc(queue_bottom, GCTaskQueue_Size, i)))
+              }
+            }
           }
         }
         is(sub_state.s1){
-          issueReq(io.Mreq, queue_bottom_addr, True, getWstrb(4), que_nextBottom, issued) { _ =>
-            queue_bottom := que_nextBottom
+          issueReq(io.Mreq, queue_bottom_addr, True, U(4), WrapInc(queue_bottom, GCTaskQueue_Size, reqNum_reg), issued) { _ =>
+            queue_bottom := WrapInc(queue_bottom, GCTaskQueue_Size, reqNum_reg).resize(32)
             spillOut_state := sub_state.s0
           }
         }
@@ -124,25 +133,34 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   val readBackArea = new Area{
     val readBack_state = RegInit(sub_state.s0)
     val issued    = RegInit(False)
+    val received  = RegInit(U(0, 4 bits))
 
     def run(): Unit = {
       switch(readBack_state) {
         is(sub_state.s0) {
-          val offset   = (que_prevBottom * U(GCScannerTask_Size)).resize(MMUAddrWidth)
-          val readAddr = queue_elems_base + offset
+          val readBackNum = U(4, 4 bits)
+          val reqNum = Mux(readBackNum >= queue_bottom, queue_bottom, readBackNum)
+          val readAddr = queue_elems_base + (WrapDec(queue_bottom, GCTaskQueue_Size, reqNum) * U(8)).resize(MMUAddrWidth)
 
-          issueReq(io.Mreq, readAddr, False, U(0), U(0), issued) { rd =>
-            when(!io.Push.fire || task_free >= U(2)) { // 要么不存在Push 要么和Push同时执行 但是task mem中至少有两个空位
-              stack_data.write(stack_bottom, rd(GCElementWidth - 1 downto 0))
+          issueReq(io.Mreq, readAddr, False, reqNum * U(8), U(0), issued) { rd =>
+            val meanWhilePush = io.Push.fire
+            val canReceive = Mux(task_free - meanWhilePush.asUInt >= reqNum, reqNum, task_free - meanWhilePush.asUInt).resize(4)
+            val elems = rd.subdivideIn(GCElementWidth bits)
+            for(i <- 0 until 4){
+              when(i < canReceive){
+                val writeElement = elems((reqNum - 1 - i).resized)
+                stack_data.write(WrapDec(stack_bottom, GCTaskStack_Entry, i), writeElement)
+                dbg(Seq("ReadBack queue index=", WrapDec(queue_bottom, GCTaskQueue_Size, i), " data=", writeElement, " -> stack index=", WrapDec(stack_bottom, GCTaskStack_Entry, i)))
+              }
             }
             readBack_state := sub_state.s1
-            stack_bottom := stk_prevBottom
-            dbg(Seq("ReadBack queue index=", que_prevBottom, " data=", rd, " -> stack index=", stack_bottom, " writeEnable=", !io.Push.fire || task_free >= U(2)))
+            stack_bottom := WrapDec(stack_bottom, GCTaskStack_Entry, canReceive)
+            received := canReceive
           }
         }
         is(sub_state.s1) {
-          issueReq(io.Mreq, queue_bottom_addr, True, getWstrb(4), que_prevBottom, issued) { _ =>
-            queue_bottom := que_prevBottom
+          issueReq(io.Mreq, queue_bottom_addr, True, U(4), WrapDec(queue_bottom, GCTaskQueue_Size, received), issued) { _ =>
+            queue_bottom := WrapDec(queue_bottom, GCTaskQueue_Size, received).resize(32)
             readBack_state := sub_state.s0
           }
         }
@@ -172,7 +190,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.s_read){
-      issueReq(io.Mreq, queue_bottom_addr, False, U(0), U(0), read_issued) { rd =>
+      issueReq(io.Mreq, queue_bottom_addr, False, U(4), U(0), read_issued) { rd =>
         state        := overall_state.s_work
         queue_bottom := rd(31 downto 0)
         dbg(Seq("Fetched JVM Queue Bottom=", rd(31 downto 0)))
@@ -180,7 +198,8 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.s_work){
-      when(task_exhausted){
+      when(task_exhausted && io.Pop.ready){
+        io.ConfigIO.Done := True
         state := overall_state.s_idle
       }.otherwise{
         handlePushAndPop()

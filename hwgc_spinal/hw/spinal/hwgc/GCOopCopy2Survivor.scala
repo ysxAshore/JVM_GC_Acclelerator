@@ -10,7 +10,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     val ToCopy = master(new GCToCopy)
     val ToTrace = master(new GCToTrace)
     val ToAllocate = master(new GCToAllocate)
-    val ToCopySurvivor = slave(new GCProcess2Survivor)
+    val ToCopySurvivor = slave(new GCToSurvivor)
     val ConfigIO = slave(new GCCopy2SurvivorConfigIO)
     val DebugTimeStamp = in(UInt(64 bits))
   }
@@ -18,6 +18,8 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   // default value
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
+  io.Mreq.RequestSize.valid := False
+  io.Mreq.RequestSize.payload.clearAll()
   io.Mreq.Response.ready := False
 
   io.ToCopy.clearIn()
@@ -62,8 +64,23 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   val issuedCopy = RegInit(False)
   val issuedTrace = RegInit(False)
   val copyDone = RegInit(False)
+  val copyFirstBeatDone = RegInit(False)
   val traceDone = RegInit(False)
   val allocateSelect = RegInit(False)
+  val allocate_done = RegInit(False)
+
+  when(io.ToCopy.Done){
+    copyDone := True
+  }
+  when(io.ToTrace.Done){
+    traceDone := True
+  }
+  when(io.ToCopy.firstBeatDone){
+    copyFirstBeatDone := True
+  }
+  when(io.ToAllocate.Done){
+    allocate_done := True
+  }
 
   def dbg(msg: Seq[Any]): Unit =
     if (DebugEnable) report(Seq("[GCAop<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
@@ -95,9 +112,10 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
     is(overall_state.states(1)){
       val compressedKlassPtr = (io.ConfigIO.CompressedKlassPointerBase + klassPtr(31 downto 0) << io.ConfigIO.CompressedKlassPointerShift).resize(GCElementWidth)
-      val addr = Mux(io.ConfigIO.UseCompressedKlassPointer, compressedKlassPtr, klassPtr)
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
-        klassPtr := addr
+      val new_klassPtr = Mux(io.ConfigIO.UseCompressedKlassPointer, compressedKlassPtr, klassPtr)
+      val addr = new_klassPtr + U(8)
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
+        klassPtr := new_klassPtr
         lh := rd(31 downto 0)
         kid := rd(63 downto 32)
         state := overall_state.states(2)
@@ -105,12 +123,12 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
 
     is(overall_state.states(2)){
-      when(lh > U(0)){
+      when(lh.asSInt > S(0)){
         size := (lh >> U(3)).resize(32)
         state := overall_state.states(3)
       }.otherwise{
         val addr = srcOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointer, U(12), U(16))
-        issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        issueReq(io.Mreq, addr, False, U(4), U(0), issued) { rd =>
           array_length := rd(31 downto 0)
           state := overall_state.states(3)
         }
@@ -118,11 +136,11 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
 
     is(overall_state.states(3)){
-      when(lh < U(0)){
+      when(lh.asSInt < S(0)){
         val temp = ((array_length << lh(7 downto 0)) + lh(23 downto 16)).resize(32)
         size := Mux(temp(2 downto 0) =/= U(0), (temp >> U(3)) + U(1), temp >> U(3)).resize(32)
       }
-      issueReq(io.Mreq, regionAttrPtr, False, U(0), U(0), issued){ rd =>
+      issueReq(io.Mreq, regionAttrPtr, False, U(2), U(0), issued){ rd =>
         src_region_attr := rd(15 downto 0)
         state := overall_state.states(4)
       }
@@ -137,7 +155,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       when(region_attr_type === U(0)){
         when(!markWord(0)){
           val addr = Mux(markWord(1), markWord ^ U(2, GCElementWidth bits), markWord)
-          issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
+          issueReq(io.Mreq, addr, False, U(8), U(0), issued){ rd =>
             new_mark := rd(GCElementWidth - 1 downto 0)
             state := overall_state.states(5)
           }
@@ -146,7 +164,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
           state := overall_state.states(5)
         }
       }.otherwise{
-        issueReq(io.Mreq, dest_attr_addr, False, U(0), U(0), issued) { rd =>
+        issueReq(io.Mreq, dest_attr_addr, False, U(2), U(0), issued) { rd =>
           dest_region_attr := rd(15 downto 0)
           state := overall_state.states(6)
         }
@@ -165,7 +183,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
         dest_region_attr := src_region_attr
         state := overall_state.states(6)
       }.otherwise{
-        issueReq(io.Mreq, dest_attr_ptr, False, U(0), U(0), issued) { rd =>
+        issueReq(io.Mreq, dest_attr_ptr, False, U(2), U(0), issued) { rd =>
           dest_region_attr := rd(15 downto 0)
           state := overall_state.states(6)
         }
@@ -174,7 +192,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
     is(overall_state.states(6)){
       val addr = (io.ConfigIO.HeapRegionBiasedBase + (srcOopPtr >> io.ConfigIO.HeapRegionShiftBy) * U(8)).resize(MMUAddrWidth)
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued){ rd =>
         from_region := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(7)
       }
@@ -183,14 +201,14 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     is(overall_state.states(7)){
       val dest_attr_type = dest_region_attr(15 downto 8)
       val addr = (io.ConfigIO.PlabAllocatorPtr + U"x10" + dest_attr_type * U(8)).resize(MMUAddrWidth)
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
         buffer_ptr := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(8)
       }
     }
 
     is(overall_state.states(8)){
-      issueReq(io.Mreq, buffer_ptr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, buffer_ptr, False, U(8), U(0), issued) { rd =>
         buffer := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(9)
       }
@@ -198,7 +216,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
     is(overall_state.states(9)){
       val addr = (buffer + U"x30").resize(MMUAddrWidth)
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(16), U(0), issued) { rd =>
         region_top := rd(GCElementWidth - 1 downto 0)
         region_end := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
         state := overall_state.states(10)
@@ -210,7 +228,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
         destOopPtr := region_top
         val addr = buffer + U"x30"
         val writeValue = (region_top + size * U(8)).resize(GCElementWidth)
-        issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued){ _ =>
+        issueReq(io.Mreq, addr, True, U(8), writeValue, issued){ _ =>
           region_top := writeValue
           state := overall_state.states(11)
         }
@@ -221,14 +239,14 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
     is(overall_state.states(11)){
       val writeValue = Cat(destOopPtr(GCElementWidth - 1 downto 2), U(3, 2 bits)).resize(GCElementWidth).asUInt
-      issueReq(io.Mreq, srcOopPtr, True, getWstrb(8), writeValue, issued) { _ =>
+      issueReq(io.Mreq, srcOopPtr, True, U(8), writeValue, issued) { _ =>
         state := overall_state.states(12)
       }
     }
 
     is(overall_state.states(12)){
       val addr = from_region + U(256)
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(4), U(0), issued) { rd =>
         young_index := rd(31 downto 0)
         state := overall_state.states(13)
       }
@@ -236,7 +254,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
     is(overall_state.states(13)){
       val addr = (io.ConfigIO.YoungWordsBase + young_index * U(8)).resize(MMUAddrWidth)
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
         temp_value := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(14)
       }
@@ -245,7 +263,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     is(overall_state.states(14)){
       val addr = (io.ConfigIO.YoungWordsBase + young_index * U(8)).resize(MMUAddrWidth)
       val writeValue = (temp_value + size).resize(GCElementWidth)
-      issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
         state := overall_state.states(15)
       }
     }
@@ -254,7 +272,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       val cond = dest_region_attr(15 downto 8) === U(0) && !markWord(0)
       val temp = (markWord & ~(U"x1111" << 3).resize(GCElementWidth)) | ((Mux(age + U(1) < U(15), age + U(1), age) & U(x"1111", 32 bits)) << U(3)).resize(GCElementWidth)
       val writeValue = Mux(cond, temp, markWord)
-      issueReq(io.Mreq, destOopPtr, True, getWstrb(8), writeValue, issued){ _ =>
+      issueReq(io.Mreq, destOopPtr, True, U(8), writeValue, issued){ _ =>
         state := overall_state.states(16)
       }
     }
@@ -263,7 +281,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       val cond = dest_region_attr(15 downto 8) === U(0) && !markWord(0)
       when(cond){
         val addr = Mux(markWord(1), markWord ^ U(2, GCElementWidth bits), markWord)
-        issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
+        issueReq(io.Mreq, addr, False, U(8), U(0), issued){ rd =>
           temp_value := rd(GCElementWidth - 1 downto 0)
           state := overall_state.states(17)
         }
@@ -275,7 +293,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     is(overall_state.states(17)){
       val addr = Mux(markWord(1), markWord ^ U(2, GCElementWidth bits), markWord)
       val writeValue = (temp_value & ~(U"x1111" << 3).resize(GCElementWidth)) | ((Mux(age + U(1) < U(15), age + U(1), age) & U(x"1111", 32 bits)) << U(3)).resize(GCElementWidth)
-      issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued){ _ =>
+      issueReq(io.Mreq, addr, True, U(8), writeValue, issued){ _ =>
         state := overall_state.states(18)
       }
     }
@@ -288,13 +306,13 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       io.ToCopy.SrcOopPtr := srcOopPtr + U(8)
       io.ToCopy.DestOopPtr := destOopPtr + U(8)
 
-      io.ToTrace.Valid := needTrace && !issuedTrace
+      io.ToTrace.Valid := needTrace && !issuedTrace && (io.ToCopy.firstBeatDone || copyFirstBeatDone)
       io.ToTrace.OopType := U(NotArrayOop)
       io.ToTrace.KlassPtr := klassPtr
       io.ToTrace.SrcOopPtr := srcOopPtr
       io.ToTrace.DestOopPtr := destOopPtr
       io.ToTrace.Kid := kid
-      io.ToTrace.ScanningInYoung := dest_region_attr(15 downto 8) === U(Type_Young, 8 bits)
+      io.ToTrace.ScanningInYoung := dest_region_attr(15 downto 8) === U(0, 8 bits)
       io.ToTrace.ArrayLength := array_length
       io.ToTrace.PartialArrayStart := U(0)
       io.ToTrace.StepIndex := (array_length % io.ConfigIO.ChunkSize).resize(32)
@@ -324,13 +342,6 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
 
     is(overall_state.states(19)){
-      when(io.ToCopy.Done){
-        copyDone := True
-      }
-      when(io.ToTrace.Done){
-        traceDone := True
-      }
-
       val needTrace = kid =/= U(TypeArrayKlassID, 32 bits)
       val copyFinished = copyDone || io.ToCopy.Done
       val traceFinished = traceDone || io.ToTrace.Done || !needTrace
@@ -338,6 +349,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       when(copyFinished && traceFinished){
         copyDone := False
         traceDone := False
+        copyFirstBeatDone := False
 
         io.ToCopySurvivor.Done := True
         io.ToCopySurvivor.DestOopPtr := destOopPtr
@@ -346,7 +358,8 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
 
     is(overall_state.states(20)){
-      when(io.ToAllocate.Done){
+      when(io.ToAllocate.Done || allocate_done){
+        allocate_done := False
         destOopPtr := io.ToAllocate.DestObjPtr
         state := Mux(allocateSelect, overall_state.states(25), overall_state.states(21))
       }
@@ -355,7 +368,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     is(overall_state.states(21)){
       when(destOopPtr === U(0)){
         val addr = io.ConfigIO.PlabAllocatorPtr + U"x18"
-        issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
           buffer_ptr := rd(GCElementWidth - 1 downto 0)
           state := overall_state.states(22)
         }
@@ -365,7 +378,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
 
     is(overall_state.states(22)){
-      issueReq(io.Mreq, buffer_ptr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, buffer_ptr, False, U(8), U(0), issued) { rd =>
         buffer := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(23)
       }
@@ -373,7 +386,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
     is(overall_state.states(23)){
       val addr = buffer + U"x30"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(16), U(0), issued) { rd =>
         region_top := rd(GCElementWidth - 1 downto 0)
         region_end := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
         dest_region_attr := (dest_region_attr & U(x"ff", 16 bits)) | U(x"100", 16 bits)
@@ -387,7 +400,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
         destOopPtr := region_top
         val addr = buffer + U"x30"
         val writeValue = (region_top + size * U(8)).resize(GCElementWidth)
-        issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { _ =>
+        issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
           region_top := writeValue
           state := overall_state.states(25)
         }
@@ -398,7 +411,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
     is(overall_state.states(25)){
       val addr = dest_attr_ptr + U(1)
-      issueReq(io.Mreq, addr, True, getWstrb(1), U(1), issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(1), U(1), issued) { _ =>
         state := overall_state.states(11)
       }
     }

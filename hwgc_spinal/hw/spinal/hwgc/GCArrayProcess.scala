@@ -8,7 +8,7 @@ import scala.language.postfixOps
 class GCArrayProcess extends Module with HWParameters with GCParameters {
   val io = new Bundle{
     val Mreq = master(new LocalMMUIO)
-    val Fetch2Process = slave(new GCFetch2ProcessUnit)
+    val Fetch2Process = slave(new GCToProcessUnit)
     val Process2Trace = master(new GCToTrace)
     val ConfigIO = slave(new GCArrayProcessConfigIO)
     val DebugTimeStamp = in(UInt(64 bits))
@@ -17,6 +17,8 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
   // default value
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
+  io.Mreq.RequestSize.valid := False
+  io.Mreq.RequestSize.payload.clearAll()
   io.Mreq.Response.ready := False
 
   io.Fetch2Process.clearOut()
@@ -41,6 +43,12 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
   val dest_length = RegInit(U(0, 32 bits))
   val step_ncreate = RegInit(U(0, 32 bits))
 
+  val trace_done = RegInit(False)
+
+  when(io.Process2Trace.Done){
+    trace_done := True
+  }
+
   def dbg(msg: Seq[Any]): Unit =
     if (DebugEnable) report(Seq("[GCArrayProcess<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
 
@@ -61,7 +69,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
 
     is(overall_state.s_readSrcLen){
       val addr = srcOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(12), U(16))
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(4), U(0), issued) { rd =>
         src_length := rd(31 downto 0)
         state := overall_state.s_readDestLen
       }
@@ -69,7 +77,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
 
     is(overall_state.s_readDestLen){
       val addr = destOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(12), U(16))
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(4), U(0), issued) { rd =>
         dest_length := rd(31 downto 0)
         state := overall_state.s_readHeapRegionPtr
       }
@@ -84,7 +92,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
       step_index := dest_length + io.ConfigIO.ChunkSize
 
       val addr = (io.ConfigIO.HeapRegionBiasedBase + (destOopPtr >> io.ConfigIO.HeapRegionShiftBy) * U(8)).resize(MMUAddrWidth)
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued){ rd =>
         heap_region := rd(GCElementWidth - 1 downto 0)
         state := overall_state.s_readHeapRegionType
       }
@@ -92,7 +100,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
 
     is(overall_state.s_readHeapRegionType){
       val addr = heap_region + U"xbc"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
+      issueReq(io.Mreq, addr, False, U(4), U(0), issued){ rd =>
         scanning_in_young := (rd(31 downto 0) & U(2, 32 bits)) =/= U(0)
         state := overall_state.s_doTrace
       }
@@ -116,7 +124,8 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
     }
 
     is(overall_state.s_waitDone){
-      when(io.Process2Trace.Done){
+      when(io.Process2Trace.Done || trace_done){
+        trace_done := False
         io.Fetch2Process.Done := True
         state := overall_state.s_idle
 

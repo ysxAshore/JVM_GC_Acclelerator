@@ -17,6 +17,8 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
 
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
+  io.Mreq.RequestSize.valid := False
+  io.Mreq.RequestSize.payload.clearAll()
   io.Mreq.Response.ready := False
 
   io.ToNewGCAlloc.clearIn()
@@ -54,6 +56,17 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
   val temp_value = RegInit(U(0, GCElementWidth bits))
   val this_type = RegInit(U(0, 8 bits))
 
+  val par_allocate_done = RegInit(False)
+  val new_gc_alloc_done = RegInit(False)
+
+  when(io.ToParAllocate.Done){
+    par_allocate_done := True
+  }
+
+  when(io.ToNewGCAlloc.Done){
+    new_gc_alloc_done := True
+  }
+
   switch(state){
     is(overall_state.states(0)){
       io.ToAttemptAllocate.Ready := True
@@ -68,7 +81,7 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(1)){
       when(allocRegion =/= io.ConfigIO.DummyRegion){
-        issueReq(io.Mreq, allocRegion, False, U(0), U(0), issued) { rd =>
+        issueReq(io.Mreq, allocRegion, False, U(24), U(0), issued) { rd =>
           alloc_end := rd(GCElementWidth - 1 downto 0)
           alloc_top := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
           state := overall_state.states(2)
@@ -80,7 +93,7 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(2)){
       val addr = regionPtr + U"x10"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(24), U(0), issued) { rd =>
         offset_regionPtr_10 := rd(GCElementWidth - 1 downto 0)
         offset_regionPtr_18 := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
         offset_regionPtr_20 := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
@@ -91,7 +104,7 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
     is(overall_state.states(3)){
       allocated_bytes := alloc_top - alloc_end - offset_regionPtr_18
       val addr = io.ConfigIO.G1h + U"x240"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
         temp_value := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(4)
       }
@@ -100,14 +113,14 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
     is(overall_state.states(4)){
       val addr = io.ConfigIO.G1h + U"x240"
       val writeValue = temp_value + allocated_bytes
-      issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
         state := overall_state.states(5)
       }
     }
 
     is(overall_state.states(5)){
       val addr = regionPtr + U"x30"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(17), U(0), issued) { rd =>
         offset_regionPtr_30 := rd(GCElementWidth - 1 downto 0)
         this_type := rd(GCElementWidth * 2 + 7 downto GCElementWidth * 2)
         state := overall_state.states(6)
@@ -116,7 +129,7 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(6)){
       val addr = io.ConfigIO.G1h + Mux(this_type === U(1), U"xa0", U"x3f8") + U"x10"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
         temp_value := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(7)
       }
@@ -125,14 +138,14 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
     is(overall_state.states(7)){
       val addr = io.ConfigIO.G1h + Mux(this_type === U(1), U"xa0", U"x3f8") + U"x10"
       val writeValue = temp_value + Mux(this_type === U(1), U(1), allocated_bytes)
-      issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
         state := overall_state.states(8)
       }
     }
 
     is(overall_state.states(8)){
       val addr = io.ConfigIO.G1h + U"x3c1"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(1), U(0), issued) { rd =>
         when(rd(7 downto 0) =/= U(0) && allocated_bytes > U(0)){
           state := overall_state.states(9)
         }.otherwise{
@@ -143,7 +156,7 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(9)){
       val addr = io.ConfigIO.G1h + U"x4e8"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
         cm := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(10)
       }
@@ -151,7 +164,7 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(10)){
       val addr = allocRegion + U"xe8"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
         next_top := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(11)
       }
@@ -159,7 +172,7 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(11)){
       val addr = cm + U"xb0"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(24), U(0), issued) { rd =>
         root_regions_array := rd(GCElementWidth - 1 downto 0)
         temp_value := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
         state := overall_state.states(12)
@@ -171,7 +184,7 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
       val writeOff0 = next_top
       val writeOff8 = ((alloc_top - next_top) / U(8)).resize(GCElementWidth)
       val writeValue = Cat(writeOff8, writeOff0).asUInt
-      issueReq(io.Mreq, addr, True, getWstrb(16), writeValue, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(16), writeValue, issued) { _ =>
         state := overall_state.states(13)
       }
     }
@@ -179,7 +192,7 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
     is(overall_state.states(13)){
       val addr = cm + U"xb0" + U"x10"
       val writeValue = temp_value + U(1)
-      issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
         state := overall_state.states(14)
       }
     }
@@ -189,7 +202,7 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
       val writeOff0 = io.ConfigIO.DummyRegion
       val writeOff10 = U(0)
       val writeValue = Cat(writeOff10, offset_regionPtr_10, writeOff0).asUInt
-      issueReq(io.Mreq, addr, True, getWstrb(24), writeValue, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(24), writeValue, issued) { _ =>
         state := overall_state.states(15)
       }
     }
@@ -203,7 +216,8 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.states(16)){
-      when(io.ToNewGCAlloc.Done){
+      when(io.ToNewGCAlloc.Done || new_gc_alloc_done){
+        new_gc_alloc_done := False
         new_alloc_region := io.ToNewGCAlloc.newAllocRegion
         state := overall_state.states(17)
       }
@@ -212,7 +226,7 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
     is(overall_state.states(17)){
       when(new_alloc_region =/= U(0)){
         val addr = new_alloc_region + U"xa8"
-        issueReq(io.Mreq, addr, True, getWstrb(8), U(0), issued) { _ =>
+        issueReq(io.Mreq, addr, True, U(8), U(0), issued) { _ =>
           state := overall_state.states(18)
         }
       }.otherwise{
@@ -223,6 +237,7 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.states(18)){
+      // @todo 这里中间怎么办
       val writeMask = B(32 bits, default -> False)
       for(i <- 0 until 8){
         writeMask(i) := True
@@ -231,7 +246,7 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
         writeMask(i) := True
       }
       val writeValue = Cat(alloc_top, U(0, 64 bits), alloc_end).asUInt
-      issueReq(io.Mreq, new_alloc_region, True, writeMask.asUInt, writeValue, issued) { _ =>
+      issueReq(io.Mreq, new_alloc_region, True, U(24), writeValue, issued) { _ =>
         state := overall_state.states(19)
       }
     }
@@ -242,7 +257,7 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
       val off18 = alloc_top - alloc_end
       val addr = regionPtr + U"x8"
       val writeValue = Cat(off18, off10, off8).asUInt
-      issueReq(io.Mreq, addr, True, getWstrb(24), writeValue, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(24), writeValue, issued) { _ =>
         state := overall_state.states(20)
       }
     }
@@ -261,7 +276,8 @@ class GCAttemptAlloc extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.states(21)){
-      when(io.ToParAllocate.Done){
+      when(io.ToParAllocate.Done || par_allocate_done){
+        par_allocate_done := False
         state := overall_state.states(0)
         io.ToAttemptAllocate.Done  := True
         when(new_alloc_region =/= U(0) && io.ToParAllocate.DestObjPtr =/= U(0)){

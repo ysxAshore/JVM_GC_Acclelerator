@@ -14,8 +14,9 @@ class GCLocalMMU extends Module with HWParameters with GCParameters {
 
   io.LastLevelCacheTLIO.Request.payload.clearAll()
   io.LastLevelCacheTLIO.Request.valid := False
+  io.LastLevelCacheTLIO.RequestSize.valid := False
+  io.LastLevelCacheTLIO.RequestSize.payload.clearAll()
 
-  val arbStart = RegInit(U(0, LocalMMUTaskType.TaskTypeBitWidth bits))
   val allValid = Vec(Bool(), LocalMMUTaskType.TaskTypeMax)
   for(i <- 0 until LocalMMUTaskType.TaskTypeMax){
     allValid(i) := io.localMMUIOs(i).Request.valid
@@ -29,6 +30,7 @@ class GCLocalMMU extends Module with HWParameters with GCParameters {
   val sourceid2port =  RegInit(Vec(Seq.fill(LLCSourceMaxNum)(U(0,log2Up(LocalMMUTaskType.TaskTypeMax) bits))))
 
   // 构造 rotatedValid[i] = allValid[(arbStart + i) % N]
+  val arbStart = RegInit(U(0, LocalMMUTaskType.TaskTypeBitWidth + 1 bits))
   val rotatedValid = Vec(Bool(), LocalMMUTaskType.TaskTypeMax)
   for (i <- 0 until  LocalMMUTaskType.TaskTypeMax) {
     val sum = arbStart + i
@@ -47,12 +49,12 @@ class GCLocalMMU extends Module with HWParameters with GCParameters {
     (rotatedValid(i), U(i, LocalMMUTaskType.TaskTypeBitWidth bits))
   )
   val offset = PriorityMux(indexCandidates)
-  val chosen_index = (arbStart + offset).resize(LocalMMUTaskType.TaskTypeBitWidth bits)
+  val chosen_index = ((arbStart + offset) % U(LocalMMUTaskType.TaskTypeMax)).resize(LocalMMUTaskType.TaskTypeBitWidth bits)
 
   val hasRequest = rotatedValid.asBits.orR
 
   when(hasRequest && io.LastLevelCacheTLIO.Request.ready && io.LastLevelCacheTLIO.ConherentRequsetSourceID.valid){
-    arbStart := ((chosen_index + U(1)) % LocalMMUTaskType.TaskTypeMax).resize(LocalMMUTaskType.TaskTypeBitWidth)
+    arbStart := ((chosen_index + U(1)) % LocalMMUTaskType.TaskTypeMax).resize(LocalMMUTaskType.TaskTypeBitWidth + 1)
 
     io.localMMUIOs(chosen_index).Request.ready := io.LastLevelCacheTLIO.Request.ready
     io.localMMUIOs(chosen_index).ConherentRequsetSourceID.valid := io.LastLevelCacheTLIO.ConherentRequsetSourceID.valid
@@ -63,6 +65,7 @@ class GCLocalMMU extends Module with HWParameters with GCParameters {
     io.LastLevelCacheTLIO.Request.payload.RequestVirtualAddr := io.localMMUIOs(chosen_index).Request.payload.RequestVirtualAddr
     io.LastLevelCacheTLIO.Request.payload.RequestType_isWrite := io.localMMUIOs(chosen_index).Request.payload.RequestType_isWrite
     io.LastLevelCacheTLIO.Request.payload.RequestData := io.localMMUIOs(chosen_index).Request.payload.RequestData
+    io.LastLevelCacheTLIO.Request.payload.RequestWStrb := io.localMMUIOs(chosen_index).Request.payload.RequestWStrb
 
     sourceid2port(io.LastLevelCacheTLIO.ConherentRequsetSourceID.payload.resized) := chosen_index
   }

@@ -7,7 +7,7 @@ import scala.language.postfixOps
 
 class GCAop extends Module with GCParameters with HWParameters {
   val io = new Bundle{
-    val Aop = slave (new GCToAopParameters)
+    val Aop = slave (new GCToAop)
     val Mreq = master(new LocalMMUIO)
     val ConfigIO = slave(new GCAopConfigIO)
     val DebugTimeStamp = in(UInt(64 bits))
@@ -17,6 +17,8 @@ class GCAop extends Module with GCParameters with HWParameters {
 
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
+  io.Mreq.RequestSize.valid := False
+  io.Mreq.RequestSize.payload.clearAll()
   io.Mreq.Response.ready := False
 
   object overall_state extends SpinalEnum {
@@ -64,7 +66,7 @@ class GCAop extends Module with GCParameters with HWParameters {
           dbg(Seq("RegionAttr=0, skip directly"))
         }.otherwise{
           val addr = io.ConfigIO.CardTablePtr + U"x38"
-          issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+          issueReq(io.Mreq, addr, False, U(16), U(0), issued) { rd =>
             byte_map := rd(GCElementWidth -1 downto 0)
             byte_map_base := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
             state := overall_state.states(1)
@@ -79,7 +81,7 @@ class GCAop extends Module with GCParameters with HWParameters {
       res := byte_map_entry
       card_index := byte_map_entry - byte_map
       val addr = io.ConfigIO.ParScanThreadStatePtr + U"x1b0"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
         last_index := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(2)
         dbg(Seq("Read last_index=", rd(GCElementWidth - 1 downto 0)))
@@ -92,7 +94,7 @@ class GCAop extends Module with GCParameters with HWParameters {
         dbg(Seq("last_index == card_index, done"))
       }.otherwise{
         val addr = io.ConfigIO.ParScanThreadStatePtr + U"x40"
-        issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        issueReq(io.Mreq, addr, False, U(32), U(0), issued) { rd =>
           par_scan_off40 := rd(GCElementWidth - 1 downto 0)
           index := (rd(GCElementWidth * 2 - 1 downto GCElementWidth) / U(8)).resize(GCElementWidth)
           buffer := rd(GCElementWidth * 4 -1 downto GCElementWidth * 3)
@@ -106,16 +108,17 @@ class GCAop extends Module with GCParameters with HWParameters {
         old_node := U(0)
         when(buffer =/= U(0)){
           old_node := buffer - U(10)
-          issueReq(io.Mreq, old_node, True, getWstrb(8), U(0), issued) { _ =>
+          issueReq(io.Mreq, old_node, True, U(8), U(0), issued) { _ =>
             state := overall_state.states(6)
           }
         }.otherwise{
           state := overall_state.states(6)
         }
       }.otherwise{
-        index := index - U(1)
-        val addr = (buffer + (index - U(1)) * U(8)).resize(MMUAddrWidth)
-        issueReq(io.Mreq, addr, True, getWstrb(8), res, issued) { _ =>
+        val temp_index = index - U(1)
+        val addr = (buffer + (temp_index - U(1)) * U(8)).resize(MMUAddrWidth)
+        issueReq(io.Mreq, addr, True, U(8), res, issued) { _ =>
+          index := temp_index
           state := overall_state.states(4)
         }
       }
@@ -124,21 +127,21 @@ class GCAop extends Module with GCParameters with HWParameters {
     is(overall_state.states(4)){
       val addr = io.ConfigIO.ParScanThreadStatePtr + U"x48"
       val writeData = (index * U(8)).resize(GCElementWidth)
-      issueReq(io.Mreq, addr, True, getWstrb(8), writeData, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(8), writeData, issued) { _ =>
         state := overall_state.states(5)
       }
     }
 
     is(overall_state.states(5)){
       val addr = io.ConfigIO.ParScanThreadStatePtr + U"x1b0"
-      issueReq(io.Mreq, addr, True, getWstrb(8), card_index, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(8), card_index, issued) { _ =>
         resetState()
       }
     }
 
     is(overall_state.states(6)){
       val addr = io.ConfigIO.ParScanThreadStatePtr + U"x20"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(32), U(0), issued) { rd =>
         node_allocator_ptr := rd(GCElementWidth - 1 downto 0)
         par_scan_off30 := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
         par_scan_off38 := rd(GCElementWidth * 4 - 1 downto GCElementWidth * 3)
@@ -149,7 +152,7 @@ class GCAop extends Module with GCParameters with HWParameters {
     is(overall_state.states(7)){
       new_top := U(0)
       val addr = node_allocator_ptr + U"x80"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
         node := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(8)
       }
@@ -158,7 +161,7 @@ class GCAop extends Module with GCParameters with HWParameters {
     is(overall_state.states(8)){
       when(node =/= U(0)){
         val addr = node + U(8)
-        issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
           new_top := rd(GCElementWidth - 1 downto 0)
           state := overall_state.states(9)
         }
@@ -169,7 +172,7 @@ class GCAop extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(9)){
       val addr = node_allocator_ptr + U"x80"
-      issueReq(io.Mreq, addr, True, getWstrb(8), new_top, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(8), new_top, issued) { _ =>
         state := overall_state.states(10)
       }
     }
@@ -177,7 +180,7 @@ class GCAop extends Module with GCParameters with HWParameters {
     is(overall_state.states(10)){
       when(node =/= U(0)){
         val addr = node + U(8)
-        issueReq(io.Mreq, addr, True, getWstrb(8), U(0), issued) { _ =>
+        issueReq(io.Mreq, addr, True, U(8), U(0), issued) { _ =>
           state := overall_state.states(11)
         }
       }.otherwise{
@@ -189,13 +192,13 @@ class GCAop extends Module with GCParameters with HWParameters {
       // @todo from interrupt get node
       val writeValue = node + U(10)
       val addr = io.ConfigIO.ParScanThreadStatePtr + U"x58"
-      issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
         state := overall_state.states(12)
       }
     }
 
     is(overall_state.states(12)){
-      issueReq(io.Mreq, node_allocator_ptr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, node_allocator_ptr, False, U(8), U(0), issued) { rd =>
         index := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(13)
       }
@@ -204,7 +207,7 @@ class GCAop extends Module with GCParameters with HWParameters {
     is(overall_state.states(13)){
       val addr = io.ConfigIO.ParScanThreadStatePtr + U"x48"
       val writeValue = (index * U(8)).resize(GCElementWidth)
-      issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
         state := overall_state.states(14)
       }
     }
@@ -215,7 +218,7 @@ class GCAop extends Module with GCParameters with HWParameters {
       }.otherwise{
         val addr = io.ConfigIO.ParScanThreadStatePtr + U"x40"
         val writeValue = (par_scan_off40 + index).resize(GCElementWidth)
-        issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued){ _ =>
+        issueReq(io.Mreq, addr, True, U(8), writeValue, issued){ _ =>
           state := overall_state.states(15)
         }
       }
@@ -223,25 +226,16 @@ class GCAop extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(15)){
       val addr = old_node + U(8)
-      issueReq(io.Mreq, addr, True, getWstrb(8), par_scan_off30, issued){ _ =>
+      issueReq(io.Mreq, addr, True, U(8), par_scan_off30, issued){ _ =>
         state := overall_state.states(16)
       }
     }
 
     is(overall_state.states(16)){
       val addr = io.ConfigIO.ParScanThreadStatePtr + U"x30"
-      issueReq(io.Mreq, addr, True, getWstrb(8), old_node, issued) { _ =>
-        state := overall_state.states(17)
-      }
-    }
-
-    is(overall_state.states(17)){
-      when(par_scan_off38 === U(0)){
-        val addr = io.ConfigIO.ParScanThreadStatePtr + U"x38"
-        issueReq(io.Mreq, addr, True, getWstrb(8), old_node, issued) { _ =>
-          state := overall_state.states(3)
-        }
-      }.otherwise{
+      val writeValue = Cat(old_node, old_node).asUInt
+      val writeSize = Mux(par_scan_off38 === U(0), U(16), U(8))
+      issueReq(io.Mreq, addr, True, writeSize, writeValue, issued) { _ =>
         state := overall_state.states(3)
       }
     }

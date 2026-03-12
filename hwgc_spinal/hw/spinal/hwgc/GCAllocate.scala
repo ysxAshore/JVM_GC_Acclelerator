@@ -13,9 +13,10 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     val ConfigIO = slave(new GCAllocateConfigIO)
     val DebugTimeStamp = in UInt(64 bits)
   }
-
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
+  io.Mreq.RequestSize.valid := False
+  io.Mreq.RequestSize.payload.clearAll()
   io.Mreq.Response.ready := False
 
   io.ToAllocate.clearOut()
@@ -98,6 +99,17 @@ class GCAllocate extends Module with GCParameters with HWParameters {
   val region_ptr = RegInit(U(0, GCElementWidth bits))
   val alloc_region = RegInit(U(0, GCElementWidth bits))
 
+  val par_allocate_done = RegInit(False)
+  val attempt_allocate_done  = RegInit(False)
+
+  when(io.ToParAllocate.Done){
+    par_allocate_done := True
+  }
+
+  when(io.ToAttemptAllocate.Done){
+    attempt_allocate_done := True
+  }
+
   switch(state){
     is(overall_state.states(0)){
       io.ToAllocate.Ready := True
@@ -112,18 +124,18 @@ class GCAllocate extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(1)){
       val addr = io.ConfigIO.G1h + Mux(destAttrType === U(0), U"x250", U"x2e0") + U"x30"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
         temp_value := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(2)
       }
     }
 
     is(overall_state.states(2)){
-      plab_word_size := Min(Max(temp_value, U"x102"), U"x400")
+      plab_word_size := Min(Max(temp_value, U"x102"), U"x40000")
       required_in_plab := (size + U(2)).resize(GCElementWidth bits)
 
       val addr = io.ConfigIO.PlabAllocatorPtr + U(8)
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(24), U(0), issued) { rd =>
         allocator_ptr := rd(GCElementWidth - 1 downto 0)
         off_plab_allocator10 := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
         off_plab_allocator18 := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
@@ -135,7 +147,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
       val cond = required_in_plab * U(100) < plab_word_size * U(10)
       when(required_in_plab <= plab_word_size && cond){
         val addr = Mux(destAttrType === U(0), off_plab_allocator10, off_plab_allocator18)
-        issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
           buffer := rd(GCElementWidth - 1 downto 0)
           state := overall_state.states(4)
         }
@@ -146,7 +158,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(4)){
       val addr = buffer + U"x30"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(24), U(0), issued) { rd =>
         region_top := rd(GCElementWidth - 1 downto 0)
         region_end := rd(GCElementWidth * 3 - 1  downto GCElementWidth * 2)
         state := overall_state.states(5)
@@ -162,10 +174,10 @@ class GCAllocate extends Module with GCParameters with HWParameters {
         val writeOff8 = Mux(io.ConfigIO.UseCompressedKlassPointers, ((temp - io.ConfigIO.CompressedKlassPointerBase) >> io.ConfigIO.CompressedKlassPointerShift).resize(64 bits), temp)
         val writeLen = (words - headSize) * U(2)
         val writeValue = Mux(io.ConfigIO.UseCompressedKlassPointers, Cat(writeLen.resize(32 bits), writeOff8.resize(32 bits), writeOff0.resize(64 bits)).resize(MMUDataWidth), Cat(writeLen.resize(32 bits), writeOff8.resize(64 bits), writeOff0.resize(64 bits)).resize(MMUDataWidth)).asUInt
-        val writeMask = Mux(words >= headSize && io.ConfigIO.UseCompressedKlassPointers, getWstrb(16),
-                        Mux(words >= headSize, getWstrb(20),
-                        Mux(io.ConfigIO.UseCompressedKlassPointers, getWstrb(12), getWstrb(16))))
-        issueReq(io.Mreq, region_top, True, writeMask, writeValue, issued) { _ =>
+        val writeSize = Mux(words >= headSize && io.ConfigIO.UseCompressedKlassPointers, U(16),
+                        Mux(words >= headSize, U(20),
+                        Mux(io.ConfigIO.UseCompressedKlassPointers, U(12), U(16)))).resize(8 bits)
+        issueReq(io.Mreq, region_top, True, writeSize, writeValue, issued) { _ =>
           state := overall_state.states(6)
         }
       }.otherwise{
@@ -176,14 +188,14 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     is(overall_state.states(6)){
       val addr = buffer + U"x28"
       val writeValue = Cat(region_end, region_end, region_end).asUInt
-      issueReq(io.Mreq, addr, True, getWstrb(24), writeValue, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(24), writeValue, issued) { _ =>
         state := overall_state.states(7)
       }
     }
 
     is(overall_state.states(7)){
       val addr = buffer + U"x48"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(16), U(0), issued) { rd =>
         offset_buffer48 := rd(GCElementWidth - 1 downto 0)
         temp_value := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
         state := overall_state.states(8)
@@ -193,14 +205,14 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     is(overall_state.states(8)){
       val addr = buffer + U"x50"
       val writeValue = (temp_value + (region_end - region_top) / U(8)).resize(GCElementWidth bits)
-      issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
         state := overall_state.states(9)
       }
     }
 
     is(overall_state.states(9)){
       val addr = (io.ConfigIO.PlabAllocatorPtr + U"x30" + destAttrType * U(8)).resize(MMUAddrWidth bits)
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
         temp_value := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(10)
       }
@@ -209,7 +221,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     is(overall_state.states(10)){
       val addr = (io.ConfigIO.PlabAllocatorPtr + U"x30" + destAttrType * U(8)).resize(MMUAddrWidth bits)
       val writeValue = temp_value + U(1)
-      issueReq(io.Mreq, addr, True, getWstrb(8), writeValue, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
         sendToState13(False, required_in_plab, plab_word_size)
       }
     }
@@ -222,7 +234,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
         val off38 = (destObjPtr + (actualPlabSize - U(2)) * U(8)).resize(GCElementWidth bits)
         val writeValue = Cat(off38, off30, off28, off20).asUInt
         val addr = buffer + U"x20"
-        issueReq(io.Mreq, addr, True, getWstrb(32), writeValue, issued) { _ =>
+        issueReq(io.Mreq, addr, True, U(32), writeValue, issued) { _ =>
           state := overall_state.states(12)
         }
       }.otherwise{
@@ -235,7 +247,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
       val off48 = offset_buffer48 + actualPlabSize
       val writeValue = Cat(off48, off40).asUInt
       val addr = buffer + U"x40"
-      issueReq(io.Mreq, addr, True, getWstrb(16), writeValue, issued) { _ =>
+      issueReq(io.Mreq, addr, True, U(16), writeValue, issued) { _ =>
         resetState(Mux(actualPlabSize - U(2) < size, U(0), destObjPtr))
       }
     }
@@ -243,7 +255,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     is(overall_state.states(13)){
       when(destAttrType === U(0)){
         val addr = allocator_ptr + U"x28"
-        issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
           region_ptr := rd(GCElementWidth - 1 downto 0)
           state := overall_state.states(14)
         }
@@ -255,7 +267,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
 
     is(overall_state.states(14)){
       val addr = region_ptr + U(8)
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
         alloc_region := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(15)
       }
@@ -266,7 +278,8 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.states(16)){
-      when(io.ToParAllocate.Done){
+      when(io.ToParAllocate.Done || par_allocate_done){
+        par_allocate_done := False
         destObjPtr := io.ToParAllocate.DestObjPtr
         actualPlabSize := io.ToParAllocate.ActualPlabSize
         state := overall_state.states(17)
@@ -276,7 +289,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     is(overall_state.states(17)){
       when(destObjPtr === U(0)){
         val addr = allocator_ptr + U"x10"
-        issueReq(io.Mreq, addr, False, U(0), U(0), issued) { rd =>
+        issueReq(io.Mreq, addr, False, U(1), U(0), issued) { rd =>
           temp_value := rd(7 downto 0).resize(GCElementWidth bits)
           state := overall_state.states(18)
         }
@@ -290,7 +303,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
       when(is_full){
         resetDuringGCSelect()
       }.otherwise{
-        issueReq(io.Mreq, io.ConfigIO.LockPtr, True, getWstrb(8), io.ConfigIO.Thread, issued) { _ =>
+        issueReq(io.Mreq, io.ConfigIO.LockPtr, True, U(8), io.ConfigIO.Thread, issued) { _ =>
           state := overall_state.states(19)
         }
       }
@@ -301,7 +314,8 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.states(20)){
-      when(io.ToParAllocate.Done){
+      when(io.ToParAllocate.Done || par_allocate_done){
+        par_allocate_done := False
         destObjPtr := io.ToParAllocate.DestObjPtr
         actualPlabSize := io.ToParAllocate.ActualPlabSize
         state := overall_state.states(21)
@@ -324,7 +338,8 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.states(22)){
-      when(io.ToAttemptAllocate.Done){
+      when(io.ToAttemptAllocate.Done || attempt_allocate_done){
+        attempt_allocate_done := False
         destObjPtr := io.ToAttemptAllocate.DestObjPtr
         actualPlabSize := io.ToAttemptAllocate.ActualPlabSize
         state := overall_state.states(23)
@@ -334,7 +349,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     is(overall_state.states(23)){
       when(destObjPtr === U(0)) {
         val addr = Mux(destAttrType === U(0), allocator_ptr + U"x10", allocator_ptr + U"x11")
-        issueReq(io.Mreq, addr, True, getWstrb(1), U(1), issued) { _ =>
+        issueReq(io.Mreq, addr, True, U(1), U(1), issued) { _ =>
           state := overall_state.states(24)
         }
       }.otherwise{
@@ -343,7 +358,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.states(24)){
-      issueReq(io.Mreq, io.ConfigIO.LockPtr, True, getWstrb(8), U(0), issued) { _ =>
+      issueReq(io.Mreq, io.ConfigIO.LockPtr, True, U(8), U(0), issued) { _ =>
         resetDuringGCSelect()
       }
     }

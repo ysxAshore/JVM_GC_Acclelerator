@@ -8,9 +8,9 @@ import scala.language.postfixOps
 class GCOopProcess extends Module with HWParameters with GCParameters{
   val io = new Bundle{
     val Mreq = master(new LocalMMUIO)
-    val Process2Aop = master(new GCToAopParameters)
-    val Fetch2Process = slave(new GCFetch2ProcessUnit)
-    val Process2CopySurvivor = master(new GCProcess2Survivor)
+    val Process2Aop = master(new GCToAop)
+    val Fetch2Process = slave(new GCToProcessUnit)
+    val Process2CopySurvivor = master(new GCToSurvivor)
     val ConfigIO = slave(new GCOopProcessConfigIO)
     val DebugTimeStamp = in(UInt(64 bits))
   }
@@ -18,6 +18,8 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
   // default value
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
+  io.Mreq.RequestSize.valid := False
+  io.Mreq.RequestSize.payload.clearAll()
   io.Mreq.Response.ready := False
 
   io.Fetch2Process.clearOut()
@@ -40,6 +42,16 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
   val heap_region = RegInit(U(0, MMUAddrWidth bits))
   val access_regionAttr = RegInit(False)
   val region_attr = RegInit(U(0, 16 bits))
+
+  val aop_done = RegInit(False)
+  val copy2survivor_done = RegInit(False)
+
+  when(io.Process2Aop.Done){
+    aop_done := True
+  }
+  when(io.Process2CopySurvivor.Done){
+    copy2survivor_done := True
+  }
 
   def resetState(): Unit = {
     state := overall_state.s_idle
@@ -75,7 +87,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
       io.Process2CopySurvivor.MarkWord := markWord
       io.Process2CopySurvivor.KlassPtr := klassPtr
       io.Process2CopySurvivor.SrcOopPtr := srcOopPtr
-      io.Process2CopySurvivor.RegionAttrPtr := (io.ConfigIO.RegionAttrBiasedBase + (srcOopPtr >> io.ConfigIO.RegionAttrShiftBy) * GCHeapRegionAttr_Size).resize(GCElementWidth)
+      io.Process2CopySurvivor.RegionAttrPtr := (io.ConfigIO.RegionAttrBiasedBase + (srcOopPtr >> io.ConfigIO.RegionAttrShiftBy) * U(2)).resize(GCElementWidth)
 
       when(io.Process2CopySurvivor.Valid && io.Process2CopySurvivor.Ready){
         state := overall_state.s_waitDone1
@@ -84,7 +96,8 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
     }
 
     is(overall_state.s_waitDone1){
-      when(io.Process2CopySurvivor.Done){
+      when(io.Process2CopySurvivor.Done || copy2survivor_done){
+        copy2survivor_done := False
         destOopPtr := io.Process2CopySurvivor.DestOopPtr
         state := overall_state.s_writeTask
 
@@ -94,8 +107,8 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
 
     is(overall_state.s_writeTask){
       val writeObj = Mux(io.ConfigIO.UseCompressedOop, ((destOopPtr - io.ConfigIO.CompressedOopBase) >> io.ConfigIO.CompressedOopShift).resize(GCElementWidth), destOopPtr)
-      val writeMask = Mux(io.ConfigIO.UseCompressedOop, getWstrb(4), getWstrb(8))
-      issueReq(io.Mreq, task.resize(MMUAddrWidth), True, writeMask, writeObj, issued) { _ =>
+      val writeSize = Mux(io.ConfigIO.UseCompressedOop, U(4), U(8))
+      issueReq(io.Mreq, task.resize(MMUAddrWidth), True, writeSize, writeObj, issued) { _ =>
         when((task ^ destOopPtr) >> io.ConfigIO.LogOfHRGrainBytes === U(0)){
           resetState()
         }.otherwise{
@@ -105,8 +118,8 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
     }
 
     is(overall_state.s_readHR){
-      val addr = (io.ConfigIO.HeapRegionBiasedBase + (task >> io.ConfigIO.HeapRegionShiftBy) * U(GCObjectPtr_Size)).resize(MMUAddrWidth)
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
+      val addr = (io.ConfigIO.HeapRegionBiasedBase + (task >> io.ConfigIO.HeapRegionShiftBy) * U(8)).resize(MMUAddrWidth)
+      issueReq(io.Mreq, addr, False, U(8), U(0), issued){ rd =>
         heap_region := rd(GCElementWidth -1 downto 0)
         state := overall_state.s_readHRType
       }
@@ -114,7 +127,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
 
     is(overall_state.s_readHRType){
       val addr = heap_region + U"xbc"
-      issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
+      issueReq(io.Mreq, addr, False, U(4), U(0), issued){ rd =>
         when((rd(31 downto 0) & U(2, 32 bits)) === U(0)){
           state := overall_state.s_sendAop
         }.otherwise{
@@ -126,8 +139,8 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
 
     is(overall_state.s_sendAop){
       when(!access_regionAttr){
-        val addr = (io.ConfigIO.RegionAttrBiasedBase + (destOopPtr >> io.ConfigIO.RegionAttrShiftBy) * GCHeapRegionAttr_Size).resize(MMUAddrWidth)
-        issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
+        val addr = (io.ConfigIO.RegionAttrBiasedBase + (destOopPtr >> io.ConfigIO.RegionAttrShiftBy) * U(2)).resize(MMUAddrWidth)
+        issueReq(io.Mreq, addr, False, U(2), U(0), issued){ rd =>
           access_regionAttr := True
           region_attr := rd(15 downto 0)
         }
@@ -145,7 +158,8 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
     }
 
     is(overall_state.s_waitDone2){
-      when(io.Process2Aop.Done){
+      when(io.Process2Aop.Done || aop_done){
+        aop_done := False
         resetState()
         dbg(Seq("Received the aop done, the task has done"))
       }
