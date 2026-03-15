@@ -42,7 +42,7 @@ class GCTop extends Module with GCParameters with HWParameters {
   val RegionAttrBiasedBase = RegInit(U(0, GCElementWidth bits))
   val HeapRegionBiasedBase = RegInit(U(0, GCElementWidth bits))
   val ParScanThreadStatePtr = RegInit(U(0, GCElementWidth bits))
-  val TaskQueue_BottomAddr = RegInit(U(0, GCElementWidth bits))
+  val TaskQueue_Bottom = RegInit(U(0, 32 bits))
   val TaskQueue_ElemsBase = RegInit(U(0, GCElementWidth bits))
   val HumongousReclaimCandidatesBoolBase = RegInit(U(0, GCElementWidth bits))
   val CardTablePtr = RegInit(U(0, GCElementWidth bits))
@@ -61,7 +61,8 @@ class GCTop extends Module with GCParameters with HWParameters {
   DebugTimeStamp := DebugTimeStamp + U(1)
 
   io.ctrl2top.Ready := !task_valid
-  io.ctrl2top.Done := task_valid && gcTaskStack.io.ConfigIO.Done  // taskstack取完了 且 当前正在做的task也处理完成
+  io.ctrl2top.Done := task_valid && gcTaskStack.io.ConfigIO.Done
+  // taskstack取完了 且 当前正在做的task也处理完成
 
   when(io.ctrl2top.Done){
     task_valid := False
@@ -82,7 +83,7 @@ class GCTop extends Module with GCParameters with HWParameters {
     RegionAttrBiasedBase              := io.ctrl2top.RegionAttrBiasedBase
     HeapRegionBiasedBase              := io.ctrl2top.HeapRegionBiasedBase
     ParScanThreadStatePtr             := io.ctrl2top.ParScanThreadStatePtr
-    TaskQueue_BottomAddr              := io.ctrl2top.TaskQueue_BottomAddr
+    TaskQueue_Bottom                  := io.ctrl2top.TaskQueue_Bottom
     TaskQueue_ElemsBase               := io.ctrl2top.TaskQueue_ElemsBase
     HumongousReclaimCandidatesBoolBase:= io.ctrl2top.HumongousReclaimCandidatesBoolBase
     CardTablePtr                      := io.ctrl2top.CardTablePtr
@@ -102,7 +103,7 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcTaskStack.io.Pop <> gcFetch.io.Stack2Fetch
   gcTaskStack.io.Push <> gcTrace.io.Trace2Stack
   gcTaskStack.io.Mreq <> gcUnalignedMMUAdapter(0).io.in
-  gcTaskStack.io.ConfigIO.TaskQueue_BottomAddr := TaskQueue_BottomAddr
+  gcTaskStack.io.ConfigIO.TaskQueue_Bottom := TaskQueue_Bottom
   gcTaskStack.io.ConfigIO.TaskQueue_ElemsBase := TaskQueue_ElemsBase
   gcTaskStack.io.ConfigIO.TaskValid := task_valid
   gcTaskStack.io.DebugTimeStamp := DebugTimeStamp
@@ -111,10 +112,12 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcFetch.io.Mreq <> gcUnalignedMMUAdapter(1).io.in
   gcFetch.io.Fetch2OopProcess <> gcOopProcess.io.Fetch2Process
   gcFetch.io.Fetch2ArrayProcess <> gcArrayProcess.io.Fetch2Process
+  gcFetch.io.Trace2Fetch <> gcTrace.io.Trace2Fetch
   gcFetch.io.ConfigIO.UseCompressedOop := CompressedFlag(0)
   gcFetch.io.ConfigIO.CompressedOopBase := CompressedOopBase
   gcFetch.io.ConfigIO.CompressedOopShift := CompressedFlag(15 downto 8)
   gcFetch.io.DebugTimeStamp := DebugTimeStamp
+  gcFetch.io.CopyDone := gcCopy.io.ToCopy.Done
 
   // GCOopProcess (ToAop)
   gcOopProcess.io.Mreq <> gcUnalignedMMUAdapter(2).io.in

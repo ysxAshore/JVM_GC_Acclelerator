@@ -407,7 +407,7 @@ class GCToAop extends Bundle with GCParameters with IMasterSlave{
 }
 
 class GCTaskStackConfigIO extends Bundle with GCParameters with IMasterSlave{
-  val TaskQueue_BottomAddr = in UInt(GCElementWidth bits)
+  val TaskQueue_Bottom = in UInt(32 bits)
   val TaskQueue_ElemsBase = in UInt(GCElementWidth bits)
 
   val TaskValid = in Bool()
@@ -415,7 +415,7 @@ class GCTaskStackConfigIO extends Bundle with GCParameters with IMasterSlave{
   val Done = out Bool()
 
   override def asMaster(): Unit = {
-    out(TaskQueue_BottomAddr, TaskQueue_ElemsBase, TaskValid)
+    out(TaskQueue_Bottom, TaskQueue_ElemsBase, TaskValid)
     in(TaskReady, Done)
   }
 }
@@ -632,7 +632,7 @@ class Ctrl2Top extends Bundle with GCParameters with IMasterSlave {
   val RegionAttrBiasedBase = in UInt(GCElementWidth bits)
   val HeapRegionBiasedBase = in UInt(GCElementWidth bits)
   val ParScanThreadStatePtr = in UInt(GCElementWidth bits)
-  val TaskQueue_BottomAddr = in UInt(GCElementWidth bits)
+  val TaskQueue_Bottom    = in UInt(32 bits)
   val TaskQueue_ElemsBase = in UInt(GCElementWidth bits)
   val HumongousReclaimCandidatesBoolBase = in UInt(GCElementWidth bits)
   val CardTablePtr = in UInt(GCElementWidth bits)
@@ -652,7 +652,7 @@ class Ctrl2Top extends Bundle with GCParameters with IMasterSlave {
   val Done = out Bool()
 
   override def asMaster(): Unit = {
-    out(Valid, ChunkSize, AgeThreshold, HeapRegionBias, RegionAttrShiftBy, HeapRegionShiftBy, LogOfHRGrainBytes, StepperOffset, YoungWordsBase, RegionAttrBase, PlabAllocatorPtr, RegionAttrBiasedBase, HeapRegionBiasedBase, ParScanThreadStatePtr, TaskQueue_BottomAddr, TaskQueue_ElemsBase, HumongousReclaimCandidatesBoolBase, CardTablePtr, G1h, IntArrayKlassObj, ObjectKlass, LockPtr, Thread, DummyRegion, NumaPtr, CompressedOopBase, CompressedKlassPointerBase, CompressedFlag)
+    out(Valid, ChunkSize, AgeThreshold, HeapRegionBias, RegionAttrShiftBy, HeapRegionShiftBy, LogOfHRGrainBytes, StepperOffset, YoungWordsBase, RegionAttrBase, PlabAllocatorPtr, RegionAttrBiasedBase, HeapRegionBiasedBase, ParScanThreadStatePtr, TaskQueue_Bottom, TaskQueue_ElemsBase, HumongousReclaimCandidatesBoolBase, CardTablePtr, G1h, IntArrayKlassObj, ObjectKlass, LockPtr, Thread, DummyRegion, NumaPtr, CompressedOopBase, CompressedKlassPointerBase, CompressedFlag)
     in(Ready, Done)
   }
 }

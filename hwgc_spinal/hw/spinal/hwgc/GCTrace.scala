@@ -11,6 +11,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
     val ToAop = master(new GCToAop)
     val ToTrace = slave(new GCToTrace)
     val Trace2Stack = master Stream UInt(GCElementWidth bits)
+    val Trace2Fetch = master Stream UInt(GCElementWidth bits)
     val ConfigIO = slave(new GCTraceConfigIO)
     val DebugTimeStamp = in UInt(64 bits)
   }
@@ -23,24 +24,21 @@ class GCTrace extends Module with GCParameters with HWParameters{
   io.Mreq.Response.ready := False
 
   io.ToAop.clearIn()
+
   io.ToTrace.clearOut()
+
   io.Trace2Stack.valid := False
   io.Trace2Stack.payload.clearAll()
 
+  io.Trace2Fetch.valid := False
+  io.Trace2Fetch.payload.clearAll()
+
   // State Machine
   object overall_state extends SpinalEnum {
-    val states = Array.tabulate(17)(_ => newElement())
+    val states = Array.tabulate(18)(_ => newElement())
     for((state, i) <- states.zipWithIndex){
       state.setName(s"s$i")
     }
-  }
-
-  def dbg(msg: Seq[Any]): Unit =
-    if (DebugEnable) report(Seq("[GCTrace<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
-
-  def resetState(): Unit = {
-    io.ToTrace.Done := True
-    state := overall_state.states(0)
   }
 
   val state = RegInit(overall_state.states(0))
@@ -72,7 +70,35 @@ class GCTrace extends Module with GCParameters with HWParameters{
   val previousState = RegInit(overall_state.states(0))
   val for_counter = RegInit(U(0, 32 bits))
 
+  val pendingPushValid   = RegInit(False)
+  val pendingPushPayload = RegInit(U(0, GCElementWidth bits))
+
   val aop_done = RegInit(False)
+
+  def dbg(msg: Seq[Any]): Unit =
+    if (DebugEnable) report(Seq("[GCTrace<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
+
+  def resetState(): Unit = {
+    io.ToTrace.Done := True
+    state := overall_state.states(0)
+  }
+
+  def pushTask(task: UInt)(afterAccept: => Unit): Unit = {
+    when(!pendingPushValid) {
+      pendingPushValid := True
+      pendingPushPayload := task
+      afterAccept
+    }.otherwise {
+      io.Trace2Stack.valid := True
+      io.Trace2Stack.payload := pendingPushPayload
+      when(io.Trace2Stack.fire) {
+        pendingPushPayload := task
+        pendingPushValid := True
+        afterAccept
+      }
+    }
+  }
+
   when(io.ToAop.Done){
     aop_done := True
   }
@@ -127,13 +153,14 @@ class GCTrace extends Module with GCParameters with HWParameters{
     is(overall_state.states(2)){
       val cond = Mux(OopType === U(PartialArrayOop), for_counter < StepNCreate, ArrayLength > StepIndex)
       when(cond){
-        io.Trace2Stack.valid := True
-        io.Trace2Stack.payload := SrcOopPtr + U(2)
-        when(io.Trace2Stack.fire && OopType === U(PartialArrayOop)){
-          for_counter := for_counter + U(1)
-          state := overall_state.states(2)
-        }.elsewhen(io.Trace2Stack.fire){
-          state := overall_state.states(3)
+        val task = SrcOopPtr + U(2)
+        pushTask(task) {
+          when(OopType === U(PartialArrayOop)){
+            for_counter := for_counter + U(1)
+            state := overall_state.states(2)
+          }.otherwise{
+            state := overall_state.states(3)
+          }
         }
       }.otherwise{
         state := overall_state.states(3)
@@ -190,7 +217,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
         }
       }.elsewhen(Kid === U(InstanceRefKlassID)){
         when(for_counter === U(3)){
-          resetState()
+          state := overall_state.states(17)
         }.otherwise {
           val discovered_offset = Mux(io.ConfigIO.UseCompressedOops && io.ConfigIO.UseCompressedKlassPointers, U"x18", Mux(io.ConfigIO.UseCompressedOops, U"x1c", U"x28"))
           val referent_offset = Mux(io.ConfigIO.UseCompressedOops && io.ConfigIO.UseCompressedKlassPointers, U"xc", U"x10")
@@ -203,7 +230,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
           state := overall_state.states(9)
         }
       }.otherwise{
-        resetState()
+        state := overall_state.states(17)
       }
     }
 
@@ -216,7 +243,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
         previousState := overall_state.states(7)
         state := overall_state.states(9)
       }.otherwise{
-        resetState()
+        state := overall_state.states(17)
       }
     }
 
@@ -262,9 +289,8 @@ class GCTrace extends Module with GCParameters with HWParameters{
       val regionAttrType = regionAttr(15 downto 8).asSInt
       val cond = ((dest ^ heap_oop) >> io.ConfigIO.LogOfHRGrainBytes(5 downto 0)) =/= U(0)
       when(regionAttrType >= 0){
-        io.Trace2Stack.valid := True
-        io.Trace2Stack.payload := dest + Mux(io.ConfigIO.UseCompressedOops, U(1), U(0))
-        when(io.Trace2Stack.fire){
+        val task = dest + Mux(io.ConfigIO.UseCompressedOops, U(1), U(0))
+        pushTask(task) {
           state := previousState
         }
       }.elsewhen(cond){
@@ -325,6 +351,19 @@ class GCTrace extends Module with GCParameters with HWParameters{
       when(io.ToAop.Done || aop_done){
         aop_done := False
         state := previousState
+      }
+    }
+
+    is(overall_state.states(17)){
+      when(pendingPushValid){
+        io.Trace2Fetch.valid := True
+        io.Trace2Fetch.payload := pendingPushPayload
+        when(io.Trace2Fetch.fire){
+          pendingPushValid := False
+          resetState()
+        }
+      }.otherwise{
+        resetState()
       }
     }
   }
