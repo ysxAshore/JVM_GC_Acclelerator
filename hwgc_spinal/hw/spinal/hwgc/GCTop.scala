@@ -102,6 +102,7 @@ class GCTop extends Module with GCParameters with HWParameters {
   // GCTaskStack
   gcTaskStack.io.Pop <> gcFetch.io.Stack2Fetch
   gcTaskStack.io.Push <> gcTrace.io.Trace2Stack
+  gcTaskStack.io.PreFetch <> gcFetch.io.StackPreFetch
   gcTaskStack.io.Mreq <> gcUnalignedMMUAdapter(0).io.in
   gcTaskStack.io.ConfigIO.TaskQueue_Bottom := TaskQueue_Bottom
   gcTaskStack.io.ConfigIO.TaskQueue_ElemsBase := TaskQueue_ElemsBase
