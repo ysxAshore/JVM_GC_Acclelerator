@@ -103,6 +103,7 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcTaskStack.io.Pop <> gcFetch.io.Stack2Fetch
   gcTaskStack.io.Push <> gcTrace.io.Trace2Stack
   gcTaskStack.io.PreFetch <> gcFetch.io.StackPreFetch
+  gcTaskStack.io.LastPush := gcTrace.io.Trace2Fetch.fire
   gcTaskStack.io.Mreq <> gcUnalignedMMUAdapter(0).io.in
   gcTaskStack.io.ConfigIO.TaskQueue_Bottom := TaskQueue_Bottom
   gcTaskStack.io.ConfigIO.TaskQueue_ElemsBase := TaskQueue_ElemsBase
@@ -111,6 +112,7 @@ class GCTop extends Module with GCParameters with HWParameters {
 
   // GCFetch
   gcFetch.io.Mreq <> gcUnalignedMMUAdapter(1).io.in
+  gcFetch.io.pushCount := gcTaskStack.io.PushCount
   gcFetch.io.Fetch2OopProcess <> gcOopProcess.io.Fetch2Process
   gcFetch.io.Fetch2ArrayProcess <> gcArrayProcess.io.Fetch2Process
   gcFetch.io.Trace2Fetch <> gcTrace.io.Trace2Fetch

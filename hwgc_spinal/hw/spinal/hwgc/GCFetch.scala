@@ -22,6 +22,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
     val StackPreFetch = slave Stream UInt(GCElementWidth bits)
     val Trace2Fetch = slave Stream UInt(GCElementWidth bits)
 
+    val pushCount = in UInt(32 bits)
     val CopyDone = in Bool()
 
     val Fetch2ArrayProcess = master(new GCToProcessUnit)
@@ -100,7 +101,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
   val buffer_top = RegInit(U(0, PreFetchBufferWidth bits)) // top存
   val buffer_bottom = RegInit(U(0, PreFetchBufferWidth bits)) // bottom取
   val buffer_count = RegInit(U(0, PreFetchBufferWidth + 1 bits))
-  val buffer_free = U(PreFetchBufferWidth, PreFetchBufferWidth + 1 bits) - buffer_count
+  val buffer_free = U(PreFetchBuffer - 1, PreFetchBufferWidth + 1 bits) - buffer_count
 
   val targetDone = Mux(main_data.oopType === U(NotArrayOop), io.Fetch2OopProcess.Done, io.Fetch2ArrayProcess.Done)
   val copyDoneSeen = RegInit(False)
@@ -154,16 +155,48 @@ class GCFetch extends Module with HWParameters with GCParameters {
     }
   }
 
+  val hasSubCount = RegInit(U(0, 32 bits))
+
   switch(preFetch_state){
     is(overall_state.s_idle) {
-      io.StackPreFetch.ready := buffer_free =/= U(0)
-      when(io.StackPreFetch.valid && io.StackPreFetch.ready) {
-        buffer_ptr := buffer_top
-        buffer_top := buffer_top + 1
-        buffer_count := buffer_count + 1
-        preFetchBufferDone(buffer_top) := False
-        preFetch_state := overall_state.s_readOop
-        receiveTask(io.StackPreFetch.payload, preFetchBuffer(buffer_top))
+      when(io.pushCount === U(0) && hasSubCount === U(0)){
+        io.StackPreFetch.ready := buffer_free =/= U(0)
+        when(io.StackPreFetch.valid && io.StackPreFetch.ready) {
+          buffer_ptr := buffer_top
+          buffer_top := buffer_top + 1
+          buffer_count := buffer_count + 1
+          preFetchBufferDone(buffer_top) := False
+          preFetch_state := overall_state.s_readOop
+          receiveTask(io.StackPreFetch.payload, preFetchBuffer(buffer_top))
+        }
+      }.otherwise{
+        io.StackPreFetch.ready := True
+        when(io.StackPreFetch.fire) {
+          when(io.pushCount === U(0)) {
+            val idx = buffer_ptr + 1
+            buffer_count := buffer_count + 1
+            preFetchBufferDone(idx) := False
+            preFetch_state := overall_state.s_readOop
+            receiveTask(io.StackPreFetch.payload, preFetchBuffer(idx))
+            buffer_ptr := idx
+            hasSubCount := hasSubCount - 1
+          }.otherwise {
+            val idx = WrapDec(buffer_bottom, PreFetchBuffer, io.pushCount)
+            val push_count = Mux(io.pushCount > PreFetchBuffer - 1, U(PreFetchBuffer - 1), io.pushCount)
+            when(buffer_free >= push_count){
+              buffer_count := buffer_count + 1
+            }.otherwise{
+              buffer_top := WrapDec(buffer_top, PreFetchBuffer, push_count - buffer_free)
+              buffer_count := (buffer_count + buffer_free - push_count + 1).resized
+            }
+            preFetchBufferDone(idx) := False
+            preFetch_state := overall_state.s_readOop
+            receiveTask(io.StackPreFetch.payload, preFetchBuffer(idx))
+            buffer_ptr := idx
+            hasSubCount := push_count - 1
+            buffer_bottom := idx
+          }
+        }
       }
     }
 
@@ -177,14 +210,15 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
   switch(state){
     is(overall_state.s_idle){
-      io.Stack2Fetch.ready := push_state === overall_state.s_idle && !io.Trace2Fetch.valid && !waitPreFetch
+      io.Stack2Fetch.ready := push_state === overall_state.s_idle && !io.Trace2Fetch.valid && !waitPreFetch && hasSubCount === U(0)
 
       when(io.Stack2Fetch.fire){
         val payload = io.Stack2Fetch.payload
         when(preFetchBuffer(buffer_bottom).task === payload - payload(GCOopTagWidth - 1 downto 0)){
           when(preFetchBufferDone(buffer_bottom)){
-            main_data := preFetchBuffer(buffer_bottom)
-            state := overall_state.s_send
+            val data = preFetchBuffer(buffer_bottom)
+            main_data := data
+            state := Mux((data.markWord & U(3, GCElementWidth bits)) === U(3), overall_state.s_send, overall_state.s_readMW)
             buffer_count := buffer_count - 1
             buffer_bottom := buffer_bottom + 1
           }.otherwise{
@@ -198,8 +232,9 @@ class GCFetch extends Module with HWParameters with GCParameters {
       }
 
       when(waitPreFetch && preFetchBufferDone(buffer_bottom)){
-        main_data := preFetchBuffer(buffer_bottom)
-        state := overall_state.s_send
+        val data = preFetchBuffer(buffer_bottom)
+        main_data := data
+        state := Mux((data.markWord & U(3, GCElementWidth bits)) === U(3), overall_state.s_send, overall_state.s_readMW)
         buffer_count := buffer_count - 1
         buffer_bottom := buffer_bottom + 1
         waitPreFetch := False
@@ -238,28 +273,32 @@ class GCFetch extends Module with HWParameters with GCParameters {
   }
 
   when(!issued){
-    val data = Mux(wantMainReadOop || wantMainReadMW, main_data, Mux(wantPushReadOop || wantPushReadMW, push_data, preFetchBuffer(buffer_ptr)))
-    io.Mreq.Request.valid := !withoutPushReq || !withoutMainReq || wantPrefetchReadMW || wantPrefetchReadOop
-    io.Mreq.RequestSize.valid := !withoutPushReq || !withoutMainReq || wantPrefetchReadMW || wantPrefetchReadOop
+    val task = Mux(wantMainReadOop || wantMainReadMW, main_data.task, Mux(wantPushReadOop || wantPushReadMW, push_data.task, preFetchBuffer(buffer_ptr).task))
+    val fromObj = Mux(wantMainReadOop || wantMainReadMW, main_data.fromObj, Mux(wantPushReadOop || wantPushReadMW, push_data.fromObj, preFetchBuffer(buffer_ptr).fromObj))
+    io.Mreq.Request.valid := !withoutPushReq || !withoutMainReq || wantPrefetchReadOop || wantPrefetchReadMW
+    io.Mreq.RequestSize.valid := !withoutPushReq || !withoutMainReq || wantPrefetchReadOop || wantPrefetchReadMW
     io.Mreq.Request.payload.RequestWStrb := U(0)
     io.Mreq.Request.payload.RequestData := U(0)
     io.Mreq.Request.payload.RequestType_isWrite := False
     io.Mreq.Request.payload.RequestSourceID := io.Mreq.ConherentRequsetSourceID.payload
-    when(wantMainReadOop || wantPushReadOop || wantPrefetchReadOop){
-      io.Mreq.RequestSize.payload := U(8)
-      io.Mreq.Request.payload.RequestVirtualAddr := data.task
-    }.elsewhen(wantMainReadMW || wantPushReadMW || wantPrefetchReadMW){
+    when(wantMainReadMW || wantPushReadMW || wantPrefetchReadMW){
       io.Mreq.RequestSize.payload := U(16)
-      io.Mreq.Request.payload.RequestVirtualAddr := data.fromObj
+      io.Mreq.Request.payload.RequestVirtualAddr := fromObj
+    }.elsewhen(wantMainReadOop || wantPushReadOop || wantPrefetchReadOop){
+      io.Mreq.RequestSize.payload := U(8)
+      io.Mreq.Request.payload.RequestVirtualAddr := task
+    }
+
+    when(io.Mreq.Request.valid && !io.Mreq.Request.ready){
+      mreqOwner := Mux(wantMainReadMW, MreqOwner.mainReadMW,
+        Mux(wantPushReadMW, MreqOwner.pushReadMW,
+          Mux(wantPrefetchReadMW, MreqOwner.prefetchReadMW,
+            Mux(wantMainReadOop, MreqOwner.mainReadOop,
+              Mux(wantPushReadOop, MreqOwner.pushReadOop, MreqOwner.prefetchReadOop)))))
     }
 
     when(io.Mreq.Request.fire){
       issued := True
-      mreqOwner := Mux(wantMainReadOop, MreqOwner.mainReadOop,
-        Mux(wantPushReadOop, MreqOwner.pushReadOop,
-          Mux(wantMainReadMW, MreqOwner.mainReadMW,
-            Mux(wantPushReadMW, MreqOwner.pushReadMW,
-              Mux(wantPrefetchReadOop, MreqOwner.prefetchReadOop, MreqOwner.prefetchReadMW)))))
     }
   }
 
@@ -312,7 +351,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
           main_data.fromObj := preFetchBuffer(buffer_bottom).fromObj
           main_data.markWord := decodeMarkWord(rd)
           main_data.klassPtr := decodeKlassPtr(rd)
-          state := overall_state.s_send
+          state := Mux((decodeMarkWord(rd) & U(3, GCElementWidth bits)) === U(3), overall_state.s_send, overall_state.s_readMW)
           buffer_bottom := buffer_bottom + 1
           buffer_count := buffer_count - 1
         }.otherwise{

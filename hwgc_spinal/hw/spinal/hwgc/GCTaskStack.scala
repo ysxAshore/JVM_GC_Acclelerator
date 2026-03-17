@@ -14,10 +14,12 @@ import scala.language.postfixOps
 class GCTaskStack extends Module with GCParameters with HWParameters {
   val io = new Bundle {
     val Pop = master Stream UInt(GCElementWidth bits)
-    val PreFetch = master Stream UInt(GCElementWidth bits)
     val Push = slave Stream UInt(GCElementWidth bits)
+    val PreFetch = master Stream UInt(GCElementWidth bits)
     val Mreq = master(new LocalMMUIO)
     val ConfigIO = slave(new GCTaskStackConfigIO)
+    val LastPush = in Bool()
+    val PushCount = out UInt(32 bits)
     val DebugTimeStamp = in UInt(64 bits)
   }
 
@@ -77,6 +79,20 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   val need_spillOut = task_count >= U(GCTaskStack_SpillNeed + 4, task_count.getWidth bits)
   val need_readback = (task_count <= U(GCTaskStack_ReadNeed - 4, task_count.getWidth bits)) && (queue_bottom =/= U(0))
 
+  val push_count = RegInit(U(0, 32 bits))
+  val not_prefetch = RegInit(False)
+  when(io.Push.fire){
+    push_count := push_count + 1
+    not_prefetch := True
+  }
+  when(io.LastPush){
+    not_prefetch := False
+  }
+  when(io.PreFetch.fire){
+    push_count := U(0)
+  }
+  io.PushCount := push_count
+
   // 从 stack_top 往前找尚未预取的任务 生成所有候选位置
   val prefetchHit = Bool()
   val prefetchIdx = UInt(stackPtrWidth bits)
@@ -87,20 +103,20 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
 
   for(i <- 1 until GCTaskStack_Entry) {
     val idx = stkDec(stack_top, U(i, stackPtrWidth bits))
-    candidates(i-1) := (U(i, task_count.getWidth bits) < task_count) && !prefetched(idx)
+    candidates(i-1) := (U(i + 1, task_count.getWidth bits) < task_count) && !prefetched(idx)
     candidateIdxs(i-1) := idx
   }
 
   val firstValidOH = OHMasking.first(candidates.asBits)
 
-  prefetchHit := firstValidOH.orR
-  prefetchIdx := MuxOH(firstValidOH, candidateIdxs)
+  prefetchHit := Mux(push_count === U(0), firstValidOH.orR, True)
+  prefetchIdx := Mux(push_count === U(0), MuxOH(firstValidOH, candidateIdxs), stack_top)
   prefetchData := stack_data.readAsync(prefetchIdx)
 
   io.Pop.valid := state === overall_state.s_work && !task_empty
   io.Pop.payload := stack_data.readAsync(stack_top)
 
-  io.PreFetch.valid := state === overall_state.s_work && prefetchHit && !io.Push.valid
+  io.PreFetch.valid := state === overall_state.s_work && prefetchHit && !not_prefetch
   io.PreFetch.payload := prefetchData
 
   io.Push.ready := state === overall_state.s_work && task_free =/= U(0)
