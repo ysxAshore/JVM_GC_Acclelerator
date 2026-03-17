@@ -54,6 +54,7 @@ trait HWParameters {
   val MMUDataWidth = 256
 
   val LineBytesNum = MMUDataWidth / 8
+  val LineBytesNumBitSize = log2Up(LineBytesNum) + 1
 
   val LLCSourceMaxNum = 64
   val LLCSourceMaxNumBitSize = log2Up(LLCSourceMaxNum) + 1
@@ -67,13 +68,13 @@ trait HWParameters {
 
     when(!reqIssued) {
       port.RequestSize.valid := True
-      port.RequestSize.payload := Size.resize(8)
+      port.RequestSize.payload := Size.resize(LineBytesNumBitSize)
 
       port.Request.payload.RequestVirtualAddr := addr
       port.Request.payload.RequestSourceID := port.ConherentRequsetSourceID.payload
       port.Request.payload.RequestType_isWrite := Write
-      port.Request.payload.RequestWStrb := getWstrb(Size.resize(6))
-      port.Request.payload.RequestData := WriteData.resize(MMUDataWidth bits)
+      port.Request.payload.RequestWStrb := getWstrb(Size.resize(LineBytesNumBitSize))
+      port.Request.payload.RequestData := WriteData.resize(MMUDataWidth)
     }
 
     when(port.Request.fire) {
@@ -89,9 +90,30 @@ trait HWParameters {
   }
 
   def getWstrb(bytes: UInt): UInt = {
-    val mask = Bits(MMUDataWidth / 8 bits)
-    mask := Mux(bytes >= U(MMUDataWidth / 8), B(MMUDataWidth / 8 bits, default -> true), ((U(1) << bytes.resize(6 bits)) - U(1)).asBits.resize(MMUDataWidth / 8 bits))
+    val mask = Bits(LineBytesNum bits)
+    mask := Mux(bytes >= U(LineBytesNum), B(LineBytesNum bits, default -> true), ((U(1) << bytes.resize(LineBytesNumBitSize)) - U(1)).asBits.resize(LineBytesNum))
     mask.asUInt
+  }
+}
+
+class GCToFetch extends Bundle with GCParameters with IMasterSlave {
+  val Pop = Stream(UInt(GCElementWidth bits))
+  val PrePop = Stream(UInt(GCElementWidth bits))
+  val PushCount = UInt(32 bits)
+
+  override def asMaster(): Unit = {
+    master(Pop, PrePop)
+    out(PushCount)
+  }
+}
+
+class GCToStack extends Bundle with GCParameters with IMasterSlave {
+  val Push = Stream(UInt(GCElementWidth bits))
+  val LastPush = Bool()
+
+  override def asMaster(): Unit = {
+    master(Push)
+    out(LastPush)
   }
 }
 
@@ -564,11 +586,11 @@ class LocalMMUIO extends Bundle with HWParameters with IMasterSlave{
     val RequestVirtualAddr = UInt(MMUAddrWidth bits)
     val RequestType_isWrite = Bool()
     val RequestData = UInt(MMUDataWidth bits)
-    val RequestWStrb = UInt(MMUDataWidth / 8 bits)
+    val RequestWStrb = UInt(LineBytesNum bits)
   }
 
   // add variable to describe the request need or not need split two request
-  val RequestSize = master Flow UInt(8 bits)
+  val RequestSize = master Flow UInt(LineBytesNumBitSize bits)
 
   val ConherentRequsetSourceID    = slave Flow UInt(LLCSourceMaxNumBitSize bits)
 

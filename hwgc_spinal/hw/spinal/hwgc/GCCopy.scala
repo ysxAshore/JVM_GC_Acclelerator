@@ -87,7 +87,7 @@ class GCCopy extends Module with HWParameters with GCParameters {
   io.writeMReq.Request.payload.RequestWStrb := getWstrb(thisBeatWriteLen)
   io.writeMReq.Request.payload.RequestData := copyDataQueue(head)
   io.writeMReq.RequestSize.valid := True
-  io.writeMReq.RequestSize.payload := thisBeatWriteLen.resize(8)
+  io.writeMReq.RequestSize.payload := thisBeatWriteLen.resize(LineBytesNumBitSize)
   io.writeMReq.Response.ready := True
 
   // write always success

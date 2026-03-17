@@ -22,7 +22,7 @@ class GCUnalignedMMUAdapter extends Module with HWParameters with GCParameters {
   io.out.RequestSize.payload.clearAll()
   io.out.Response.ready := False
 
-  val size = RegInit(U(0, 8 bits))
+  val size = RegInit(U(0, LineBytesNumBitSize bits))
   val addr = RegInit(U(0, MMUAddrWidth bits))
   val isWrite = RegInit(False)
   val reqData = RegInit(U(0, MMUDataWidth bits))

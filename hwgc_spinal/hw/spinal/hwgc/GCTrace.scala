@@ -10,7 +10,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
     val Mreq = master(new LocalMMUIO)
     val ToAop = master(new GCToAop)
     val ToTrace = slave(new GCToTrace)
-    val Trace2Stack = master Stream UInt(GCElementWidth bits)
+    val ToStack = master(new GCToStack)
     val Trace2Fetch = master Stream UInt(GCElementWidth bits)
     val ConfigIO = slave(new GCTraceConfigIO)
     val DebugTimeStamp = in UInt(64 bits)
@@ -27,8 +27,9 @@ class GCTrace extends Module with GCParameters with HWParameters{
 
   io.ToTrace.clearOut()
 
-  io.Trace2Stack.valid := False
-  io.Trace2Stack.payload.clearAll()
+  io.ToStack.Push.valid := False
+  io.ToStack.Push.payload.clearAll()
+  io.ToStack.LastPush := io.Trace2Fetch.fire
 
   io.Trace2Fetch.valid := False
   io.Trace2Fetch.payload.clearAll()
@@ -89,9 +90,9 @@ class GCTrace extends Module with GCParameters with HWParameters{
       pendingPushPayload := task
       afterAccept
     }.otherwise {
-      io.Trace2Stack.valid := True
-      io.Trace2Stack.payload := pendingPushPayload
-      when(io.Trace2Stack.fire) {
+      io.ToStack.Push.valid := True
+      io.ToStack.Push.payload := pendingPushPayload
+      when(io.ToStack.Push.fire) {
         pendingPushPayload := task
         pendingPushValid := True
         afterAccept

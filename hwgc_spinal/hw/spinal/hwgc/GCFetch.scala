@@ -17,12 +17,9 @@ case class GcFetchData() extends Bundle with GCParameters {
 class GCFetch extends Module with HWParameters with GCParameters {
   val io = new Bundle{
     val Mreq = master(new LocalMMUIO)
-
-    val Stack2Fetch = slave Stream UInt(GCElementWidth bits)
-    val StackPreFetch = slave Stream UInt(GCElementWidth bits)
+    val toFetch = slave(new GCToFetch)
     val Trace2Fetch = slave Stream UInt(GCElementWidth bits)
 
-    val pushCount = in UInt(32 bits)
     val CopyDone = in Bool()
 
     val Fetch2ArrayProcess = master(new GCToProcessUnit)
@@ -38,8 +35,8 @@ class GCFetch extends Module with HWParameters with GCParameters {
   io.Mreq.RequestSize.valid := False
   io.Mreq.RequestSize.payload.clearAll()
 
-  io.Stack2Fetch.ready := False
-  io.StackPreFetch.ready := False
+  io.toFetch.Pop.ready := False
+  io.toFetch.PrePop.ready := False
   io.Trace2Fetch.ready := False
 
   io.Fetch2ArrayProcess.clearIn()
@@ -81,7 +78,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
     target.KlassPtr  := payload.klassPtr
   }
 
-  val PreFetchBuffer = 8
+  val PreFetchBuffer = 16
   val PreFetchBufferWidth = log2Up(PreFetchBuffer)
 
   val issued = RegInit(False)
@@ -159,30 +156,30 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
   switch(preFetch_state){
     is(overall_state.s_idle) {
-      when(io.pushCount === U(0) && hasSubCount === U(0)){
-        io.StackPreFetch.ready := buffer_free =/= U(0)
-        when(io.StackPreFetch.valid && io.StackPreFetch.ready) {
+      when(io.toFetch.PushCount === U(0) && hasSubCount === U(0)){
+        io.toFetch.PrePop.ready := buffer_free =/= U(0)
+        when(io.toFetch.PrePop.valid && io.toFetch.PrePop.ready) {
           buffer_ptr := buffer_top
           buffer_top := buffer_top + 1
           buffer_count := buffer_count + 1
           preFetchBufferDone(buffer_top) := False
           preFetch_state := overall_state.s_readOop
-          receiveTask(io.StackPreFetch.payload, preFetchBuffer(buffer_top))
+          receiveTask(io.toFetch.PrePop.payload, preFetchBuffer(buffer_top))
         }
       }.otherwise{
-        io.StackPreFetch.ready := True
-        when(io.StackPreFetch.fire) {
-          when(io.pushCount === U(0)) {
+        io.toFetch.PrePop.ready := True
+        when(io.toFetch.PrePop.fire) {
+          when(io.toFetch.PushCount === U(0)) {
             val idx = buffer_ptr + 1
             buffer_count := buffer_count + 1
             preFetchBufferDone(idx) := False
             preFetch_state := overall_state.s_readOop
-            receiveTask(io.StackPreFetch.payload, preFetchBuffer(idx))
+            receiveTask(io.toFetch.PrePop.payload, preFetchBuffer(idx))
             buffer_ptr := idx
             hasSubCount := hasSubCount - 1
           }.otherwise {
-            val idx = WrapDec(buffer_bottom, PreFetchBuffer, io.pushCount)
-            val push_count = Mux(io.pushCount > PreFetchBuffer - 1, U(PreFetchBuffer - 1), io.pushCount)
+            val idx = WrapDec(buffer_bottom, PreFetchBuffer, io.toFetch.PushCount)
+            val push_count = Mux(io.toFetch.PushCount > PreFetchBuffer - 1, U(PreFetchBuffer - 1), io.toFetch.PushCount)
             when(buffer_free >= push_count){
               buffer_count := buffer_count + 1
             }.otherwise{
@@ -191,7 +188,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
             }
             preFetchBufferDone(idx) := False
             preFetch_state := overall_state.s_readOop
-            receiveTask(io.StackPreFetch.payload, preFetchBuffer(idx))
+            receiveTask(io.toFetch.PrePop.payload, preFetchBuffer(idx))
             buffer_ptr := idx
             hasSubCount := push_count - 1
             buffer_bottom := idx
@@ -210,10 +207,10 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
   switch(state){
     is(overall_state.s_idle){
-      io.Stack2Fetch.ready := push_state === overall_state.s_idle && !io.Trace2Fetch.valid && !waitPreFetch && hasSubCount === U(0)
+      io.toFetch.Pop.ready := push_state === overall_state.s_idle && !io.Trace2Fetch.valid && !waitPreFetch && hasSubCount === U(0)
 
-      when(io.Stack2Fetch.fire){
-        val payload = io.Stack2Fetch.payload
+      when(io.toFetch.Pop.fire){
+        val payload = io.toFetch.Pop.payload
         when(preFetchBuffer(buffer_bottom).task === payload - payload(GCOopTagWidth - 1 downto 0)){
           when(preFetchBufferDone(buffer_bottom)){
             val data = preFetchBuffer(buffer_bottom)
