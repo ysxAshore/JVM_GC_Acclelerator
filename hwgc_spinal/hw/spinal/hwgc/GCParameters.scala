@@ -41,6 +41,11 @@ trait GCParameters {
   val TypeArrayKlassID = 4
   val ObjectArrayKlassID = 5
 
+  val PreFetchBuffer = 16
+  val PreFetchScanWindow = PreFetchBuffer
+  val PreFetchBufferWidth = log2Up(PreFetchBuffer)
+
+
   val GCTaskQueue_Size = 1 << 17
 
   val UINT_MAX = U(BigInt(2147483647L * 2 + 1), 32 bits)
@@ -128,10 +133,11 @@ class GCToProcessUnit extends Bundle with GCParameters with IMasterSlave {
   val SrcOopPtr = in UInt(GCElementWidth bits)
   val MarkWord = in UInt(GCElementWidth bits)
   val KlassPtr = in UInt(GCElementWidth bits)
+  val SrcLength = in UInt(32 bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done)
-    out(Valid, Task, OopType, SrcOopPtr, MarkWord, KlassPtr)
+    out(Valid, Task, OopType, SrcOopPtr, MarkWord, KlassPtr, SrcLength)
   }
 
   def clearIn(): Unit = {
@@ -141,6 +147,7 @@ class GCToProcessUnit extends Bundle with GCParameters with IMasterSlave {
     SrcOopPtr := U(0)
     MarkWord := U(0)
     KlassPtr := U(0)
+    SrcLength := U(0)
   }
 
   def clearOut(): Unit = {
@@ -159,11 +166,12 @@ class GCToSurvivor extends Bundle with GCParameters with IMasterSlave {
   val MarkWord = in UInt(GCElementWidth bits)
   val KlassPtr = in UInt(GCElementWidth bits)
   val SrcOopPtr = in UInt(GCElementWidth bits)
+  val SrcLength = in UInt(32 bits)
   val RegionAttrPtr = in UInt(GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done, DestOopPtr)
-    out(Valid, SrcOopPtr, MarkWord, KlassPtr, RegionAttrPtr)
+    out(Valid, SrcOopPtr, MarkWord, KlassPtr, RegionAttrPtr, SrcLength)
   }
 
   def clearIn(): Unit = {
@@ -171,6 +179,7 @@ class GCToSurvivor extends Bundle with GCParameters with IMasterSlave {
     MarkWord := U(0)
     KlassPtr := U(0)
     SrcOopPtr := U(0)
+    SrcLength := U(0)
     RegionAttrPtr := U(0)
   }
 
@@ -446,9 +455,10 @@ class GCFetchConfigIO extends Bundle with GCParameters with IMasterSlave{
   val UseCompressedOop = in Bool()
   val CompressedOopBase = in UInt(GCElementWidth bits)
   val CompressedOopShift = in UInt(8 bits)
+  val UseCompressedKlassPointers = in Bool()
 
   override def asMaster(): Unit = {
-    out(UseCompressedOop, CompressedOopBase, CompressedOopShift)
+    out(UseCompressedOop, CompressedOopBase, CompressedOopShift, UseCompressedKlassPointers)
     in()
   }
 }

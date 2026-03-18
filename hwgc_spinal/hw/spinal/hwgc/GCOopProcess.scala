@@ -38,6 +38,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
   val destOopPtr = RegInit(U(0, GCElementWidth bits))
   val markWord = RegInit(U(0, GCElementWidth bits))
   val klassPtr = RegInit(U(0, GCElementWidth bits))
+  val srcLength = RegInit(U(0, 32 bits))
 
   val heap_region = RegInit(U(0, MMUAddrWidth bits))
   val access_regionAttr = RegInit(False)
@@ -69,6 +70,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
         markWord := io.Fetch2Process.MarkWord
         klassPtr := io.Fetch2Process.KlassPtr
         srcOopPtr := io.Fetch2Process.SrcOopPtr
+        srcLength := io.Fetch2Process.SrcLength
 
         val doCopy2Survivor = (io.Fetch2Process.MarkWord & U(3, GCElementWidth bits)) =/= U(3, GCElementWidth bits)
         when(!doCopy2Survivor){
@@ -87,6 +89,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
       io.Process2CopySurvivor.MarkWord := markWord
       io.Process2CopySurvivor.KlassPtr := klassPtr
       io.Process2CopySurvivor.SrcOopPtr := srcOopPtr
+      io.Process2CopySurvivor.SrcLength := srcLength
       io.Process2CopySurvivor.RegionAttrPtr := (io.ConfigIO.RegionAttrBiasedBase + (srcOopPtr >> io.ConfigIO.RegionAttrShiftBy) * U(2)).resize(GCElementWidth)
 
       when(io.Process2CopySurvivor.Valid && io.Process2CopySurvivor.Ready){

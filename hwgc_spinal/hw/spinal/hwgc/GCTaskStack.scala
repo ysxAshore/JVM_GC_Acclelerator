@@ -94,15 +94,15 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   // 从 stack_top 往前找尚未预取的任务 生成所有候选位置
   val prefetchHit = Bool()
   val prefetchIdx = UInt(stackPtrWidth bits)
-  val prefetchData = cloneOf(stack_data.readAsync(stack_top))
+  val prefetchData = UInt(GCElementWidth bits)
 
-  val candidates = Vec(Bool(), GCTaskStack_Entry - 1)
-  val candidateIdxs = Vec(UInt(stackPtrWidth bits), GCTaskStack_Entry - 1)
+  val candidates = Vec(Bool(), PreFetchScanWindow)
+  val candidateIdxs = Vec(UInt(stackPtrWidth bits), PreFetchScanWindow)
 
-  for(i <- 1 until GCTaskStack_Entry) {
+  for(i <- 1 until PreFetchScanWindow + 1) {
     val idx = stkDec(stack_top, U(i, stackPtrWidth bits))
     // i + 1 -> stack_top is a useful item
-    candidates(i-1) := (U(i + 1, task_usage.getWidth bits) < task_usage) && !prefetched(idx)
+    candidates(i-1) := (U(i + 1, task_usage.getWidth bits) <= task_usage) && !prefetched(idx)
     candidateIdxs(i-1) := idx
   }
 
@@ -134,36 +134,28 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
     }
     when(io.toStack.Push.fire && !io.toFetch.Pop.fire) {
       stack_top := stk_nextTop
+      prefetched(stk_nextTop) := False
       stack_data.write(stk_nextTop, io.toStack.Push.payload)
       dbg(Seq("Push, index=", stk_nextTop, " data=", io.toStack.Push.payload))
     }.elsewhen(io.toFetch.Pop.fire && !io.toStack.Push.fire) {
       stack_top := stk_prevTop
-      prefetched(stack_top) := False
-      dbg(Seq("Pop, index=", stack_top, " data=", stack_data.readAsync(stack_top)))
+      dbg(Seq("Pop, index=", stack_top))
     }.elsewhen(io.toStack.Push.fire && io.toFetch.Pop.fire) {
-      stack_data.write(stack_top, io.toStack.Push.payload)
       prefetched(stack_top) := False
-      dbg(Seq("Push+Pop simultaneously, index=", stack_top, " pop=", stack_data.readAsync(stack_top), " push=", io.toStack.Push.payload))
+      stack_data.write(stack_top, io.toStack.Push.payload)
+      dbg(Seq("Push+Pop simultaneously, index=", stack_top, " push=", io.toStack.Push.payload))
     }
   }
 
   val spillOutArea = new Area {
     val issued = RegInit(False)
 
-    val sb1 = stkInc(stack_bottom, U(1))
-    val sb2 = stkInc(stack_bottom, U(2))
-    val sb3 = stkInc(stack_bottom, U(3))
-    val sb4 = stkInc(stack_bottom, U(4))
-
-    val e0 = stack_data.readAsync(sb1)
-    val e1 = stack_data.readAsync(sb2)
-    val e2 = stack_data.readAsync(sb3)
-    val e3 = stack_data.readAsync(sb4)
-
     def run(): Unit = {
       val reqNum = U(4, 4 bits)
       val addr = elemAddr(queue_bottom)
-      val packData = Cat(e3, e2, e1, e0).resize(MMUDataWidth bits).asUInt
+      val spillPtrs = Vec((0 until 4).map(i => stkInc(stack_bottom, U(i + 1))))
+      val spillData = Vec((0 until 4).map(i => stack_data.readAsync(spillPtrs(i))))
+      val packData  = Cat(spillData.reverse).asUInt
       issueReq(io.Mreq, addr, True, reqNum * U(8), packData, issued) { _ =>
         val newQueueBottom = queInc(queue_bottom, reqNum)
 
@@ -198,6 +190,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
             val writeElement = elems((reqNum - 1 - i).resized)
             val wrPtr  = stkDec(stack_bottom, U(i))
             stack_data.write(wrPtr, writeElement)
+            prefetched(wrPtr) := False
           }
         }
         stack_bottom := stkDec(stack_bottom, canReceive)
@@ -208,14 +201,12 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
     }
   }
 
-  val read_issued = RegInit(False)
   switch(state){
     is(overall_state.s_idle){
       for(i <- 0 until GCTaskStack_Entry) {
         prefetched(i) := False
       }
 
-      read_issued            := False
       spillOutArea.issued    := False
       readBackArea.issued    := False
 

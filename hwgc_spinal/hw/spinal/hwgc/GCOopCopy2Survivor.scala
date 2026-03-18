@@ -40,12 +40,12 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   val klassPtr = RegInit(U(0, GCElementWidth bits))
   val srcOopPtr = RegInit(U(0, GCElementWidth bits))
   val regionAttrPtr = RegInit(U(0, GCElementWidth bits))
+  val srcLength = RegInit(U(0, 32 bits))
 
   val destOopPtr = RegInit(U(0, GCElementWidth bits))
 
   val lh = RegInit(U(0, 32 bits))
   val kid = RegInit(U(0, 32 bits))
-  val array_length = RegInit(U(0, 32 bits))
   val size = RegInit(U(0, 32 bits))
   val src_region_attr = RegInit(U(0, 16 bits))
   val age = RegInit(U(0, 32 bits))
@@ -103,6 +103,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
         srcOopPtr := io.ToCopySurvivor.SrcOopPtr
         markWord := io.ToCopySurvivor.MarkWord
         klassPtr := io.ToCopySurvivor.KlassPtr
+        srcLength := io.ToCopySurvivor.SrcLength
         regionAttrPtr := io.ToCopySurvivor.RegionAttrPtr
 
         state := overall_state.states(1)
@@ -125,19 +126,8 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     is(overall_state.states(2)){
       when(lh.asSInt > S(0)){
         size := (lh >> U(3)).resize(32)
-        state := overall_state.states(3)
       }.otherwise{
-        val addr = srcOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointer, U(12), U(16))
-        issueReq(io.Mreq, addr, False, U(4), U(0), issued) { rd =>
-          array_length := rd(31 downto 0)
-          state := overall_state.states(3)
-        }
-      }
-    }
-
-    is(overall_state.states(3)){
-      when(lh.asSInt < S(0)){
-        val temp = ((array_length << lh(7 downto 0)) + lh(23 downto 16)).resize(32)
+        val temp = ((srcLength << lh(7 downto 0)) + lh(23 downto 16)).resize(32)
         size := Mux(temp(2 downto 0) =/= U(0), (temp >> U(3)) + U(1), temp >> U(3)).resize(32)
       }
       issueReq(io.Mreq, regionAttrPtr, False, U(2), U(0), issued){ rd =>
@@ -313,10 +303,10 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       io.ToTrace.DestOopPtr := destOopPtr
       io.ToTrace.Kid := kid
       io.ToTrace.ScanningInYoung := dest_region_attr(15 downto 8) === U(0, 8 bits)
-      io.ToTrace.ArrayLength := array_length
+      io.ToTrace.ArrayLength := srcLength
       io.ToTrace.PartialArrayStart := U(0)
-      io.ToTrace.StepIndex := (array_length % io.ConfigIO.ChunkSize).resize(32)
-      io.ToTrace.StepNCreate := Mux(array_length > (array_length % io.ConfigIO.ChunkSize), U(1), U(0)).resize(32)
+      io.ToTrace.StepIndex := (srcLength % io.ConfigIO.ChunkSize).resize(32)
+      io.ToTrace.StepNCreate := Mux(srcLength > (srcLength % io.ConfigIO.ChunkSize), U(1), U(0)).resize(32)
 
       val copyFire = io.ToCopy.Valid && io.ToCopy.Ready
       val traceFire = io.ToTrace.Valid && io.ToTrace.Ready

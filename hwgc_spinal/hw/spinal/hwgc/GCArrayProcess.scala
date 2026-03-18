@@ -25,7 +25,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
   io.Process2Trace.clearIn()
 
   object overall_state extends SpinalEnum {
-    val s_idle, s_readSrcLen, s_readDestLen, s_readHeapRegionPtr, s_readHeapRegionType, s_doTrace, s_waitDone = newElement()
+    val s_idle, s_readDestLen, s_readHeapRegionPtr, s_readHeapRegionType, s_doTrace, s_waitDone = newElement()
   }
 
   val state = RegInit(overall_state.s_idle)
@@ -35,8 +35,8 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
   val srcOopPtr = RegInit(U(0, GCElementWidth bits))
   val destOopPtr = RegInit(U(0, GCElementWidth bits))
   val markWord = RegInit(U(0, GCElementWidth bits))
+  val srcLength = RegInit(U(0, 32 bits))
 
-  val src_length = RegInit(U(0, 32 bits))
   val heap_region = RegInit(U(0, GCElementWidth bits))
   val scanning_in_young = RegInit(False)
   val step_index = RegInit(U(0, 32 bits))
@@ -60,18 +60,11 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
         srcOopPtr := io.Fetch2Process.SrcOopPtr
         markWord := io.Fetch2Process.MarkWord
         destOopPtr := io.Fetch2Process.MarkWord & ~U(3, GCElementWidth bits)
+        srcLength := io.Fetch2Process.SrcLength
 
-        state := overall_state.s_readSrcLen
+        state := overall_state.s_readDestLen
 
         dbg(Seq("Receive task from Fetch Module, the srcOopPtr is ", io.Fetch2Process.SrcOopPtr, ", the markWord is ", io.Fetch2Process.MarkWord))
-      }
-    }
-
-    is(overall_state.s_readSrcLen){
-      val addr = srcOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(12), U(16))
-      issueReq(io.Mreq, addr, False, U(4), U(0), issued) { rd =>
-        src_length := rd(31 downto 0)
-        state := overall_state.s_readDestLen
       }
     }
 
@@ -85,7 +78,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
 
     is(overall_state.s_readHeapRegionPtr){
       val task_num = (dest_length / io.ConfigIO.ChunkSize).resize(32)
-      val remaining_tasks = ((src_length - dest_length) / io.ConfigIO.ChunkSize).resize(32)
+      val remaining_tasks = ((srcLength - dest_length) / io.ConfigIO.ChunkSize).resize(32)
       val max_pending = ((io.ConfigIO.StepperOffset(63 downto 32) - U(1)) * task_num + U(1)).resize(32)
       val pending = max_pending.min(remaining_tasks).min(io.ConfigIO.StepperOffset(31 downto 0))
       step_ncreate := io.ConfigIO.StepperOffset(63 downto 32).min(remaining_tasks.min(io.ConfigIO.StepperOffset(31 downto 0) + U(1)) - pending).resize(32)
