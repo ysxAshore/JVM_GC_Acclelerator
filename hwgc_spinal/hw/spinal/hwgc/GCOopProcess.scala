@@ -47,11 +47,12 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
   val aop_done = RegInit(False)
   val copy2survivor_done = RegInit(False)
 
-  when(io.Process2Aop.Done){
+  when(io.Process2Aop.Done && state =/= overall_state.s_waitDone2){
     aop_done := True
   }
-  when(io.Process2CopySurvivor.Done){
+  when(io.Process2CopySurvivor.Done && state =/= overall_state.s_waitDone1){
     copy2survivor_done := True
+    destOopPtr := io.Process2CopySurvivor.DestOopPtr
   }
 
   def resetState(): Unit = {
@@ -101,7 +102,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
     is(overall_state.s_waitDone1){
       when(io.Process2CopySurvivor.Done || copy2survivor_done){
         copy2survivor_done := False
-        destOopPtr := io.Process2CopySurvivor.DestOopPtr
+        destOopPtr := Mux(copy2survivor_done, destOopPtr, io.Process2CopySurvivor.DestOopPtr)
         state := overall_state.s_writeTask
 
         dbg(Seq("The Copy2Survivor Module has done, and the destOopPtr is ", io.Process2CopySurvivor.DestOopPtr))
@@ -135,7 +136,6 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
           state := overall_state.s_sendAop
         }.otherwise{
           resetState()
-          dbg(Seq("The task has done"))
         }
       }
     }
@@ -156,7 +156,6 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
       when(io.Process2Aop.Valid && io.Process2Aop.Ready){
         state := overall_state.s_waitDone2
         access_regionAttr := False
-        dbg(Seq("Send the task to Aop"))
       }
     }
 
@@ -164,7 +163,6 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
       when(io.Process2Aop.Done || aop_done){
         aop_done := False
         resetState()
-        dbg(Seq("Received the aop done, the task has done"))
       }
     }
   }

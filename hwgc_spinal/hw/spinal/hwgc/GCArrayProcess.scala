@@ -25,7 +25,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
   io.Process2Trace.clearIn()
 
   object overall_state extends SpinalEnum {
-    val s_idle, s_readDestLen, s_readHeapRegionPtr, s_readHeapRegionType, s_doTrace, s_waitDone = newElement()
+    val s_idle, s_readDestLen, s_calInfo, s_readHeapRegionPtr, s_readHeapRegionType, s_doTrace, s_waitDone = newElement()
   }
 
   val state = RegInit(overall_state.s_idle)
@@ -43,9 +43,12 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
   val dest_length = RegInit(U(0, 32 bits))
   val step_ncreate = RegInit(U(0, 32 bits))
 
+  val task_limit = io.ConfigIO.StepperOffset(31 downto 0)
+  val task_fanout = io.ConfigIO.StepperOffset(63 downto 32)
+
   val trace_done = RegInit(False)
 
-  when(io.Process2Trace.Done){
+  when(io.Process2Trace.Done && state =/= overall_state.s_waitDone){
     trace_done := True
   }
 
@@ -72,18 +75,22 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
       val addr = destOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(12), U(16))
       issueReq(io.Mreq, addr, False, U(4), U(0), issued) { rd =>
         dest_length := rd(31 downto 0)
-        state := overall_state.s_readHeapRegionPtr
+        state := overall_state.s_calInfo
       }
     }
 
-    is(overall_state.s_readHeapRegionPtr){
+    is(overall_state.s_calInfo){
       val task_num = (dest_length / io.ConfigIO.ChunkSize).resize(32)
       val remaining_tasks = ((srcLength - dest_length) / io.ConfigIO.ChunkSize).resize(32)
-      val max_pending = ((io.ConfigIO.StepperOffset(63 downto 32) - U(1)) * task_num + U(1)).resize(32)
-      val pending = max_pending.min(remaining_tasks).min(io.ConfigIO.StepperOffset(31 downto 0))
-      step_ncreate := io.ConfigIO.StepperOffset(63 downto 32).min(remaining_tasks.min(io.ConfigIO.StepperOffset(31 downto 0) + U(1)) - pending).resize(32)
+      val max_pending = ((task_fanout - U(1)) * task_num + U(1)).resize(32)
+      val pending = max_pending.min(remaining_tasks).min(task_limit)
+      step_ncreate := task_fanout.min(remaining_tasks.min(task_fanout + U(1)) - pending).resize(32)
       step_index := dest_length + io.ConfigIO.ChunkSize
 
+      state := overall_state.s_readHeapRegionType
+    }
+
+    is(overall_state.s_readHeapRegionPtr){
       val addr = (io.ConfigIO.HeapRegionBiasedBase + (destOopPtr >> io.ConfigIO.HeapRegionShiftBy) * U(8)).resize(MMUAddrWidth)
       issueReq(io.Mreq, addr, False, U(8), U(0), issued){ rd =>
         heap_region := rd(GCElementWidth - 1 downto 0)

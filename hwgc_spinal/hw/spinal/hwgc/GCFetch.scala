@@ -117,7 +117,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
   when(io.CopyDone){
     copyDoneSeen := True
   }
-  when(targetDone){
+  when(targetDone && state =/= overall_state.s_waitDone){
     targetDoneSeen := True
   }
 
