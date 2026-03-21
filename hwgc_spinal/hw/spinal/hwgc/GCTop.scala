@@ -102,6 +102,7 @@ class GCTop extends Module with GCParameters with HWParameters {
   // GCTaskStack
   gcTaskStack.io.toFetch <> gcFetch.io.toFetch
   gcTaskStack.io.toStack <> gcTrace.io.ToStack
+  gcTaskStack.io.gcUpdatedRegion <> gcOopCopy2Survivor.io.ToStack
   gcTaskStack.io.Mreq <> gcUnalignedMMUAdapter(0).io.in
   gcTaskStack.io.ConfigIO.TaskQueue_Bottom := TaskQueue_Bottom
   gcTaskStack.io.ConfigIO.TaskQueue_ElemsBase := TaskQueue_ElemsBase
@@ -146,6 +147,7 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcOopCopy2Survivor.io.Mreq <> gcUnalignedMMUAdapter(4).io.in
   gcOopCopy2Survivor.io.ToCopy <> gcCopy.io.ToCopy
   gcOopCopy2Survivor.io.ToAllocate <> gcAllocate.io.ToAllocate
+  gcOopCopy2Survivor.io.TaskDone := io.ctrl2top.Done
   gcOopCopy2Survivor.io.ConfigIO.ChunkSize := ChunkSize
   gcOopCopy2Survivor.io.ConfigIO.AgeThreshold := AgeThreshold
   gcOopCopy2Survivor.io.ConfigIO.YoungWordsBase := YoungWordsBase

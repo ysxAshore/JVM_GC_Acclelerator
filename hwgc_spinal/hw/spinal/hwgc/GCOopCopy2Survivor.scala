@@ -2,6 +2,7 @@ package hwgc
 
 import spinal.core._
 import spinal.lib._
+
 import scala.language.postfixOps
 
 class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
@@ -9,8 +10,10 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     val Mreq = master(new LocalMMUIO)
     val ToCopy = master(new GCToCopy)
     val ToTrace = master(new GCToTrace)
+    val ToStack = master(new GCUpdatedRegion)
     val ToAllocate = master(new GCToAllocate)
     val ToCopySurvivor = slave(new GCToSurvivor)
+    val TaskDone = in(Bool())
     val ConfigIO = slave(new GCCopy2SurvivorConfigIO)
     val DebugTimeStamp = in(UInt(64 bits))
   }
@@ -28,7 +31,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   io.ToCopySurvivor.clearOut()
 
   object overall_state extends SpinalEnum {
-    val states = Array.tabulate(27)(_ => newElement())
+    val states = Array.tabulate(20)(_ => newElement())
     for((state, i) <- states.zipWithIndex){
       state.setName(s"s$i")
     }
@@ -38,16 +41,16 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
   val markWord = RegInit(U(0, GCElementWidth bits))
   val klassPtr = RegInit(U(0, GCElementWidth bits))
-  val srcOopPtr = RegInit(U(0, GCElementWidth bits))
-  val regionAttrPtr = RegInit(U(0, GCElementWidth bits))
   val srcLength = RegInit(U(0, 32 bits))
+  val srcOopPtr = RegInit(U(0, GCElementWidth bits))
+  val srcRegionAttr = RegInit(U(0, 16 bits))
+  val regionAttrPtr = RegInit(U(0, GCElementWidth bits))
 
   val destOopPtr = RegInit(U(0, GCElementWidth bits))
 
   val lh = RegInit(U(0, 32 bits))
   val kid = RegInit(U(0, 32 bits))
   val size = RegInit(U(0, 32 bits))
-  val src_region_attr = RegInit(U(0, 16 bits))
   val age = RegInit(U(0, 32 bits))
   val new_mark = RegInit(U(0, GCElementWidth bits))
   val dest_attr_ptr = RegInit(U(0, GCElementWidth bits))
@@ -56,11 +59,20 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   val buffer = RegInit(U(0, GCElementWidth bits))
   val region_top = RegInit(U(0, GCElementWidth bits))
   val region_end = RegInit(U(0, GCElementWidth bits))
-  val from_region = RegInit(U(0, GCElementWidth bits))
-  val young_index = RegInit(U(0, 32 bits))
   val temp_value = RegInit(U(0, GCElementWidth bits))
 
+  val destAttrRegionCached = RegInit(False)
+  val destAttrRegionCache = RegInit(U(0, 32 bits))
+
+  val plabCacheBufferValid = Vec(RegInit(False), 2)
+  val plabCacheBufferPtr = Vec(Reg(UInt(GCElementWidth bits)) init(0), 2)
+  val plabCacheValid = Vec(RegInit(False), 2) // 先按 2 类 region: survivor(0), old(1)
+  val plabCacheBuffer    = Vec(Reg(UInt(GCElementWidth bits)) init(0), 2)
+  val plabCacheTop       = Vec(Reg(UInt(GCElementWidth bits)) init(0), 2)
+  val plabCacheEnd       = Vec(Reg(UInt(GCElementWidth bits)) init(0), 2)
+
   val issued = RegInit(False)
+  val writeSrcOopPtr = RegInit(False)
   val issuedCopy = RegInit(False)
   val issuedTrace = RegInit(False)
   val copyDone = RegInit(False)
@@ -68,7 +80,23 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   val traceDone = RegInit(False)
   val allocateSelect = RegInit(False)
   val allocate_done = RegInit(False)
+  val waitWriteRegionTop = RegInit(False)
+  val waitAllocateFire = RegInit(False)
 
+  io.ToStack.Valid0 := plabCacheValid(0)
+  io.ToStack.Valid1 := plabCacheValid(1)
+  io.ToStack.Buffer0 := plabCacheBuffer(0)
+  io.ToStack.Buffer1 := plabCacheBuffer(1)
+  io.ToStack.RegionTop0 := plabCacheTop(0)
+  io.ToStack.RegionTop1 := plabCacheTop(1)
+
+  when(io.TaskDone){
+    destAttrRegionCached := False
+    plabCacheValid(0) := False
+    plabCacheValid(1) := False
+    plabCacheBufferValid(0) := False
+    plabCacheBufferValid(1) := False
+  }
   when(io.ToCopy.Done){
     copyDone := True
   }
@@ -85,14 +113,38 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   def dbg(msg: Seq[Any]): Unit =
     if (DebugEnable) report(Seq("[GCAop<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
 
-  def sendToAllocate(select: Bool): Unit = {
-    allocateSelect := select
-    io.ToAllocate.Valid := True
-    io.ToAllocate.Size := size
-    io.ToAllocate.DestAttrType := dest_region_attr(15 downto 8)
+  def allocateCache(select: Bool): Unit = {
+    val idx = Mux(select, U(1), dest_region_attr(15 downto 8).resize(1))
+    when(((plabCacheEnd(idx) - plabCacheTop(idx)) / U(8)) >= size){
+      destOopPtr := plabCacheTop(idx)
+      plabCacheTop(idx) := (plabCacheTop(idx) + size * U(8)).resize(GCElementWidth)
+      state := overall_state.states(8)
+    }.otherwise{
+      val addr = plabCacheBuffer(idx) + U"x30"
 
-    when(io.ToAllocate.Valid && io.ToAllocate.Ready){
-      state := overall_state.states(20)
+      when(!waitWriteRegionTop) {
+        issueReq(io.Mreq, addr, True, U(8), plabCacheTop(idx), issued) { _ =>
+          waitWriteRegionTop := True
+        }
+      }
+
+      allocateSelect := select
+      when(!waitAllocateFire) {
+        io.ToAllocate.Valid := True
+        io.ToAllocate.Size := size
+        io.ToAllocate.DestAttrType := dest_region_attr(15 downto 8)
+      }
+
+      when(io.ToAllocate.Valid && io.ToAllocate.Ready){
+        waitAllocateFire := True
+      }
+
+      when((io.ToAllocate.Valid && io.ToAllocate.Ready || waitAllocateFire) && (waitWriteRegionTop || io.Mreq.Response.fire)){
+        waitAllocateFire := False
+        waitWriteRegionTop := False
+        plabCacheValid(idx) := False
+        state := overall_state.states(13)
+      }
     }
   }
 
@@ -104,6 +156,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
         markWord := io.ToCopySurvivor.MarkWord
         klassPtr := io.ToCopySurvivor.KlassPtr
         srcLength := io.ToCopySurvivor.SrcLength
+        srcRegionAttr := io.ToCopySurvivor.SrcRegionAttr
         regionAttrPtr := io.ToCopySurvivor.RegionAttrPtr
 
         state := overall_state.states(1)
@@ -130,16 +183,9 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
         val temp = ((srcLength << lh(7 downto 0)) + lh(23 downto 16)).resize(32)
         size := Mux(temp(2 downto 0) =/= U(0), (temp >> U(3)) + U(1), temp >> U(3)).resize(32)
       }
-      issueReq(io.Mreq, regionAttrPtr, False, U(2), U(0), issued){ rd =>
-        src_region_attr := rd(15 downto 0)
-        state := overall_state.states(4)
-      }
-    }
 
-    is(overall_state.states(4)){
-      val region_attr_type = src_region_attr(15 downto 8)
-      val dest_attr_addr = (io.ConfigIO.ParScanThreadStatePtr + U"x178" + region_attr_type * U(2)).resize(GCElementWidth)
-      dest_attr_ptr := dest_attr_addr
+      val region_attr_type = srcRegionAttr(15 downto 8)
+      val dest_attr_addr = (io.ConfigIO.ParScanThreadStatePtr + U"x178").resize(GCElementWidth)
       age := U(0)
 
       when(region_attr_type === U(0)){
@@ -147,22 +193,30 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
           val addr = Mux(markWord(1), markWord ^ U(2, GCElementWidth bits), markWord)
           issueReq(io.Mreq, addr, False, U(8), U(0), issued){ rd =>
             new_mark := rd(GCElementWidth - 1 downto 0)
-            state := overall_state.states(5)
+            state := overall_state.states(3)
           }
         }.otherwise{
           age := ((markWord >> U(3)) & U(x"1111", GCElementWidth bits)).resize(32)
-          state := overall_state.states(5)
+          state := overall_state.states(3)
         }
       }.otherwise{
-        issueReq(io.Mreq, dest_attr_addr, False, U(2), U(0), issued) { rd =>
-          dest_region_attr := rd(15 downto 0)
-          state := overall_state.states(6)
+        dest_attr_ptr := dest_attr_addr + region_attr_type * 2
+        when(!destAttrRegionCached){
+          issueReq(io.Mreq, dest_attr_addr, False, U(2), U(0), issued) { rd =>
+            destAttrRegionCached := True
+            destAttrRegionCache := rd(31 downto 0)
+            dest_region_attr := Mux(region_attr_type === U(1), rd(31 downto 16), rd(15 downto 0))
+            state := overall_state.states(4)
+          }
+        }.otherwise{
+          dest_region_attr := Mux(region_attr_type === U(1), destAttrRegionCache(31 downto 16), destAttrRegionCache(15 downto 0))
+          state := overall_state.states(4)
         }
       }
     }
 
-    is(overall_state.states(5)){
-      val cond = src_region_attr(15 downto 8) === U(0) && !markWord(0)
+    is(overall_state.states(3)){
+      val cond = srcRegionAttr(15 downto 8) === U(0) && !markWord(0)
       val temp = Mux(cond, ((new_mark >> U(3)) & U(x"1111", GCElementWidth bits)).resize(32), age)
       when(cond){
         age := ((new_mark >> U(3)) & U(x"1111", GCElementWidth bits)).resize(32)
@@ -170,125 +224,67 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
       when(temp < io.ConfigIO.AgeThreshold){
         dest_attr_ptr := regionAttrPtr
-        dest_region_attr := src_region_attr
-        state := overall_state.states(6)
+        dest_region_attr := srcRegionAttr
+        state := overall_state.states(4)
       }.otherwise{
-        issueReq(io.Mreq, dest_attr_ptr, False, U(2), U(0), issued) { rd =>
-          dest_region_attr := rd(15 downto 0)
+        val dest_attr_addr = (io.ConfigIO.ParScanThreadStatePtr + U"x178").resize(GCElementWidth)
+        dest_attr_ptr := dest_attr_addr + srcRegionAttr(15 downto 8) * 2
+        when(!destAttrRegionCached){
+          issueReq(io.Mreq, dest_attr_addr, False, U(2), U(0), issued) { rd =>
+            destAttrRegionCached := True
+            destAttrRegionCache := rd(31 downto 0)
+            dest_region_attr := Mux(srcRegionAttr(15 downto 8) === U(1), rd(31 downto 16), rd(15 downto 0))
+            state := overall_state.states(4)
+          }
+        }.otherwise{
+          dest_region_attr := Mux(srcRegionAttr(15 downto 8) === U(1), destAttrRegionCache(31 downto 16), destAttrRegionCache(15 downto 0))
+          state := overall_state.states(4)
+        }
+      }
+    }
+
+    is(overall_state.states(4)){
+      val idx = dest_region_attr(15 downto 8).resize(1)
+      when(plabCacheValid(idx)){
+        allocateCache(False)
+      }.otherwise{
+        when(!plabCacheBufferValid(idx)){
+          val addr = (io.ConfigIO.PlabAllocatorPtr + U"x10" + idx * U(8)).resize(MMUAddrWidth)
+          issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
+            plabCacheBufferPtr(idx) := rd(GCElementWidth - 1 downto 0)
+            state := overall_state.states(5)
+          }
+        }.otherwise{
           state := overall_state.states(6)
         }
       }
     }
 
+    is(overall_state.states(5)){
+      val idx = dest_region_attr(15 downto 8).resize(1)
+      issueReq(io.Mreq, plabCacheBufferPtr(idx), False, U(8), U(0), issued) { rd =>
+        plabCacheBuffer(idx) := rd(GCElementWidth - 1 downto 0)
+        plabCacheBufferValid(idx) := True
+        state := overall_state.states(6)
+      }
+    }
+
     is(overall_state.states(6)){
-      val addr = (io.ConfigIO.HeapRegionBiasedBase + (srcOopPtr >> io.ConfigIO.HeapRegionShiftBy) * U(8)).resize(MMUAddrWidth)
-      issueReq(io.Mreq, addr, False, U(8), U(0), issued){ rd =>
-        from_region := rd(GCElementWidth - 1 downto 0)
+      val idx = dest_region_attr(15 downto 8).resize(1)
+      val addr = plabCacheBuffer(idx) + U"x30"
+      issueReq(io.Mreq, addr, False, U(16), U(0), issued) { rd =>
+        plabCacheTop(idx) := rd(GCElementWidth - 1 downto 0)
+        plabCacheEnd(idx) := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+        plabCacheValid(idx) := True
         state := overall_state.states(7)
       }
     }
 
     is(overall_state.states(7)){
-      val dest_attr_type = dest_region_attr(15 downto 8)
-      val addr = (io.ConfigIO.PlabAllocatorPtr + U"x10" + dest_attr_type * U(8)).resize(MMUAddrWidth)
-      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
-        buffer_ptr := rd(GCElementWidth - 1 downto 0)
-        state := overall_state.states(8)
-      }
+      allocateCache(False)
     }
 
     is(overall_state.states(8)){
-      issueReq(io.Mreq, buffer_ptr, False, U(8), U(0), issued) { rd =>
-        buffer := rd(GCElementWidth - 1 downto 0)
-        state := overall_state.states(9)
-      }
-    }
-
-    is(overall_state.states(9)){
-      val addr = (buffer + U"x30").resize(MMUAddrWidth)
-      issueReq(io.Mreq, addr, False, U(16), U(0), issued) { rd =>
-        region_top := rd(GCElementWidth - 1 downto 0)
-        region_end := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
-        state := overall_state.states(10)
-      }
-    }
-
-    is(overall_state.states(10)){
-      when((region_end - region_top) / U(8) >= size){
-        destOopPtr := region_top
-        val addr = buffer + U"x30"
-        val writeValue = (region_top + size * U(8)).resize(GCElementWidth)
-        issueReq(io.Mreq, addr, True, U(8), writeValue, issued){ _ =>
-          region_top := writeValue
-          state := overall_state.states(11)
-        }
-      }.otherwise{
-        sendToAllocate(False)
-      }
-    }
-
-    is(overall_state.states(11)){
-      val writeValue = Cat(destOopPtr(GCElementWidth - 1 downto 2), U(3, 2 bits)).resize(GCElementWidth).asUInt
-      issueReq(io.Mreq, srcOopPtr, True, U(8), writeValue, issued) { _ =>
-        state := overall_state.states(12)
-      }
-    }
-
-    is(overall_state.states(12)){
-      val addr = from_region + U(256)
-      issueReq(io.Mreq, addr, False, U(4), U(0), issued) { rd =>
-        young_index := rd(31 downto 0)
-        state := overall_state.states(13)
-      }
-    }
-
-    is(overall_state.states(13)){
-      val addr = (io.ConfigIO.YoungWordsBase + young_index * U(8)).resize(MMUAddrWidth)
-      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
-        temp_value := rd(GCElementWidth - 1 downto 0)
-        state := overall_state.states(14)
-      }
-    }
-
-    is(overall_state.states(14)){
-      val addr = (io.ConfigIO.YoungWordsBase + young_index * U(8)).resize(MMUAddrWidth)
-      val writeValue = (temp_value + size).resize(GCElementWidth)
-      issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
-        state := overall_state.states(15)
-      }
-    }
-
-    is(overall_state.states(15)){
-      val cond = dest_region_attr(15 downto 8) === U(0) && !markWord(0)
-      val temp = (markWord & ~(U"x1111" << 3).resize(GCElementWidth)) | ((Mux(age + U(1) < U(15), age + U(1), age) & U(x"1111", 32 bits)) << U(3)).resize(GCElementWidth)
-      val writeValue = Mux(cond, temp, markWord)
-      issueReq(io.Mreq, destOopPtr, True, U(8), writeValue, issued){ _ =>
-        state := overall_state.states(16)
-      }
-    }
-
-    is(overall_state.states(16)){
-      val cond = dest_region_attr(15 downto 8) === U(0) && !markWord(0)
-      when(cond){
-        val addr = Mux(markWord(1), markWord ^ U(2, GCElementWidth bits), markWord)
-        issueReq(io.Mreq, addr, False, U(8), U(0), issued){ rd =>
-          temp_value := rd(GCElementWidth - 1 downto 0)
-          state := overall_state.states(17)
-        }
-      }.otherwise{
-        state := overall_state.states(18)
-      }
-    }
-
-    is(overall_state.states(17)){
-      val addr = Mux(markWord(1), markWord ^ U(2, GCElementWidth bits), markWord)
-      val writeValue = (temp_value & ~(U"x1111" << 3).resize(GCElementWidth)) | ((Mux(age + U(1) < U(15), age + U(1), age) & U(x"1111", 32 bits)) << U(3)).resize(GCElementWidth)
-      issueReq(io.Mreq, addr, True, U(8), writeValue, issued){ _ =>
-        state := overall_state.states(18)
-      }
-    }
-
-    is(overall_state.states(18)){
       val needTrace = kid =/= U(TypeArrayKlassID, 32 bits)
 
       io.ToCopy.Valid := !issuedCopy
@@ -324,14 +320,52 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       val copyIssuedDone  = copyFire || issuedCopy
       val traceIssuedDone = traceFire || issuedTrace || !needTrace
 
-      when(copyIssuedDone && traceIssuedDone) {
+      when(!writeSrcOopPtr) {
+        val writeValue = Cat(destOopPtr(GCElementWidth - 1 downto 2), U(3, 2 bits)).resize(GCElementWidth).asUInt
+        issueReq(io.Mreq, srcOopPtr, True, U(8), writeValue, issued) { _ =>
+          writeSrcOopPtr := True
+        }
+      }
+
+      when(copyIssuedDone && traceIssuedDone && writeSrcOopPtr) {
         issuedCopy  := False
         issuedTrace := False
-        state := overall_state.states(19)
+        writeSrcOopPtr := False
+        state := overall_state.states(9)
       }
     }
 
-    is(overall_state.states(19)){
+    is(overall_state.states(9)){
+      val cond = dest_region_attr(15 downto 8) === U(0) && !markWord(0)
+      val temp = (markWord & ~(U"x1111" << 3).resize(GCElementWidth)) | ((Mux(age + U(1) < U(15), age + U(1), age) & U(x"1111", 32 bits)) << U(3)).resize(GCElementWidth)
+      val writeValue = Mux(cond, temp, markWord)
+      issueReq(io.Mreq, destOopPtr, True, U(8), writeValue, issued){ _ =>
+        state := overall_state.states(10)
+      }
+    }
+
+    is(overall_state.states(10)){
+      val cond = dest_region_attr(15 downto 8) === U(0) && !markWord(0)
+      when(cond){
+        val addr = Mux(markWord(1), markWord ^ U(2, GCElementWidth bits), markWord)
+        issueReq(io.Mreq, addr, False, U(8), U(0), issued){ rd =>
+          temp_value := rd(GCElementWidth - 1 downto 0)
+          state := overall_state.states(11)
+        }
+      }.otherwise{
+        state := overall_state.states(12)
+      }
+    }
+
+    is(overall_state.states(11)){
+      val addr = Mux(markWord(1), markWord ^ U(2, GCElementWidth bits), markWord)
+      val writeValue = (temp_value & ~(U"x1111" << 3).resize(GCElementWidth)) | ((Mux(age + U(1) < U(15), age + U(1), age) & U(x"1111", 32 bits)) << U(3)).resize(GCElementWidth)
+      issueReq(io.Mreq, addr, True, U(8), writeValue, issued){ _ =>
+        state := overall_state.states(12)
+      }
+    }
+
+    is(overall_state.states(12)){
       val needTrace = kid =/= U(TypeArrayKlassID, 32 bits)
       val copyFinished = copyDone || io.ToCopy.Done
       val traceFinished = traceDone || io.ToTrace.Done || !needTrace
@@ -347,62 +381,62 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       }
     }
 
-    is(overall_state.states(20)){
+    is(overall_state.states(13)){
       when(io.ToAllocate.Done || allocate_done){
         allocate_done := False
         destOopPtr := io.ToAllocate.DestObjPtr
-        state := Mux(allocateSelect, overall_state.states(25), overall_state.states(21))
+        state := Mux(allocateSelect, overall_state.states(18), overall_state.states(14))
       }
     }
 
-    is(overall_state.states(21)){
+    is(overall_state.states(14)){
       when(destOopPtr === U(0)){
-        val addr = io.ConfigIO.PlabAllocatorPtr + U"x18"
-        issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
-          buffer_ptr := rd(GCElementWidth - 1 downto 0)
-          state := overall_state.states(22)
+        when(plabCacheValid(1)){
+          allocateCache(True)
+        }.otherwise {
+          when(!plabCacheBufferValid(1)) {
+            val addr = (io.ConfigIO.PlabAllocatorPtr + U"x10" + U(8)).resize(MMUAddrWidth)
+            issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
+              plabCacheBufferPtr(1) := rd(GCElementWidth - 1 downto 0)
+              state := overall_state.states(15)
+            }
+          }.otherwise {
+            state := overall_state.states(16)
+          }
         }
       }.otherwise{
-        state := overall_state.states(11)
+        state := overall_state.states(8)
       }
     }
 
-    is(overall_state.states(22)){
-      issueReq(io.Mreq, buffer_ptr, False, U(8), U(0), issued) { rd =>
-        buffer := rd(GCElementWidth - 1 downto 0)
-        state := overall_state.states(23)
+    is(overall_state.states(15)){
+      issueReq(io.Mreq, plabCacheBufferPtr(1), False, U(8), U(0), issued) { rd =>
+        plabCacheBuffer(1) := rd(GCElementWidth - 1 downto 0)
+        plabCacheBufferValid(1) := True
+        state := overall_state.states(16)
       }
     }
 
-    is(overall_state.states(23)){
-      val addr = buffer + U"x30"
+    is(overall_state.states(16)){
+      val addr = plabCacheBuffer(1) + U"x30"
       issueReq(io.Mreq, addr, False, U(16), U(0), issued) { rd =>
-        region_top := rd(GCElementWidth - 1 downto 0)
-        region_end := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
         dest_region_attr := (dest_region_attr & U(x"ff", 16 bits)) | U(x"100", 16 bits)
+        plabCacheTop(1) := rd(GCElementWidth - 1 downto 0)
+        plabCacheEnd(1) := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+        plabCacheValid(1) := True
 
-        state := overall_state.states(24)
+        state := overall_state.states(17)
       }
     }
 
-    is(overall_state.states(24)){
-      when((region_end - region_top) / U(8) >= size){
-        destOopPtr := region_top
-        val addr = buffer + U"x30"
-        val writeValue = (region_top + size * U(8)).resize(GCElementWidth)
-        issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
-          region_top := writeValue
-          state := overall_state.states(25)
-        }
-      }.otherwise{
-        sendToAllocate(True)
-      }
+    is(overall_state.states(18)){
+      allocateCache(True)
     }
 
-    is(overall_state.states(25)){
+    is(overall_state.states(19)){
       val addr = dest_attr_ptr + U(1)
       issueReq(io.Mreq, addr, True, U(1), U(1), issued) { _ =>
-        state := overall_state.states(11)
+        state := overall_state.states(8)
       }
     }
   }

@@ -27,7 +27,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
   io.Process2Aop.clearIn()
 
   object overall_state extends SpinalEnum {
-    val s_idle, s_sendCopy2Survivor, s_waitDone1, s_writeTask, s_readHR, s_readHRType, s_sendAop, s_waitDone2 = newElement()
+    val s_idle, s_readSrcRegionAttr, s_sendCopy2Survivor, s_waitDone1, s_writeTask, s_readHR, s_readHRType, s_sendAop, s_waitDone2 = newElement()
   }
 
   val state = RegInit(overall_state.s_idle)
@@ -40,9 +40,10 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
   val klassPtr = RegInit(U(0, GCElementWidth bits))
   val srcLength = RegInit(U(0, 32 bits))
 
+  val src_region_attr = RegInit(U(0, 16 bits))
   val heap_region = RegInit(U(0, MMUAddrWidth bits))
   val access_regionAttr = RegInit(False)
-  val region_attr = RegInit(U(0, 16 bits))
+  val dest_region_attr = RegInit(U(0, 16 bits))
 
   val aop_done = RegInit(False)
   val copy2survivor_done = RegInit(False)
@@ -73,15 +74,28 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
         srcOopPtr := io.Fetch2Process.SrcOopPtr
         srcLength := io.Fetch2Process.SrcLength
 
-        val doCopy2Survivor = (io.Fetch2Process.MarkWord & U(3, GCElementWidth bits)) =/= U(3, GCElementWidth bits)
-        when(!doCopy2Survivor){
-          destOopPtr := io.Fetch2Process.MarkWord & ~U(3, GCElementWidth bits)
-          state := overall_state.s_writeTask
-        }.otherwise{
-          state := overall_state.s_sendCopy2Survivor
-        }
+        state := overall_state.s_readSrcRegionAttr
 
         dbg(Seq("Receive task from Fetch Module, the srcOopPtr is ", io.Fetch2Process.SrcOopPtr, ", the markWord is ", io.Fetch2Process.MarkWord, ", the klassPtr is ", io.Fetch2Process.KlassPtr))
+      }
+    }
+
+    is(overall_state.s_readSrcRegionAttr){
+      val addr = (io.ConfigIO.RegionAttrBiasedBase + (srcOopPtr >> io.ConfigIO.RegionAttrShiftBy) * U(2)).resize(GCElementWidth)
+      issueReq(io.Mreq, addr, False, U(2), U(0), issued){ rd =>
+        val src_region_attr_type = rd(15 downto 8).asSInt
+        src_region_attr := rd(15 downto 0)
+        when(src_region_attr_type < 0){
+          resetState()
+        }.otherwise{
+          val doCopy2Survivor = (markWord & U(3, GCElementWidth bits)) =/= U(3, GCElementWidth bits)
+          when(!doCopy2Survivor){
+            destOopPtr := markWord & ~U(3, GCElementWidth bits)
+            state := overall_state.s_writeTask
+          }.otherwise{
+            state := overall_state.s_sendCopy2Survivor
+          }
+        }
       }
     }
 
@@ -91,7 +105,8 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
       io.Process2CopySurvivor.KlassPtr := klassPtr
       io.Process2CopySurvivor.SrcOopPtr := srcOopPtr
       io.Process2CopySurvivor.SrcLength := srcLength
-      io.Process2CopySurvivor.RegionAttrPtr := (io.ConfigIO.RegionAttrBiasedBase + (srcOopPtr >> io.ConfigIO.RegionAttrShiftBy) * U(2)).resize(GCElementWidth)
+      io.Process2CopySurvivor.SrcRegionAttr := src_region_attr
+      io.Process2CopySurvivor.RegionAttrPtr :=  (io.ConfigIO.RegionAttrBiasedBase + (srcOopPtr >> io.ConfigIO.RegionAttrShiftBy) * U(2)).resize(GCElementWidth)
 
       when(io.Process2CopySurvivor.Valid && io.Process2CopySurvivor.Ready){
         state := overall_state.s_waitDone1
@@ -145,13 +160,13 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
         val addr = (io.ConfigIO.RegionAttrBiasedBase + (destOopPtr >> io.ConfigIO.RegionAttrShiftBy) * U(2)).resize(MMUAddrWidth)
         issueReq(io.Mreq, addr, False, U(2), U(0), issued){ rd =>
           access_regionAttr := True
-          region_attr := rd(15 downto 0)
+          dest_region_attr := rd(15 downto 0)
         }
       }
 
       io.Process2Aop.Valid := access_regionAttr
       io.Process2Aop.Task := task
-      io.Process2Aop.RegionAttr := region_attr
+      io.Process2Aop.RegionAttr := dest_region_attr
 
       when(io.Process2Aop.Valid && io.Process2Aop.Ready){
         state := overall_state.s_waitDone2

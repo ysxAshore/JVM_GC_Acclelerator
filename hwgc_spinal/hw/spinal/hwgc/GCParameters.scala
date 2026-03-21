@@ -167,11 +167,12 @@ class GCToSurvivor extends Bundle with GCParameters with IMasterSlave {
   val KlassPtr = in UInt(GCElementWidth bits)
   val SrcOopPtr = in UInt(GCElementWidth bits)
   val SrcLength = in UInt(32 bits)
+  val SrcRegionAttr = in UInt(16 bits)
   val RegionAttrPtr = in UInt(GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done, DestOopPtr)
-    out(Valid, SrcOopPtr, MarkWord, KlassPtr, RegionAttrPtr, SrcLength)
+    out(Valid, SrcOopPtr, MarkWord, KlassPtr, RegionAttrPtr, SrcLength, SrcRegionAttr)
   }
 
   def clearIn(): Unit = {
@@ -180,6 +181,7 @@ class GCToSurvivor extends Bundle with GCParameters with IMasterSlave {
     KlassPtr := U(0)
     SrcOopPtr := U(0)
     SrcLength := U(0)
+    SrcRegionAttr := U(0)
     RegionAttrPtr := U(0)
   }
 
@@ -187,6 +189,19 @@ class GCToSurvivor extends Bundle with GCParameters with IMasterSlave {
     Ready := False
     Done := False
     DestOopPtr := U(0)
+  }
+}
+
+class GCUpdatedRegion extends Bundle with GCParameters with IMasterSlave{
+  val Valid0 = in Bool()
+  val Valid1 = in Bool()
+  val Buffer0 = in UInt(GCElementWidth bits)
+  val Buffer1 = in UInt(GCElementWidth bits)
+  val RegionTop0 = in UInt(GCElementWidth bits)
+  val RegionTop1 = in UInt(GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    out(Valid0, Valid1, Buffer0, Buffer1, RegionTop0, RegionTop1)
   }
 }
 

@@ -15,6 +15,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   val io = new Bundle {
     val toFetch = master(new GCToFetch)
     val toStack = slave(new GCToStack)
+    val gcUpdatedRegion = slave(new GCUpdatedRegion)
     val Mreq = master(new LocalMMUIO)
     val ConfigIO = slave(new GCTaskStackConfigIO)
     val DebugTimeStamp = in UInt(64 bits)
@@ -50,7 +51,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   val prefetched = Vec.fill(GCTaskStack_Entry)(RegInit(False))
 
   object overall_state extends SpinalEnum {
-    val s_idle, s_work = newElement()
+    val s_idle, s_work, s_updatedRegionTop = newElement()
   }
   val state = RegInit(overall_state.s_idle)
 
@@ -146,6 +147,9 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
       dbg(Seq("Push+Pop simultaneously, index=", stack_top, " push=", io.toStack.Push.payload))
     }
   }
+  val main_issued = RegInit(False)
+  val upd0Done = RegInit(False)
+  val upd1Done = RegInit(False)
 
   val spillOutArea = new Area {
     val issued = RegInit(False)
@@ -226,8 +230,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
 
     is(overall_state.s_work){
       when(task_exhausted && io.toFetch.Pop.ready){
-        io.ConfigIO.Done := True
-        state := overall_state.s_idle
+        state := overall_state.s_updatedRegionTop
       }.otherwise{
         handlePushAndPop()
         when(need_spillOut){
@@ -235,6 +238,28 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
         }.elsewhen(need_readback){
           readBackArea.run()
         }
+      }
+    }
+
+    is(overall_state.s_updatedRegionTop){
+      val need_req0 = io.gcUpdatedRegion.Valid0
+      val need_req1 = io.gcUpdatedRegion.Valid1
+
+      when(need_req0 && !upd0Done){
+        issueReq(io.Mreq, io.gcUpdatedRegion.Buffer0, True, U(8), io.gcUpdatedRegion.RegionTop0, main_issued){ _ =>
+          upd0Done := True
+        }
+      }.elsewhen(need_req1 && !upd1Done){
+        issueReq(io.Mreq, io.gcUpdatedRegion.Buffer1, True, U(8), io.gcUpdatedRegion.RegionTop1, main_issued){ _ =>
+          upd1Done := True
+        }
+      }
+
+      when((!need_req0 || upd0Done) && (!need_req1 || upd1Done)){
+        upd0Done := False
+        upd1Done := False
+        io.ConfigIO.Done := True
+        state := overall_state.s_idle
       }
     }
   }
