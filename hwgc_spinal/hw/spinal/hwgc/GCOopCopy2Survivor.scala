@@ -77,7 +77,6 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   val issuedCopy = RegInit(False)
   val issuedTrace = RegInit(False)
   val copyDone = RegInit(False)
-  val copyFirstBeatDone = RegInit(False)
   val traceDone = RegInit(False)
 
   // alloc regs
@@ -104,9 +103,6 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   }
   when(io.ToTrace.Done){
     traceDone := True
-  }
-  when(io.ToCopy.firstBeatDone){
-    copyFirstBeatDone := True
   }
   when(io.ToAllocate.Done){
     allocateDone := True
@@ -287,13 +283,15 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
     is(overall_state.states(8)){
       val needTrace = kid =/= U(TypeArrayKlassID, 32 bits)
+      val totalSize = (size * U(8)).resize(size.getWidth)
+      val compressedSize = Mux(io.ConfigIO.UseCompressedKlassPointer, U(16), U(20))
 
       io.ToCopy.Valid := !issuedCopy
-      io.ToCopy.Size := size - U(1)
-      io.ToCopy.SrcOopPtr := srcOopPtr + U(8)
-      io.ToCopy.DestOopPtr := destOopPtr + U(8)
+      io.ToCopy.Size := Mux(kid === U(ObjectArrayKlassID, 32 bits), totalSize - compressedSize, totalSize - U(8))
+      io.ToCopy.SrcOopPtr := Mux(kid === U(ObjectArrayKlassID, 32 bits), srcOopPtr + compressedSize, srcOopPtr + U(8))
+      io.ToCopy.DestOopPtr := Mux(kid === U(ObjectArrayKlassID, 32 bits), destOopPtr + compressedSize, destOopPtr + U(8))
 
-      io.ToTrace.Valid := needTrace && !issuedTrace && (io.ToCopy.firstBeatDone || copyFirstBeatDone)
+      io.ToTrace.Valid := needTrace && !issuedTrace
       io.ToTrace.OopType := U(NotArrayOop)
       io.ToTrace.KlassPtr := klassPtr
       io.ToTrace.SrcOopPtr := srcOopPtr
@@ -374,7 +372,6 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       when(copyFinished && traceFinished){
         copyDone := False
         traceDone := False
-        copyFirstBeatDone := False
 
         io.ToCopySurvivor.Done := True
         io.ToCopySurvivor.DestOopPtr := destOopPtr

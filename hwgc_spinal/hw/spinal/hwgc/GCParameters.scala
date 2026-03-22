@@ -401,7 +401,6 @@ class GCToCopy extends Bundle with GCParameters with IMasterSlave {
   val Valid = in Bool()
   val Ready = out Bool()
   val Done = out Bool()
-  val firstBeatDone = out Bool()
 
   // some parse module calculate parameters
   val DestOopPtr = in UInt(GCElementWidth bits)
@@ -410,7 +409,7 @@ class GCToCopy extends Bundle with GCParameters with IMasterSlave {
 
   override def asMaster(): Unit = {
     out(Valid, SrcOopPtr, DestOopPtr, Size)
-    in(Ready, Done, firstBeatDone)
+    in(Ready, Done)
   }
 
   def clearIn(): Unit = {
