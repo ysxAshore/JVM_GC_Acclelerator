@@ -74,7 +74,80 @@ class GCTrace extends Module with GCParameters with HWParameters{
   val pendingPushValid   = RegInit(False)
   val pendingPushPayload = RegInit(U(0, GCElementWidth bits))
 
-  val aop_done = RegInit(False)
+  val KlassCacheEntries = 8
+
+  val klassCacheValid  = Vec(RegInit(False), KlassCacheEntries)
+  val klassCachePtr    = Vec(Reg(UInt(GCElementWidth bits)) init(0), KlassCacheEntries)
+  val klassCacheVtable = Vec(Reg(UInt(32 bits)) init(0), KlassCacheEntries)
+  val klassCacheStartMap  = Vec(Reg(UInt(GCElementWidth bits)) init(0), KlassCacheEntries)
+  val klassCacheEndMap  = Vec(Reg(UInt(GCElementWidth bits)) init(0), KlassCacheEntries)
+  val klassCacheAge    = Vec(Reg(UInt(3 bits)) init(0), KlassCacheEntries)   // 0 newest, 7 oldest
+
+  val klassCacheHit      = Bool()
+  val klassCacheHitIndex = UInt(log2Up(KlassCacheEntries) bits)
+  val klassCacheAllocIndex = UInt(log2Up(KlassCacheEntries) bits)
+
+  // miss 时临时保存从内存读出来的中间结果
+  val pendingCacheIndex  = RegInit(U(0, log2Up(KlassCacheEntries) bits))
+
+  val klassCacheHitVec = Vec(Bool(), KlassCacheEntries)
+  for(i <- 0 until KlassCacheEntries){
+    klassCacheHitVec(i) := klassCacheValid(i) && (klassCachePtr(i) === KlassPtr)
+  }
+
+  klassCacheHit := klassCacheHitVec.orR
+  klassCacheHitIndex := OHToUInt(klassCacheHitVec.asBits)
+
+  val klassCacheInvalidVec = Vec(Bool(), KlassCacheEntries)
+  for(i <- 0 until KlassCacheEntries){
+    klassCacheInvalidVec(i) := !klassCacheValid(i)
+  }
+
+  val hasInvalidEntry = klassCacheInvalidVec.orR
+  val firstInvalidIdx = OHToUInt(klassCacheInvalidVec.asBits)
+
+  // 选 age 最大的作为 LRU
+  val lruIdxStage = Vec(UInt(log2Up(KlassCacheEntries) bits), KlassCacheEntries)
+  val lruAgeStage = Vec(UInt(3 bits), KlassCacheEntries)
+
+  lruIdxStage(0) := U(0)
+  lruAgeStage(0) := klassCacheAge(0)
+
+  for(i <- 1 until KlassCacheEntries){
+    when(klassCacheAge(i) > lruAgeStage(i - 1)){
+      lruIdxStage(i) := U(i)
+      lruAgeStage(i) := klassCacheAge(i)
+    }.otherwise{
+      lruIdxStage(i) := lruIdxStage(i - 1)
+      lruAgeStage(i) := lruAgeStage(i - 1)
+    }
+  }
+
+  val lruIndex = lruIdxStage(KlassCacheEntries - 1)
+  klassCacheAllocIndex := Mux(hasInvalidEntry, firstInvalidIdx, lruIndex)
+
+  // hit: 只把原来比它更新的项 age + 1
+  def touchKlassCacheOnHit(idx: UInt): Unit = {
+    val oldAge = klassCacheAge(idx)
+    for(i <- 0 until KlassCacheEntries){
+      when(U(i) === idx){
+        klassCacheAge(i) := U(0)
+      }.elsewhen(klassCacheValid(i) && (klassCacheAge(i) < oldAge)){
+        klassCacheAge(i) := klassCacheAge(i) + U(1)
+      }
+    }
+  }
+
+  // fill 新项成为最新 其余项整体+1
+  def touchKlassCacheOnFill(idx: UInt): Unit = {
+    for(i <- 0 until KlassCacheEntries){
+      when(U(i) === idx){
+        klassCacheAge(i) := U(0)
+      }.elsewhen(klassCacheValid(i) && (klassCacheAge(i) =/= U(KlassCacheEntries - 1))){
+        klassCacheAge(i) := klassCacheAge(i) + U(1)
+      }
+    }
+  }
 
   def dbg(msg: Seq[Any]): Unit =
     if (DebugEnable) report(Seq("[GCTrace<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
@@ -98,10 +171,6 @@ class GCTrace extends Module with GCParameters with HWParameters{
         afterAccept
       }
     }
-  }
-
-  when(io.ToAop.Done){
-    aop_done := True
   }
 
   switch(state){
@@ -145,16 +214,31 @@ class GCTrace extends Module with GCParameters with HWParameters{
           state := overall_state.states(2)
         }
       }.otherwise{
-        val addr = KlassPtr + U(160)
-        issueReq(io.Mreq, addr, False, U(4), U(0), issued) { rd =>
-          vtable_len := rd(31 downto 0)
-          state := overall_state.states(4)
+        when(klassCacheHit){
+          vtable_len := klassCacheVtable(klassCacheHitIndex)
+          start_map := klassCacheStartMap(klassCacheHitIndex)
+          end_map := klassCacheEndMap(klassCacheHitIndex)
+
+          touchKlassCacheOnHit(klassCacheHitIndex)
+          state := overall_state.states(5)
+        }.otherwise {
+          pendingCacheIndex := klassCacheAllocIndex
+          val addr = KlassPtr + U(160)
+          issueReq(io.Mreq, addr, False, U(4), U(0), issued) { rd =>
+            vtable_len := rd(31 downto 0)
+            state := overall_state.states(4)
+          }
         }
       }
     }
 
     is(overall_state.states(2)){
       val cond = Mux(OopType === U(PartialArrayOop), for_counter < StepNCreate, ArrayLength > StepIndex)
+      val low = (DestOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(16), U(24)) + PartialArrayStart * Mux(io.ConfigIO.UseCompressedOops, U(4), U(8))).resize(GCElementWidth)
+      val high = (DestOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(16), U(24)) + StepIndex * Mux(io.ConfigIO.UseCompressedOops, U(4), U(8))).resize(GCElementWidth)
+      val temp_p = DestOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(16), U(24))
+      val temp_q = (temp_p + ArrayLength * Mux(io.ConfigIO.UseCompressedOops, U(4), U(8))).resize(GCElementWidth)
+
       when(cond){
         val task = SrcOopPtr + U(2)
         pushTask(task) {
@@ -162,31 +246,33 @@ class GCTrace extends Module with GCParameters with HWParameters{
             for_counter := for_counter + U(1)
             state := overall_state.states(2)
           }.otherwise{
-            state := overall_state.states(3)
+            p := Mux(temp_p < low, low, temp_p)
+            q := Mux(temp_q > high, high, temp_q)
+            state := overall_state.states(7)
           }
         }
       }.otherwise{
-        state := overall_state.states(3)
+        p := Mux(temp_p < low, low, temp_p)
+        q := Mux(temp_q > high, high, temp_q)
+        state := overall_state.states(7)
       }
-    }
-
-    is(overall_state.states(3)){
-      val low = (DestOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(16), U(24)) + PartialArrayStart * Mux(io.ConfigIO.UseCompressedOops, U(4), U(8))).resize(GCElementWidth)
-      val high = (DestOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(16), U(24)) + StepIndex * Mux(io.ConfigIO.UseCompressedOops, U(4), U(8))).resize(GCElementWidth)
-      val temp_p = DestOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(16), U(24))
-      val temp_q = (temp_p + ArrayLength * Mux(io.ConfigIO.UseCompressedOops, U(4), U(8))).resize(GCElementWidth)
-      p := Mux(temp_p < low, low, temp_p)
-      q := Mux(temp_q > high, high, temp_q)
-
-      // TRACE_PLUS -> done to end
-      state := overall_state.states(7)
     }
 
     is(overall_state.states(4)){
       val addr = KlassPtr + U(296)
       issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
-        start_map := (KlassPtr + U(464) + (vtable_len + rd(63 downto 32)) * U(8)).resize(GCElementWidth)
-        end_map := (KlassPtr + U(464) + (vtable_len + rd(63 downto 32) + rd(31 downto 0)) * U(8)).resize(GCElementWidth)
+        val new_startMap = (KlassPtr + U(464) + (vtable_len + rd(63 downto 32)) * U(8)).resize(GCElementWidth)
+        val new_endMap = (KlassPtr + U(464) + (vtable_len + rd(63 downto 32) + rd(31 downto 0)) * U(8)).resize(GCElementWidth)
+
+        klassCacheValid(pendingCacheIndex) := True
+        klassCachePtr(pendingCacheIndex) := KlassPtr
+        klassCacheVtable(pendingCacheIndex) := vtable_len
+        klassCacheStartMap(pendingCacheIndex) := new_startMap
+        klassCacheEndMap(pendingCacheIndex)   := new_endMap
+        touchKlassCacheOnFill(pendingCacheIndex)
+
+        start_map := new_startMap
+        end_map := new_endMap
         state := overall_state.states(5)
       }
     }
@@ -345,15 +431,8 @@ class GCTrace extends Module with GCParameters with HWParameters{
         io.ToAop.RegionAttr := regionAttr
 
         when(io.ToAop.Valid && io.ToAop.Ready){
-          state := overall_state.states(16)
+          state := previousState
         }
-      }
-    }
-
-    is(overall_state.states(16)){
-      when(io.ToAop.Done || aop_done){
-        aop_done := False
-        state := previousState
       }
     }
 

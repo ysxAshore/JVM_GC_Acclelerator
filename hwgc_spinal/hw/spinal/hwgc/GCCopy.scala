@@ -104,7 +104,7 @@ class GCCopy extends Module with HWParameters with GCParameters {
     head := WrapInc(head, GCCopyEntry, U(1))
   }
 
-  when(io.writeMReq.Response.fire){
+  when(io.writeMReq.Response.fire) {
     writeResRemainSize := Mux(writeResRemainSize >= BeatSize, writeResRemainSize - BeatSize, U(0))
   }
 
@@ -114,9 +114,6 @@ class GCCopy extends Module with HWParameters with GCParameters {
     }
     is(B"01"){
       queueCount := queueCount - 1
-    }
-    default{
-      queueCount := queueCount
     }
   }
 }
