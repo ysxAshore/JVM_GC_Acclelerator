@@ -103,6 +103,7 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcTaskStack.io.toFetch <> gcFetch.io.toFetch
   gcTaskStack.io.toStack <> gcTrace.io.ToStack
   gcTaskStack.io.gcUpdatedRegion <> gcOopCopy2Survivor.io.ToStack
+  gcTaskStack.io.gcUpdatedAop <> gcAop.io.ToStack
   gcTaskStack.io.Mreq <> gcUnalignedMMUAdapter(0).io.in
   gcTaskStack.io.ConfigIO.TaskQueue_Bottom := TaskQueue_Bottom
   gcTaskStack.io.ConfigIO.TaskQueue_ElemsBase := TaskQueue_ElemsBase
@@ -217,9 +218,11 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcTrace.io.ConfigIO.UseCompressedKlassPointers       := CompressedFlag(1)
   gcTrace.io.ConfigIO.HumongousReclaimCandidatesBoolBase := HumongousReclaimCandidatesBoolBase
   gcTrace.io.DebugTimeStamp := DebugTimeStamp
+  gcTrace.io.TaskDone := io.ctrl2top.Done
 
   // gcAop
   gcAop.io.Mreq <> gcUnalignedMMUAdapter(13).io.in
+  gcAop.io.TaskDone := io.ctrl2top.Done
   gcAop.io.ConfigIO.CardTablePtr := CardTablePtr
   gcAop.io.ConfigIO.ParScanThreadStatePtr := ParScanThreadStatePtr
   gcAop.io.DebugTimeStamp := DebugTimeStamp

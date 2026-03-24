@@ -205,6 +205,25 @@ class GCUpdatedRegion extends Bundle with GCParameters with IMasterSlave{
   }
 }
 
+class GCUpdatedAop extends Bundle with GCParameters with IMasterSlave{
+  val Valid0 = in Bool()
+  val Valid1 = in Bool()
+  val Valid2 = in Bool()
+  val Valid3 = in Bool()
+  val Addr0 = in UInt (GCElementWidth bits)
+  val Addr1 = in UInt(GCElementWidth bits)
+  val Addr2 = in UInt(GCElementWidth bits)
+  val Addr3 = in UInt(GCElementWidth bits)
+  val Data0 = in UInt(GCElementWidth bits)
+  val Data1 = in UInt(GCElementWidth * 3 bits)
+  val Data2 = in UInt(GCElementWidth * 2 bits)
+  val Data3 = in UInt(GCElementWidth * 4 bits)
+
+  override def asMaster(): Unit = {
+    out(Valid0, Valid1, Valid2, Valid3, Addr0, Addr1, Addr2, Addr3, Data0, Data1, Data2, Data3)
+  }
+}
+
 class GCToAllocate extends Bundle with GCParameters with IMasterSlave{
   val Valid = in Bool()
   val Ready = out Bool()

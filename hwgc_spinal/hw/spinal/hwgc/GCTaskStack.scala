@@ -16,6 +16,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
     val toFetch = master(new GCToFetch)
     val toStack = slave(new GCToStack)
     val gcUpdatedRegion = slave(new GCUpdatedRegion)
+    val gcUpdatedAop = slave(new GCUpdatedAop)
     val Mreq = master(new LocalMMUIO)
     val ConfigIO = slave(new GCTaskStackConfigIO)
     val DebugTimeStamp = in UInt(64 bits)
@@ -51,7 +52,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   val prefetched = Vec.fill(GCTaskStack_Entry)(RegInit(False))
 
   object overall_state extends SpinalEnum {
-    val s_idle, s_work, s_updatedRegionTop = newElement()
+    val s_idle, s_work, s_updateCacheAttr = newElement()
   }
   val state = RegInit(overall_state.s_idle)
 
@@ -147,9 +148,62 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
       dbg(Seq("Push+Pop simultaneously, index=", stack_top, " push=", io.toStack.Push.payload))
     }
   }
-  val main_issued = RegInit(False)
-  val upd0Done = RegInit(False)
-  val upd1Done = RegInit(False)
+
+  def generateUpdateMMU(idx: UInt): (Bool, UInt, UInt, UInt) = {
+    val valid = Bool()
+    val addr = UInt(GCElementWidth bits)
+    val size = UInt(LineBytesNumBitSize bits)
+    val data = UInt(MMUDataWidth bits)
+    switch(idx) {
+      is(U(0)) {
+        addr := io.gcUpdatedRegion.Buffer0
+        size := U(8)
+        data := io.gcUpdatedRegion.RegionTop0.resize(MMUDataWidth)
+        valid := io.gcUpdatedRegion.Valid0
+      }
+      is(U(1)) {
+        addr := io.gcUpdatedRegion.Buffer1
+        size := U(8)
+        data := io.gcUpdatedRegion.RegionTop1.resize(MMUDataWidth)
+        valid := io.gcUpdatedRegion.Valid1
+      }
+      is(U(2)) {
+        addr := io.gcUpdatedAop.Addr0
+        size := U(8)
+        data := io.gcUpdatedAop.Data0.resize(MMUDataWidth)
+        valid := io.gcUpdatedAop.Valid0
+      }
+      is(U(3)) {
+        addr := io.gcUpdatedAop.Addr1
+        size := U(24)
+        data := io.gcUpdatedAop.Data1.resize(MMUDataWidth)
+        valid := io.gcUpdatedAop.Valid1
+      }
+      is(U(4)) {
+        addr := io.gcUpdatedAop.Addr2
+        size := U(16)
+        data := io.gcUpdatedAop.Data2.resize(MMUDataWidth)
+        valid := io.gcUpdatedAop.Valid2
+      }
+      is(U(5)) {
+        addr := io.gcUpdatedAop.Addr3
+        size := U(32) - io.gcUpdatedAop.Addr3(4 downto 0)
+        data := io.gcUpdatedAop.Data3.resize(MMUDataWidth)
+        valid := io.gcUpdatedAop.Valid3
+      }
+      default {
+        addr := U(0)
+        size := U(0)
+        data := U(0)
+        valid := False
+      }
+    }
+    (valid, addr, size, data)
+  }
+
+  val reqIdx = RegInit(U(0, 3 bits))
+  val reqCnt = RegInit(U(0, 3 bits))
+  val resCnt = RegInit(U(0, 3 bits))
 
   val spillOutArea = new Area {
     val issued = RegInit(False)
@@ -230,7 +284,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
 
     is(overall_state.s_work){
       when(task_exhausted && io.toFetch.Pop.ready){
-        state := overall_state.s_updatedRegionTop
+        state := overall_state.s_updateCacheAttr
       }.otherwise{
         handlePushAndPop()
         when(need_spillOut){
@@ -241,25 +295,38 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
       }
     }
 
-    is(overall_state.s_updatedRegionTop){
-      val need_req0 = io.gcUpdatedRegion.Valid0
-      val need_req1 = io.gcUpdatedRegion.Valid1
+    is(overall_state.s_updateCacheAttr){
+      val (valid, addr, size, data) = generateUpdateMMU(reqIdx)
+      io.Mreq.Request.valid := valid
+      io.Mreq.Request.payload.RequestType_isWrite := True
+      io.Mreq.Request.payload.RequestVirtualAddr := addr
+      io.Mreq.Request.payload.RequestSourceID := io.Mreq.ConherentRequsetSourceID.payload
+      io.Mreq.Request.payload.RequestWStrb := getWstrb(size.resize(LineBytesNumBitSize))
+      io.Mreq.Request.payload.RequestData := data
+      io.Mreq.RequestSize.valid := valid
+      io.Mreq.RequestSize.payload := size
+      io.Mreq.Response.ready := True
 
-      when(need_req0 && !upd0Done){
-        issueReq(io.Mreq, io.gcUpdatedRegion.Buffer0, True, U(8), io.gcUpdatedRegion.RegionTop0, main_issued){ _ =>
-          upd0Done := True
-        }
-      }.elsewhen(need_req1 && !upd1Done){
-        issueReq(io.Mreq, io.gcUpdatedRegion.Buffer1, True, U(8), io.gcUpdatedRegion.RegionTop1, main_issued){ _ =>
-          upd1Done := True
+      when(io.Mreq.Request.fire){
+        reqCnt := reqCnt + 1
+      }
+
+      when(io.Mreq.Request.fire || !valid){
+        when(reqIdx < 6){
+          reqIdx := reqIdx + 1
         }
       }
 
-      when((!need_req0 || upd0Done) && (!need_req1 || upd1Done)){
-        upd0Done := False
-        upd1Done := False
-        io.ConfigIO.Done := True
+      when(io.Mreq.Response.fire){
+        resCnt := resCnt + 1
+      }
+
+      when(reqIdx === 6 && reqCnt === resCnt){
+        reqCnt := 0
+        resCnt := 0
+        reqIdx := 0
         state := overall_state.s_idle
+        io.ConfigIO.Done := True
       }
     }
   }
