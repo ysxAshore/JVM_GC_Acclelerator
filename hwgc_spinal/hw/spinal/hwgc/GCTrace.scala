@@ -122,16 +122,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
     humRegionHitVec(i) := humRegionCacheValid(i) && (humRegionCacheTag(i) === regionLookup)
   }
   val humRegionHit = humRegionHitVec.orR
-  val humRegionCacheInvalidVec = Vec(Bool(), humRegionCacheEntries)
-  for(i <- 0 until humRegionCacheEntries){
-    humRegionCacheInvalidVec(i) := !humRegionCacheValid(i)
-  }
-  val InvalidEntry = humRegionCacheInvalidVec.orR
-  val InvalidIdxOH = OHMasking.first(humRegionCacheInvalidVec.asBits)
-  val InvalidIdx = OHToUInt(InvalidIdxOH)
   val humRegionCacheReplacePtr = RegInit(U(0, log2Up(humRegionCacheEntries) bits))
-  val humRegionCacheAllocIndex = UInt(log2Up(humRegionCacheEntries) bits)
-  humRegionCacheAllocIndex := Mux(InvalidEntry, InvalidIdx, humRegionCacheReplacePtr)
 
   // some const value
   val oopStride = Mux(io.ConfigIO.UseCompressedOops, U(4), U(8))
