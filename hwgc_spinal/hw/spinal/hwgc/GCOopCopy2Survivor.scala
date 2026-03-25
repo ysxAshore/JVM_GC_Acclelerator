@@ -55,7 +55,6 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   val new_mark = RegInit(U(0, GCElementWidth bits))
   val dest_attr_ptr = RegInit(U(0, GCElementWidth bits))
   val dest_region_attr = RegInit(U(0, 16 bits))
-  val temp_value = RegInit(U(0, GCElementWidth bits))
 
   // dest attr regs
   val destAttrRegionValid = RegInit(False)
@@ -71,6 +70,41 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   val plabCacheEnd       = Vec(Reg(UInt(GCElementWidth bits)) init(0), 2)
   val plabCacheValid = Vec(RegInit(False), 2)
   val waitWriteRegionTop = RegInit(False)
+
+  // klass meta data cache
+  val KlassCacheEntries = 16
+  val klassCacheValid  = Vec(RegInit(False), KlassCacheEntries)
+  val klassCachePtr    = Vec(Reg(UInt(GCElementWidth bits)) init(0), KlassCacheEntries)
+  val klassCacheKidLh  = Vec(Reg(UInt(GCElementWidth bits)) init(0), KlassCacheEntries)
+
+  val klassCacheHit      = Bool()
+  val klassCacheHitIndex = UInt(log2Up(KlassCacheEntries) bits)
+  val klassCacheAllocIndex = UInt(log2Up(KlassCacheEntries) bits)
+
+  val compressedKlassPtr = (io.ConfigIO.CompressedKlassPointerBase + klassPtr(31 downto 0) << io.ConfigIO.CompressedKlassPointerShift).resize(GCElementWidth)
+  val lookupKlassPtr = Mux(io.ConfigIO.UseCompressedKlassPointer, compressedKlassPtr, klassPtr)
+
+  val klassCacheHitVec = Vec(Bool(), KlassCacheEntries)
+  for(i <- 0 until KlassCacheEntries){
+    klassCacheHitVec(i) := klassCacheValid(i) && (klassCachePtr(i) === lookupKlassPtr)
+  }
+
+  // Hit only -> can use OHToUInt
+  klassCacheHit := klassCacheHitVec.orR
+  klassCacheHitIndex := OHToUInt(klassCacheHitVec.asBits)
+
+  val klassCacheInvalidVec = Vec(Bool(), KlassCacheEntries)
+  for(i <- 0 until KlassCacheEntries){
+    klassCacheInvalidVec(i) := !klassCacheValid(i)
+  }
+
+  val hasInvalidEntry = klassCacheInvalidVec.orR
+  // invalid not only -> is disable to use OHToUInt -> use OHMasking.first
+  val firstInvalidIdxOH = OHMasking.first(klassCacheInvalidVec.asBits)
+  val firstInvalidIdx = OHToUInt(firstInvalidIdxOH)
+  val klassCacheReplacePtr = RegInit(U(0, log2Up(KlassCacheEntries) bits))
+  klassCacheAllocIndex := Mux(hasInvalidEntry, firstInvalidIdx, klassCacheReplacePtr)
+
 
   val issued = RegInit(False)
   val writeSrcOopPtr = RegInit(False)
@@ -185,14 +219,25 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
 
     is(overall_state.states(1)){
-      val compressedKlassPtr = (io.ConfigIO.CompressedKlassPointerBase + klassPtr(31 downto 0) << io.ConfigIO.CompressedKlassPointerShift).resize(GCElementWidth)
-      val new_klassPtr = Mux(io.ConfigIO.UseCompressedKlassPointer, compressedKlassPtr, klassPtr)
-      val addr = new_klassPtr + U(8)
-      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
-        klassPtr := new_klassPtr
-        lh := rd(31 downto 0)
-        kid := rd(63 downto 32)
+      when(klassCacheHit){
+        klassPtr := lookupKlassPtr
+        lh := klassCacheKidLh(klassCacheHitIndex)(31 downto 0)
+        kid := klassCacheKidLh(klassCacheHitIndex)(63 downto 32)
         state := overall_state.states(2)
+      }.otherwise {
+        val addr = lookupKlassPtr + U(8)
+        issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
+          klassPtr := lookupKlassPtr
+          lh := rd(31 downto 0)
+          kid := rd(63 downto 32)
+
+          klassCacheValid(klassCacheReplacePtr) := True
+          klassCachePtr(klassCacheReplacePtr) := lookupKlassPtr
+          klassCacheKidLh(klassCacheReplacePtr) := rd(63 downto 0)
+          klassCacheReplacePtr := klassCacheReplacePtr + 1
+
+          state := overall_state.states(2)
+        }
       }
     }
 
@@ -207,7 +252,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       plabForceOld := False
 
       val region_attr_type = srcRegionAttr(15 downto 8)
-      when(region_attr_type === U(0)){
+      when(region_attr_type === 0){
         when(!markWord(0)){
           val addr = Mux(markWord(1), markWord ^ U(2, GCElementWidth bits), markWord)
           issueReq(io.Mreq, addr, False, U(8), U(0), issued){ rd =>
@@ -335,7 +380,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
 
     is(overall_state.states(9)){
-      val cond = dest_region_attr(15 downto 8) === U(0) && !markWord(0)
+      val cond = dest_region_attr(15 downto 8) === U(0) && markWord(0)
       val temp = (markWord & ~(U"x1111" << 3).resize(GCElementWidth)) | ((Mux(age + U(1) < U(15), age + U(1), age) & U(x"1111", 32 bits)) << U(3)).resize(GCElementWidth)
       val writeValue = Mux(cond, temp, markWord)
       issueReq(io.Mreq, destOopPtr, True, U(8), writeValue, issued){ _ =>
@@ -346,10 +391,14 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     is(overall_state.states(10)){
       val cond = dest_region_attr(15 downto 8) === U(0) && !markWord(0)
       when(cond){
-        val addr = Mux(markWord(1), markWord ^ U(2, GCElementWidth bits), markWord)
-        issueReq(io.Mreq, addr, False, U(8), U(0), issued){ rd =>
-          temp_value := rd(GCElementWidth - 1 downto 0)
+        when(srcRegionAttr(15 downto 8) === 0){
           state := overall_state.states(11)
+        }.otherwise {
+          val addr = Mux(markWord(1), markWord ^ U(2, GCElementWidth bits), markWord)
+          issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
+            new_mark:= rd(GCElementWidth - 1 downto 0)
+            state := overall_state.states(11)
+          }
         }
       }.otherwise{
         state := overall_state.states(12)
@@ -358,7 +407,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
     is(overall_state.states(11)){
       val addr = Mux(markWord(1), markWord ^ U(2, GCElementWidth bits), markWord)
-      val writeValue = (temp_value & ~(U"x1111" << 3).resize(GCElementWidth)) | ((Mux(age + U(1) < U(15), age + U(1), age) & U(x"1111", 32 bits)) << U(3)).resize(GCElementWidth)
+      val writeValue = (new_mark & ~(U"x1111" << 3).resize(GCElementWidth)) | ((Mux(age + U(1) < U(15), age + U(1), age) & U(x"1111", 32 bits)) << U(3)).resize(GCElementWidth)
       issueReq(io.Mreq, addr, True, U(8), writeValue, issued){ _ =>
         state := overall_state.states(12)
       }

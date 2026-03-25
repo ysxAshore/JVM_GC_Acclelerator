@@ -87,9 +87,6 @@ class GCTrace extends Module with GCParameters with HWParameters{
   val klassCacheHitIndex = UInt(log2Up(KlassCacheEntries) bits)
   val klassCacheAllocIndex = UInt(log2Up(KlassCacheEntries) bits)
 
-  // miss 时临时保存从内存读出来的中间结果
-  val pendingCacheIndex  = RegInit(U(0, log2Up(KlassCacheEntries) bits))
-
   val klassCacheHitVec = Vec(Bool(), KlassCacheEntries)
   for(i <- 0 until KlassCacheEntries){
     klassCacheHitVec(i) := klassCacheValid(i) && (klassCachePtr(i) === KlassPtr)
@@ -98,18 +95,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
   // Hit only -> can use OHToUInt
   klassCacheHit := klassCacheHitVec.orR
   klassCacheHitIndex := OHToUInt(klassCacheHitVec.asBits)
-
-  val klassCacheInvalidVec = Vec(Bool(), KlassCacheEntries)
-  for(i <- 0 until KlassCacheEntries){
-    klassCacheInvalidVec(i) := !klassCacheValid(i)
-  }
-
-  val hasInvalidEntry = klassCacheInvalidVec.orR
-  // invalid not only -> is disable to use OHToUInt -> use OHMasking.first
-  val firstInvalidIdxOH = OHMasking.first(klassCacheInvalidVec.asBits)
-  val firstInvalidIdx = OHToUInt(firstInvalidIdxOH)
   val klassCacheReplacePtr = RegInit(U(0, log2Up(KlassCacheEntries) bits))
-  klassCacheAllocIndex := Mux(hasInvalidEntry, firstInvalidIdx, klassCacheReplacePtr)
 
   // region cache
   val humRegionCacheEntries = 8
@@ -123,6 +109,23 @@ class GCTrace extends Module with GCParameters with HWParameters{
   }
   val humRegionHit = humRegionHitVec.orR
   val humRegionCacheReplacePtr = RegInit(U(0, log2Up(humRegionCacheEntries) bits))
+
+  // region attr cache
+  val regionAttrCacheEntries = 8
+  val regionAttrCacheValid = Vec(RegInit(False), regionAttrCacheEntries)
+  val regionAttrCacheTag = Vec(RegInit(U(0, GCElementWidth bits)), regionAttrCacheEntries)
+  val regionAttrCache = Vec(RegInit(U(0, 16 bits)), regionAttrCacheEntries)
+  val compressed_oop = (io.ConfigIO.CompressedOopBase + (heap_oop << io.ConfigIO.CompressedOopShift)).resize(GCElementWidth)
+  val current_oop = Mux(io.ConfigIO.UseCompressedOops, compressed_oop, heap_oop)
+  val regionAttrAddrLookup = (io.ConfigIO.RegionAttrBiasedBase + (current_oop >> io.ConfigIO.RegionAttrShiftBy) * U(2)).resize(MMUAddrWidth)
+
+  val regionAttrHitVec = Vec(Bool(), regionAttrCacheEntries)
+  for(i <- 0 until regionAttrCacheEntries){
+    regionAttrHitVec(i) := regionAttrCacheValid(i) && (regionAttrCacheTag(i) === regionAttrAddrLookup)
+  }
+  val regionAttrHit = regionAttrHitVec.orR
+  val regionAttrHitIndex = OHToUInt(regionAttrHitVec.asBits)
+  val regionAttrCacheReplacePtr = RegInit(U(0, log2Up(regionAttrCacheEntries) bits))
 
   // some const value
   val oopStride = Mux(io.ConfigIO.UseCompressedOops, U(4), U(8))
@@ -159,6 +162,9 @@ class GCTrace extends Module with GCParameters with HWParameters{
     }
     for(i <- 0 until humRegionCacheEntries){
       humRegionCacheValid(i) := False
+    }
+    for(i <- 0 until regionAttrCacheEntries){
+      regionAttrCacheValid(i) := False
     }
   }
 
@@ -208,7 +214,6 @@ class GCTrace extends Module with GCParameters with HWParameters{
           end_map := klassCacheEndMap(klassCacheHitIndex)
           state := overall_state.states(4)
         }.otherwise {
-          pendingCacheIndex := klassCacheAllocIndex
           val addr = KlassPtr + U(160)
           issueReq(io.Mreq, addr, False, U(4), U(0), issued) { rd =>
             vtable_len := rd(31 downto 0)
@@ -250,15 +255,13 @@ class GCTrace extends Module with GCParameters with HWParameters{
         val new_startMap = (KlassPtr + U(464) + (vtable_len + rd(63 downto 32)) * U(8)).resize(GCElementWidth)
         val new_endMap = (KlassPtr + U(464) + (vtable_len + rd(63 downto 32) + rd(31 downto 0)) * U(8)).resize(GCElementWidth)
 
-        klassCacheValid(pendingCacheIndex) := True
-        klassCachePtr(pendingCacheIndex) := KlassPtr
-        klassCacheVtable(pendingCacheIndex) := vtable_len
-        klassCacheStartMap(pendingCacheIndex) := new_startMap
-        klassCacheEndMap(pendingCacheIndex)   := new_endMap
+        klassCacheValid(klassCacheReplacePtr) := True
+        klassCachePtr(klassCacheReplacePtr) := KlassPtr
+        klassCacheVtable(klassCacheReplacePtr) := vtable_len
+        klassCacheStartMap(klassCacheReplacePtr) := new_startMap
+        klassCacheEndMap(klassCacheReplacePtr)   := new_endMap
 
-        when(!hasInvalidEntry){
-          klassCacheReplacePtr := klassCacheReplacePtr + 1
-        }
+        klassCacheReplacePtr := klassCacheReplacePtr + 1
 
         start_map := new_startMap
         end_map := new_endMap
@@ -351,14 +354,22 @@ class GCTrace extends Module with GCParameters with HWParameters{
       when(heap_oop === U(0)){
         state := previousState
       }.otherwise{
-        val compressed_oop = (io.ConfigIO.CompressedOopBase + (heap_oop << io.ConfigIO.CompressedOopShift)).resize(GCElementWidth)
-        val current_oop = Mux(io.ConfigIO.UseCompressedOops, compressed_oop, heap_oop)
-        val addr = (io.ConfigIO.RegionAttrBiasedBase + (current_oop >> io.ConfigIO.RegionAttrShiftBy) * U(2)).resize(MMUAddrWidth)
-
-        issueReq(io.Mreq, addr, False, U(2), U(0), issued) { rd =>
-          regionAttr := rd(15 downto 0)
+        when(regionAttrHit){
+          regionAttr := regionAttrCache(regionAttrHitIndex)
           heap_oop := current_oop
           state := overall_state.states(10)
+        }.otherwise {
+          issueReq(io.Mreq, regionAttrAddrLookup, False, U(2), U(0), issued) { rd =>
+            regionAttr := rd(15 downto 0)
+            heap_oop := current_oop
+
+            regionAttrCacheValid(regionAttrCacheReplacePtr) := True
+            regionAttrCacheTag(regionAttrCacheReplacePtr) := regionAttrAddrLookup
+            regionAttrCache(regionAttrCacheReplacePtr) := rd(15 downto 0)
+            regionAttrCacheReplacePtr := regionAttrCacheReplacePtr + 1
+
+            state := overall_state.states(10)
+          }
         }
       }
     }

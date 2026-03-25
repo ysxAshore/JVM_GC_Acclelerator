@@ -13,6 +13,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     val ConfigIO = slave(new GCAllocateConfigIO)
     val DebugTimeStamp = in UInt(64 bits)
   }
+
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
   io.Mreq.RequestSize.valid := False
@@ -123,6 +124,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     }
 
     is(overall_state.states(1)){
+      // can do cache
       val addr = io.ConfigIO.G1h + Mux(destAttrType === U(0), U"x250", U"x2e0") + U"x30"
       issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
         temp_value := rd(GCElementWidth - 1 downto 0)
@@ -205,22 +207,6 @@ class GCAllocate extends Module with GCParameters with HWParameters {
     is(overall_state.states(8)){
       val addr = buffer + U"x50"
       val writeValue = (temp_value + (region_end - region_top) / U(8)).resize(GCElementWidth bits)
-      issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
-        state := overall_state.states(9)
-      }
-    }
-
-    is(overall_state.states(9)){
-      val addr = (io.ConfigIO.PlabAllocatorPtr + U"x30" + destAttrType * U(8)).resize(MMUAddrWidth bits)
-      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
-        temp_value := rd(GCElementWidth - 1 downto 0)
-        state := overall_state.states(10)
-      }
-    }
-
-    is(overall_state.states(10)){
-      val addr = (io.ConfigIO.PlabAllocatorPtr + U"x30" + destAttrType * U(8)).resize(MMUAddrWidth bits)
-      val writeValue = temp_value + U(1)
       issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
         sendToState13(False, required_in_plab, plab_word_size)
       }

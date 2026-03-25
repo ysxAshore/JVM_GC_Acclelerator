@@ -27,7 +27,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
   io.Process2Aop.clearIn()
 
   object overall_state extends SpinalEnum {
-    val states = Array.tabulate(16)(_ => newElement())
+    val states = Array.tabulate(9)(_ => newElement())
     for((state, i) <- states.zipWithIndex){
       state.setName(s"s$i")
     }
@@ -65,10 +65,10 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
   val regionAttrHitIndex = OHToUInt(regionAttrHitVec.asBits)
   val regionAttrCacheReplacePtr = RegInit(U(0, log2Up(regionAttrCacheEntries) bits))
 
-  val heapRegionCacheEntries = 8
+  val heapRegionCacheEntries = 4
   val heapRegionCacheValid = Vec(RegInit(False), heapRegionCacheEntries)
   val heapRegionCacheTag = Vec(RegInit(U(0, GCElementWidth bits)), heapRegionCacheEntries)
-  val heapRegionCache = Vec(RegInit(U(0, 32 bits)), heapRegionCacheEntries)
+  val heapRegionCache = Vec(RegInit(False), heapRegionCacheEntries)
   val heapRegionAddrLookup = (io.ConfigIO.HeapRegionBiasedBase + (task >> io.ConfigIO.HeapRegionShiftBy) * U(8)).resize(MMUAddrWidth)
 
   val heapRegionHitVec = Vec(Bool(), heapRegionCacheEntries)
@@ -93,7 +93,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
   }
 
   def sendAop(): Unit = {
-    when(heapRegionHit && (heapRegionCache(heapRegionHitIndex) & U(2)) =/= 0){
+    when(heapRegionHit && heapRegionCache(heapRegionHitIndex)){
       resetState()
     }.otherwise{
       state := overall_state.states(8)
@@ -184,7 +184,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
 
         heapRegionCacheValid(heapRegionCacheReplacePtr) := True
         heapRegionCacheTag(heapRegionCacheReplacePtr) := heapRegionAddrLookup
-        heapRegionCache(heapRegionCacheReplacePtr) := rd(31 downto 0)
+        heapRegionCache(heapRegionCacheReplacePtr) := (rd(31 downto 0) & U(2, 32 bits)) =/= U(0)
         heapRegionCacheReplacePtr := heapRegionCacheReplacePtr + 1
       }
     }
