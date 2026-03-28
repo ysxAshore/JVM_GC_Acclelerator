@@ -435,6 +435,7 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
         is(overall_state.states(5)){
           io.ToNewGCAlloc.Valid := True
           io.ToNewGCAlloc.regionPtr := region_ptr_cache(destAttrIdx)
+          io.ToNewGCAlloc.destAttrIdx := destAttrIdx
           when(io.ToNewGCAlloc.Valid && io.ToNewGCAlloc.Ready){
             sub_state := overall_state.states(6)
           }

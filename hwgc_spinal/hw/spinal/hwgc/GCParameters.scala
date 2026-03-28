@@ -325,17 +325,19 @@ class GCToNewGCAlloc extends Bundle with GCParameters with IMasterSlave {
   val Done = out Bool()
 
   val regionPtr = in UInt(GCElementWidth bits)
+  val destAttrIdx = in UInt(1 bits)
 
   val newAllocRegion = out UInt(GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done, newAllocRegion)
-    out(Valid, regionPtr)
+    out(Valid, regionPtr, destAttrIdx)
   }
 
   def clearIn(): Unit = {
     Valid := False
     regionPtr := U(0)
+    destAttrIdx := U(0)
   }
 
   def clearOut(): Unit = {
