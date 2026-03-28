@@ -200,9 +200,15 @@ class GCTrace extends Module with GCParameters with HWParameters{
     }
 
     is(overall_state.states(1)) {
-      when(OopType === U(PartialArrayOop) || Kid === U(ObjectArrayKlassID)){
+      when(OopType === U(PartialArrayOop)){
+        val addr = DestOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U"xc", U"x10")
+        val writeValue = ArrayLength
+        issueReq(io.Mreq, addr, True, 4, writeValue, issued){ _ =>
+          state := overall_state.states(2)
+        }
+      }.elsewhen(Kid === U(ObjectArrayKlassID)){
         val addr = DestOopPtr + U(8)
-        val writeLen = Mux(OopType === U(PartialArrayOop), ArrayLength, StepIndex)
+        val writeLen = StepIndex
         val writeValue = Mux(io.ConfigIO.UseCompressedKlassPointers, Cat(writeLen, KlassPtr(31 downto 0)).resize(96), Cat(writeLen, KlassPtr)).asUInt
         issueReq(io.Mreq, addr, True, objArrayMarkKlassLenSize, writeValue, issued) { _ =>
           state := overall_state.states(2)
