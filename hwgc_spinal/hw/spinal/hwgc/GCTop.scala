@@ -14,7 +14,6 @@ class GCTop extends Module with GCParameters with HWParameters {
   val gcOopCopy2Survivor = new GCOopCopy2Survivor
   val gcAllocate = new GCAllocate
   val gcParAllocate = new GCParAllocate
-  val gcAttemptAlloc = new GCAttemptAlloc
   val gcNewGCAlloc = new GCNewGCAlloc
   val gcAllocFreeRegion = new GCAllocFreeRegion
   val gcCopy = new GCCopy
@@ -163,9 +162,7 @@ class GCTop extends Module with GCParameters with HWParameters {
 
   // gcAllocate(ToParAllocate)
   gcAllocate.io.Mreq <> gcUnalignedMMUAdapter(5).io.in
-  gcAllocate.io.ToAttemptAllocate <> gcAttemptAlloc.io.ToAttemptAllocate
-  gcAllocate.io.ConfigIO.Thread := Thread
-  gcAllocate.io.ConfigIO.LockPtr := LockPtr
+  gcAllocate.io.ToParAllocate <> gcParAllocate.io.ToParAllocate
   gcAllocate.io.ConfigIO.G1h := G1h
   gcAllocate.io.ConfigIO.objectKlassObj := ObjectKlass
   gcAllocate.io.ConfigIO.intArrayKlassObj := IntArrayKlassObj
@@ -177,34 +174,32 @@ class GCTop extends Module with GCParameters with HWParameters {
 
   // gcParAllocate
   gcParAllocate.io.Mreq <> gcUnalignedMMUAdapter(6).io.in
+  gcParAllocate.io.ToNewGCAlloc <> gcNewGCAlloc.io.ToNewGCAlloc
+  gcParAllocate.io.ConfigIO.G1h := G1h
+  gcParAllocate.io.ConfigIO.Thread := Thread
+  gcParAllocate.io.ConfigIO.LockPtr := LockPtr
+  gcParAllocate.io.ConfigIO.DummyRegion := DummyRegion
   gcParAllocate.io.DebugTimeStamp := DebugTimeStamp
 
-  // gcAttemptAlloc
-  gcAttemptAlloc.io.Mreq <> gcUnalignedMMUAdapter(7).io.in
-  gcAttemptAlloc.io.ToNewGCAlloc <> gcNewGCAlloc.io.ToNewGCAlloc
-  gcAttemptAlloc.io.ConfigIO.G1h := G1h
-  gcAttemptAlloc.io.ConfigIO.DummyRegion := DummyRegion
-  gcAttemptAlloc.io.DebugTimeStamp := DebugTimeStamp
-
   // gcNewGCAloc
-  gcNewGCAlloc.io.Mreq <> gcUnalignedMMUAdapter(8).io.in
+  gcNewGCAlloc.io.Mreq <> gcUnalignedMMUAdapter(7).io.in
   gcNewGCAlloc.io.ToAllocFreeRegion <> gcAllocFreeRegion.io.ToAllocFreeRegion
   gcNewGCAlloc.io.ConfigIO.G1h := G1h
   gcNewGCAlloc.io.ConfigIO.DummyRegion := DummyRegion
   gcNewGCAlloc.io.DebugTimeStamp := DebugTimeStamp
 
   // gcAllocFreeRegion
-  gcAllocFreeRegion.io.Mreq <> gcUnalignedMMUAdapter(9).io.in
+  gcAllocFreeRegion.io.Mreq <> gcUnalignedMMUAdapter(8).io.in
   gcAllocFreeRegion.io.ConfigIO.G1h := G1h
   gcAllocFreeRegion.io.ConfigIO.NumaPtr := NumaPtr
   gcAllocFreeRegion.io.DebugTimeStamp := DebugTimeStamp
 
   // gcCopy
-  gcCopy.io.readMReq <> gcUnalignedMMUAdapter(10).io.in
-  gcCopy.io.writeMReq <> gcUnalignedMMUAdapter(11).io.in
+  gcCopy.io.readMReq <> gcUnalignedMMUAdapter(9).io.in
+  gcCopy.io.writeMReq <> gcUnalignedMMUAdapter(10).io.in
 
   // gcTrace
-  gcTrace.io.Mreq <> gcUnalignedMMUAdapter(12).io.in
+  gcTrace.io.Mreq <> gcUnalignedMMUAdapter(11).io.in
   gcTrace.io.ConfigIO.ChunkSize                        := ChunkSize
   gcTrace.io.ConfigIO.RegionAttrBase                   := RegionAttrBase
   gcTrace.io.ConfigIO.RegionAttrShiftBy                := RegionAttrShiftBy
@@ -221,7 +216,7 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcTrace.io.TaskDone := io.ctrl2top.Done
 
   // gcAop
-  gcAop.io.Mreq <> gcUnalignedMMUAdapter(13).io.in
+  gcAop.io.Mreq <> gcUnalignedMMUAdapter(12).io.in
   gcAop.io.TaskDone := io.ctrl2top.Done
   gcAop.io.ConfigIO.CardTablePtr := CardTablePtr
   gcAop.io.ConfigIO.ParScanThreadStatePtr := ParScanThreadStatePtr
@@ -241,12 +236,6 @@ class GCTop extends Module with GCParameters with HWParameters {
   aop_mux.io.In0 <> gcOopProcess.io.Process2Aop
   aop_mux.io.In1 <> gcTrace.io.ToAop
   aop_mux.io.Out <> gcAop.io.Aop
-
-  // gcParAllocate source mux
-  val parAllocate_mux = new GCParAllocateMux
-  parAllocate_mux.io.In0 <> gcAllocate.io.ToParAllocate
-  parAllocate_mux.io.In1 <> gcAttemptAlloc.io.ToParAllocate
-  parAllocate_mux.io.Out <> gcParAllocate.io.ToParAllocate
 }
 
 object GCTopVerilog extends App{

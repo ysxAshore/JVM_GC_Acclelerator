@@ -256,27 +256,27 @@ class GCToParAllocate extends Bundle with GCParameters with IMasterSlave{
   val Ready = out Bool()
   val Done = out Bool()
 
-  val excuteAll = in Bool()
-  val botUpdates = in Bool()
-  val allocRegion = in UInt(GCElementWidth bits)
-  val minWordSize = in UInt(GCElementWidth bits)
-  val desiredWordSize = in UInt(GCElementWidth bits)
+  val NodeIndex = in UInt(8 bits)
+  val DestAttrIdx = in UInt(1 bits)
+  val MinWordSize = in UInt(GCElementWidth bits)
+  val AllocatorPtr = in UInt(GCElementWidth bits)
+  val DesiredWordSize = in UInt(GCElementWidth bits)
 
   val DestObjPtr = out UInt(GCElementWidth bits)
   val ActualPlabSize = out UInt(GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done, DestObjPtr, ActualPlabSize)
-    out(Valid, excuteAll, botUpdates, allocRegion, minWordSize, desiredWordSize)
+    out(Valid, NodeIndex, MinWordSize, DestAttrIdx, AllocatorPtr, DesiredWordSize)
   }
 
   def clearIn(): Unit = {
     Valid := False
-    excuteAll := False
-    botUpdates := False
-    allocRegion := U(0)
-    minWordSize := U(0)
-    desiredWordSize := U(0)
+    NodeIndex := U(0)
+    MinWordSize := U(0)
+    DestAttrIdx := U(0)
+    AllocatorPtr := U(0)
+    DesiredWordSize := U(0)
   }
 
   def clearOut(): Unit = {
@@ -545,8 +545,6 @@ class GCCopy2SurvivorConfigIO extends Bundle with GCParameters with IMasterSlave
 
 class GCAllocateConfigIO extends Bundle with GCParameters with IMasterSlave{
   val G1h = in UInt(GCElementWidth bits)
-  val Thread = in UInt(GCElementWidth bits)
-  val LockPtr = in UInt(GCElementWidth bits)
   val objectKlassObj = in UInt(GCElementWidth bits)
   val intArrayKlassObj = in UInt(GCElementWidth bits)
   val PlabAllocatorPtr = in UInt(GCElementWidth bits)
@@ -555,7 +553,19 @@ class GCAllocateConfigIO extends Bundle with GCParameters with IMasterSlave{
   val CompressedKlassPointerShift = in UInt(8 bits)
 
   override def asMaster(): Unit = {
-    out(G1h, Thread, LockPtr, objectKlassObj, intArrayKlassObj, PlabAllocatorPtr, UseCompressedKlassPointers, CompressedKlassPointerBase, CompressedKlassPointerShift)
+    out(G1h, objectKlassObj, intArrayKlassObj, PlabAllocatorPtr, UseCompressedKlassPointers, CompressedKlassPointerBase, CompressedKlassPointerShift)
+    in()
+  }
+}
+
+class GCParAllocateConfigIO extends Bundle with GCParameters with IMasterSlave{
+  val G1h = in UInt(GCElementWidth bits)
+  val Thread = in UInt(GCElementWidth bits)
+  val LockPtr = in UInt(GCElementWidth bits)
+  val DummyRegion = in UInt(GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    out(G1h, Thread, LockPtr, DummyRegion)
     in()
   }
 }
@@ -679,7 +689,7 @@ object WrapDec {
 
 
 object LocalMMUTaskType {
-  val TaskTypeMax = 12 + 2
+  val TaskTypeMax = 11 + 2
   val TaskTypeBitWidth = log2Up(TaskTypeMax)
 }
 
