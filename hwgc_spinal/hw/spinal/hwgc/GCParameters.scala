@@ -192,6 +192,22 @@ class GCToSurvivor extends Bundle with GCParameters with IMasterSlave {
   }
 }
 
+class GCWriteSrcOopPtr extends Bundle with GCParameters with IMasterSlave{
+  val valid = in Bool()
+  val srcOopPtr = in UInt(GCElementWidth bits)
+  val writeValue = in UInt(GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    out(valid, srcOopPtr, writeValue)
+  }
+
+  def clearIn(): Unit = {
+    valid := False
+    srcOopPtr := U(0)
+    writeValue := U(0)
+  }
+}
+
 class GCUpdatedRegion extends Bundle with GCParameters with IMasterSlave{
   val Valid0 = in Bool()
   val Valid1 = in Bool()

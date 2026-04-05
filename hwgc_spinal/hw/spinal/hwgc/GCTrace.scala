@@ -127,10 +127,21 @@ class GCTrace extends Module with GCParameters with HWParameters{
   val regionAttrHitIndex = OHToUInt(regionAttrHitVec.asBits)
   val regionAttrCacheReplacePtr = RegInit(U(0, log2Up(regionAttrCacheEntries) bits))
 
+  val plus_or_dec = RegInit(False)
+  val heap_oop_valid = RegInit(False)
+  val remainCount = RegInit(U(0, 32 bits))
+  val heap_oop_cache = RegInit(U(0, MMUDataWidth bits))
+  val heap_oop_addr = RegInit(U(0, MMUAddrWidth bits))
+
   // some const value
   val oopStride = Mux(io.ConfigIO.UseCompressedOops, U(4), U(8))
   val objArrayHeaderSize = Mux(io.ConfigIO.UseCompressedKlassPointers, U(16), U(24))
   val objArrayMarkKlassLenSize = Mux(io.ConfigIO.UseCompressedKlassPointers, U(8), U(12))
+
+  val counter = RegInit(U(0, GCElementWidth bits))
+  when(state =/= overall_state.states(0)){
+    counter := counter + 1
+  }
 
   def dbg(msg: Seq[Any]): Unit =
     if (DebugEnable) report(Seq("[GCTrace<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
@@ -155,6 +166,44 @@ class GCTrace extends Module with GCParameters with HWParameters{
       }
     }
   }
+
+  def readFromWindow(base: UInt, data: UInt): Unit = {
+    when(io.ConfigIO.UseCompressedOops) {
+      val idx32 = ((src - base) >> 2).resize(3 bits)   // 32B / 4B = 8 entries
+      val split32 = data.subdivideIn(32 bits)
+      heap_oop := Cat(U(0, 32 bits), split32(idx32)).asUInt
+    } otherwise {
+      val idx64 = ((src - base) >> 3).resize(2 bits)   // 32B / 8B = 4 entries
+      val split64 = data.subdivideIn(GCElementWidth bits)
+      heap_oop := split64(idx64)
+    }
+    state := overall_state.states(9)
+  }
+
+  def issueElemRead(addr: UInt): Unit = {
+    val elemBytes = Mux(io.ConfigIO.UseCompressedOops, U(4), U(8))
+    issueReq(io.Mreq, addr, False, elemBytes, U(0), issued) { rd =>
+      when(io.ConfigIO.UseCompressedOops) {
+        heap_oop := Cat(U(0, 32 bits), rd(31 downto 0)).asUInt
+      } otherwise {
+        heap_oop := rd(GCElementWidth - 1 downto 0)
+      }
+      state := overall_state.states(9)
+    }
+  }
+
+  def issueWindowRead(addr: UInt): Unit = {
+    issueReq(io.Mreq, addr, False, U(32), U(0), issued) { rd =>
+      heap_oop_addr  := addr
+      heap_oop_cache := rd
+      heap_oop_valid := True
+      readFromWindow(addr, rd)
+    }
+  }
+
+
+
+
 
   when(io.TaskDone){
     for(i <- 0 until KlassCacheEntries){
@@ -185,6 +234,8 @@ class GCTrace extends Module with GCParameters with HWParameters{
 
         for_counter := U(0)
         state := overall_state.states(1)
+
+        heap_oop_addr := U(0)
 
         dbg(Seq(
           "Receive GCTrace Task", ", RegionAttrBase = ", io.ConfigIO.RegionAttrBase, ", RegionAttrShiftBy = ", io.ConfigIO.RegionAttrShiftBy,
@@ -235,6 +286,12 @@ class GCTrace extends Module with GCParameters with HWParameters{
       val high = (DestOopPtr + objArrayHeaderSize + StepIndex * oopStride).resize(GCElementWidth)
       val temp_p = DestOopPtr + objArrayHeaderSize
       val temp_q = (temp_p + ArrayLength * oopStride).resize(GCElementWidth)
+      val q_value = Mux(temp_q > high, high, temp_q)
+      val p_value = Mux(temp_p < low, low, temp_p)
+
+      p := p_value
+      q := q_value
+      remainCount := ((q_value - p_value) >> Mux(io.ConfigIO.UseCompressedOops, U(2), U(3))).resize(32)
 
       when(cond){
         val task = SrcOopPtr + U(2)
@@ -243,14 +300,10 @@ class GCTrace extends Module with GCParameters with HWParameters{
             for_counter := for_counter + U(1)
             state := overall_state.states(2)
           }.otherwise{
-            p := Mux(temp_p < low, low, temp_p)
-            q := Mux(temp_q > high, high, temp_q)
             state := overall_state.states(6)
           }
         }
       }.otherwise{
-        p := Mux(temp_p < low, low, temp_p)
-        q := Mux(temp_q > high, high, temp_q)
         state := overall_state.states(6)
       }
     }
@@ -281,6 +334,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
         issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
           p := (DestOopPtr + rd(31 downto 0)).resize(GCElementWidth)
           q := (DestOopPtr + rd(31 downto 0) + rd(63 downto 32) * oopStride).resize(GCElementWidth)
+          remainCount := rd(63 downto 32)
           end_map := addr
 
           // TRACE_DEC -> done to the state
@@ -298,6 +352,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
         issueReq(io.Mreq, addr, False, U(4), U(0), issued) { rd =>
           p := DestOopPtr + U(184)
           q := (DestOopPtr + U(184) + rd(31 downto 0) * oopStride).resize(GCElementWidth)
+          remainCount := rd(31 downto 0)
 
           // TRACE_PLUS -> done to end
           state := overall_state.states(6)
@@ -327,8 +382,11 @@ class GCTrace extends Module with GCParameters with HWParameters{
         src := p - DestOopPtr + SrcOopPtr
         dest := p
         p := p + oopStride
+
         previousState := overall_state.states(6)
         state := overall_state.states(8)
+
+        plus_or_dec := False
       }.otherwise{
         state := overall_state.states(15)
       }
@@ -344,15 +402,59 @@ class GCTrace extends Module with GCParameters with HWParameters{
 
         previousState := overall_state.states(7)
         state := overall_state.states(8)
+
+        plus_or_dec := True
       }.otherwise{
         state := overall_state.states(4)
       }
     }
 
     is(overall_state.states(8)){
-      issueReq(io.Mreq, src, False, U(8), U(0), issued) { rd =>
-        heap_oop := Mux(io.ConfigIO.UseCompressedOops, Cat(U(0, 32 bits), rd(31 downto 0)).asUInt, rd(GCElementWidth - 1 downto 0))
-        state := overall_state.states(9)
+      val alignedBase  = src & ~U(31, src.getWidth bits)
+      val cacheHit     = heap_oop_valid && (src >= heap_oop_addr) && (src < heap_oop_addr + LineBytesNum)
+
+      val offAligned = src - alignedBase
+      val idxAligned32 = (offAligned >> 2).resize(4 bits) // 0..7
+      val idxAligned64 = (offAligned >> 3).resize(3 bits) // 0..3
+
+      // 当前对齐 line 对后续遍历最多还能覆盖多少个元素
+      val usableAligned = UInt(4 bits)
+      usableAligned := 0
+      when(io.ConfigIO.UseCompressedOops) {
+        when(plus_or_dec) {
+          usableAligned := (idxAligned32 + 1).resized
+        } otherwise {
+          usableAligned := (U(8) - idxAligned32).resized
+        }
+      } otherwise {
+        when(plus_or_dec) {
+          usableAligned := (idxAligned64 + 1).resized
+        } otherwise {
+          usableAligned := (U(4) - idxAligned64).resized
+        }
+      }
+
+      // backward 时，为了覆盖更多前面的元素，window 起点往前挪
+      val shiftedBase = UInt(src.getWidth bits)
+      shiftedBase := src
+      when(plus_or_dec) {
+        shiftedBase := Mux(io.ConfigIO.UseCompressedOops, src - 28, src - 24)
+      }
+
+      when(cacheHit) {
+        // 已经在缓存窗口里，直接切
+        readFromWindow(heap_oop_addr, heap_oop_cache)
+      } otherwise {
+        when(remainCount === 1) {
+          // 只读一个，就别读整 32B
+          issueElemRead(src)
+        } elsewhen(remainCount <= usableAligned.resized) {
+          // 当前 src 所在的“对齐 32B line”已经足够覆盖接下来要读的元素
+          issueWindowRead(alignedBase)
+        } otherwise {
+          // 当前对齐 line 不够用，才读偏移窗口
+          issueWindowRead(shiftedBase)
+        }
       }
     }
 

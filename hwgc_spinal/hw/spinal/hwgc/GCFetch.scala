@@ -19,6 +19,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
   val io = new Bundle{
     val Mreq = master(new LocalMMUIO)
     val toFetch = slave(new GCToFetch)
+    val gcWriteSrcOopPtr = slave (new GCWriteSrcOopPtr)
     val Trace2Fetch = slave Stream UInt(GCElementWidth bits)
 
     val CopyDone = in Bool()
@@ -119,6 +120,12 @@ class GCFetch extends Module with HWParameters with GCParameters {
   }
   when(targetDone && state =/= overall_state.s_waitDone){
     targetDoneSeen := True
+  }
+
+  for(i <- 0 until PreFetchBuffer){
+    when(io.gcWriteSrcOopPtr.valid && preFetchBuffer(i).fromObj === io.gcWriteSrcOopPtr.srcOopPtr){
+      preFetchBuffer(i).markWord := io.gcWriteSrcOopPtr.writeValue
+    }
   }
 
   switch(push_state){
@@ -222,7 +229,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
           val data = preFetchBuffer(buffer_bottom)
           main_data := data
-          state := Mux((data.markWord & U(3, GCElementWidth bits)) === U(3), overall_state.s_send, overall_state.s_readMW)
+          state := overall_state.s_send
         }.elsewhen(preFetchBuffer(buffer_bottom).task === popTaskBase){
           waitPreFetch := True
         }.otherwise{
@@ -235,7 +242,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
       when(waitPreFetch && preFetchBufferDone(buffer_bottom)){
         val data = preFetchBuffer(buffer_bottom)
         main_data := data
-        state := Mux((data.markWord & U(3, GCElementWidth bits)) === U(3), overall_state.s_send, overall_state.s_readMW)
+        state := overall_state.s_send
 
         buffer_count := buffer_count - 1
         buffer_bottom := buffer_bottom + 1
@@ -358,7 +365,8 @@ class GCFetch extends Module with HWParameters with GCParameters {
           main_data.markWord := decodeMarkWord(rd)
           main_data.klassPtr := decodeKlassPtr(rd)
           main_data.srcLength := decodeSrcLength(rd)
-          state := Mux((decodeMarkWord(rd) & U(3, GCElementWidth bits)) === U(3), overall_state.s_send, overall_state.s_readMW)
+          //state := Mux((decodeMarkWord(rd) & U(3, GCElementWidth bits)) === U(3), overall_state.s_send, overall_state.s_readMW)
+          state := overall_state.s_send
           buffer_bottom := buffer_bottom + 1
           buffer_count := buffer_count - 1
         }.otherwise{

@@ -114,6 +114,7 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcFetch.io.Fetch2OopProcess <> gcOopProcess.io.Fetch2Process
   gcFetch.io.Fetch2ArrayProcess <> gcArrayProcess.io.Fetch2Process
   gcFetch.io.Trace2Fetch <> gcTrace.io.Trace2Fetch
+  gcFetch.io.gcWriteSrcOopPtr <> gcOopCopy2Survivor.io.ToFetch
   gcFetch.io.ConfigIO.UseCompressedOop := CompressedFlag(0)
   gcFetch.io.ConfigIO.CompressedOopBase := CompressedOopBase
   gcFetch.io.ConfigIO.CompressedOopShift := CompressedFlag(15 downto 8)

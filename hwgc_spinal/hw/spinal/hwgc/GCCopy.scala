@@ -33,6 +33,12 @@ class GCCopy extends Module with HWParameters with GCParameters {
   // 需要使用Vec来支持动态索引
   val copyDataQueue = Vec.fill(GCCopyEntry)(Reg(UInt(MMUDataWidth bits)))
 
+  // perf counter
+  val counter = RegInit(U(0, GCElementWidth bits))
+  when(task_valid){
+    counter := counter + 1
+  }
+
   io.ToCopy.Ready := !task_valid
 
   val zeroTaskDone = RegInit(False)

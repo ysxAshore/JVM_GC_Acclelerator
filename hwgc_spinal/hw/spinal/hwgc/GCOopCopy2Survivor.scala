@@ -9,6 +9,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   val io = new Bundle{
     val Mreq = master(new LocalMMUIO)
     val ToCopy = master(new GCToCopy)
+    val ToFetch = master(new GCWriteSrcOopPtr)
     val ToTrace = master(new GCToTrace)
     val ToStack = master(new GCUpdatedRegion)
     val ToAllocate = master(new GCToAllocate)
@@ -26,6 +27,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   io.Mreq.Response.ready := False
 
   io.ToCopy.clearIn()
+  io.ToFetch.clearIn()
   io.ToTrace.clearIn()
   io.ToAllocate.clearIn()
   io.ToCopySurvivor.clearOut()
@@ -368,6 +370,10 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
         val writeValue = Cat(destOopPtr(GCElementWidth - 1 downto 2), U(3, 2 bits)).resize(GCElementWidth).asUInt
         issueReq(io.Mreq, srcOopPtr, True, U(8), writeValue, issued) { _ =>
           writeSrcOopPtr := True
+
+          io.ToFetch.valid := True
+          io.ToFetch.srcOopPtr := srcOopPtr
+          io.ToFetch.writeValue := writeValue
         }
       }
 
@@ -415,7 +421,9 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
     is(overall_state.states(12)){
       val needTrace = kid =/= U(TypeArrayKlassID, 32 bits)
-      val copyFinished = copyDone || io.ToCopy.Done
+      val dontNeedWaitCopy = !needTrace
+
+      val copyFinished = copyDone || io.ToCopy.Done || dontNeedWaitCopy
       val traceFinished = traceDone || io.ToTrace.Done || !needTrace
 
       when(copyFinished && traceFinished){
