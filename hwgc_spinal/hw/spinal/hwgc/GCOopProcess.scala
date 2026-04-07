@@ -143,7 +143,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
         when(!doCopy2Survivor){
           destOopPtr := markWord & ~U(3, GCElementWidth bits)
           fromMarkWord := True
-          state := overall_state.states(7)
+          state := overall_state.states(4)
         }.otherwise{
           fromMarkWord := False
           state := overall_state.states(3)
@@ -192,7 +192,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters{
     is(overall_state.states(6)){
       when(fromMarkWord){
         fromMarkWord := False
-        sendAop()
+        state := overall_state.states(7)
       }.elsewhen(io.Process2CopySurvivor.Done || copy2survivor_done){
         copy2survivor_done := False
         destOopPtr := Mux(copy2survivor_done, destOopPtr, io.Process2CopySurvivor.DestOopPtr)

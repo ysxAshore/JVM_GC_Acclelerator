@@ -33,7 +33,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   io.ToCopySurvivor.clearOut()
 
   object overall_state extends SpinalEnum {
-    val states = Array.tabulate(19)(_ => newElement())
+    val states = Array.tabulate(16)(_ => newElement())
     for((state, i) <- states.zipWithIndex){
       state.setName(s"s$i")
     }
