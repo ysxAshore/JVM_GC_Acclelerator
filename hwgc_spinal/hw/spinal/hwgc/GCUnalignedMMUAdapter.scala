@@ -4,137 +4,160 @@ import spinal.core._
 import spinal.lib._
 
 import scala.language.postfixOps
-
-class GCUnalignedMMUAdapter extends Module with HWParameters with GCParameters {
+class GCUnalignedMMUAdapter extends Component with HWParameters with GCParameters {
   val io = new Bundle {
-    val in = slave(new LocalMMUIO)
+    val in  = slave(new LocalMMUIO)
     val out = master(new LocalMMUIO)
   }
-  io.in.Request.ready := False
-  io.in.Response.valid := False
-  io.in.Response.payload.clearAll()
+
+  // defaults
   io.in.ConherentRequsetSourceID.valid := False
   io.in.ConherentRequsetSourceID.payload.clearAll()
 
-  io.out.Request.valid := False
-  io.out.Request.payload.assignAllByName(io.in.Request.payload)
   io.out.RequestSize.valid := False
   io.out.RequestSize.payload.clearAll()
-  io.out.Response.ready := False
 
-  val size = RegInit(U(0, LineBytesNumBitSize bits))
-  val addr = RegInit(U(0, MMUAddrWidth bits))
+  // ----------------------------
+  // request registers
+  // ----------------------------
+  val busy            = RegInit(False)
+  val splitReq        = RegInit(False)
+  val sendBeat0Pending = RegInit(False)
+  val sendBeat1Pending = RegInit(False)
+  val gotOneResp      = RegInit(False)
+
+  val size    = RegInit(U(0, LineBytesNumBitSize bits))
+  val addr    = RegInit(U(0, MMUAddrWidth bits))
   val isWrite = RegInit(False)
   val reqData = RegInit(U(0, MMUDataWidth bits))
 
-  val offset = addr(log2Up(LineBytesNum) - 1 downto 0)
+  val firstSourceID  = RegInit(U(0, LLCSourceMaxNumBitSize bits))
+  val secondSourceID = RegInit(U(0, LLCSourceMaxNumBitSize bits))
+
+  val bufferData     = RegInit(U(0, MMUDataWidth bits))
+  val bufferIsBeat0  = RegInit(False)
+
+  // final response buffer
+  val respOutValid   = RegInit(False)
+  val respOutPayload = Reg(cloneOf(io.in.Response.payload))
+
+  io.in.Response.valid := respOutValid
+  io.in.Response.payload := respOutPayload
+
+  when(respOutValid && io.in.Response.ready) {
+    respOutValid := False
+    busy := False
+    gotOneResp := False
+  }
+
+  // ----------------------------
+  // derived values from latched request
+  // ----------------------------
+  val offset      = addr(log2Up(LineBytesNum) - 1 downto 0)
   val alignedAddr = addr & ~U(LineBytesNum - 1, addr.getWidth bits)
-  val crossBeat = offset + size > LineBytesNum
-  val firstBytes = Mux(crossBeat, LineBytesNum - offset, size)
+  val crossBeat   = offset + size > LineBytesNum
+  val firstBytes  = Mux(crossBeat, LineBytesNum - offset, size)
   val secondBytes = size - firstBytes
 
-  object overall_state extends SpinalEnum {
-    val s_idle, s_send1, s_send2, s_wait1, s_wait2 = newElement()
-  }
-  val state = RegInit(overall_state.s_idle)
-
-  val bufferData = RegInit(U(0, MMUDataWidth bits))
   val writeData0 = reqData |<< (offset << 3)
   val writeData1 = reqData |>> (firstBytes << 3)
-  val mask0 = ((U(1, LineBytesNum bits) |<< firstBytes) - 1) |<< offset
-  val mask1 = (U(1, LineBytesNum bits) |<< secondBytes) - 1
-  val firstSourceID = RegInit(U(0, LLCSourceMaxNumBitSize bits))
-  val secondSourceID = RegInit(U(0, LLCSourceMaxNumBitSize bits))
-  val hasReceived = RegInit(False) // 0 表示 buffer 缓存的是 第一次的; 1 表示缓存的第二次
+  val mask0      = ((U(1, LineBytesNum bits) |<< firstBytes) - 1) |<< offset
+  val mask1      = (U(1, LineBytesNum bits) |<< secondBytes) - 1
 
-  switch(state){
-    is(overall_state.s_idle){
-      when(io.in.Request.valid){
-        size := io.in.RequestSize.payload
-        addr := io.in.Request.payload.RequestVirtualAddr
-        reqData := io.in.Request.payload.RequestData
-        isWrite := io.in.Request.payload.RequestType_isWrite
+  // ----------------------------
+  // accept one new request
+  // ----------------------------
+  io.in.Request.ready := !busy && !respOutValid
 
-        state := overall_state.s_send1
-      }
+  val inOffsetNow    = io.in.Request.payload.RequestVirtualAddr(log2Up(LineBytesNum) - 1 downto 0)
+  val inCrossBeatNow = inOffsetNow + io.in.RequestSize.payload > LineBytesNum
+
+  when(io.in.Request.fire) {
+    size    := io.in.RequestSize.payload
+    addr    := io.in.Request.payload.RequestVirtualAddr
+    reqData := io.in.Request.payload.RequestData
+    isWrite := io.in.Request.payload.RequestType_isWrite
+
+    splitReq         := inCrossBeatNow
+    sendBeat0Pending := True
+    sendBeat1Pending := inCrossBeatNow
+    gotOneResp       := False
+    busy             := True
+  }
+
+  // ----------------------------
+  // request issuing logic
+  // ----------------------------
+  val issueBeat0 = busy && sendBeat0Pending
+  val issueBeat1 = busy && !sendBeat0Pending && sendBeat1Pending
+
+  io.out.Request.valid := issueBeat0 || issueBeat1
+  io.out.Request.payload.clearAll()
+
+  when(issueBeat0) {
+    io.out.Request.payload.RequestVirtualAddr := alignedAddr
+    io.out.Request.payload.RequestSourceID := io.out.ConherentRequsetSourceID.payload
+    when(isWrite) {
+      io.out.Request.payload.RequestData  := writeData0
+      io.out.Request.payload.RequestWStrb := mask0
+      io.out.Request.payload.RequestType_isWrite := True
     }
+  }
 
-    is(overall_state.s_send1){
-      io.out.Request.valid := True
-      io.out.Request.payload.RequestVirtualAddr := alignedAddr
-      io.in.Request.ready := io.out.Request.ready
-
-      when(isWrite){
-        io.out.Request.payload.RequestData := writeData0
-        io.out.Request.payload.RequestWStrb := mask0
-      }
-
-      when(io.out.Request.fire){
-        when(crossBeat){
-          state := overall_state.s_send2
-          firstSourceID := io.out.ConherentRequsetSourceID.payload
-        }.otherwise{
-          state := overall_state.s_wait1
-        }
-      }
+  when(issueBeat1) {
+    io.out.Request.payload.RequestVirtualAddr := alignedAddr + LineBytesNum
+    io.out.Request.payload.RequestSourceID := io.out.ConherentRequsetSourceID.payload
+    when(isWrite) {
+      io.out.Request.payload.RequestData  := writeData1
+      io.out.Request.payload.RequestWStrb := mask1
+      io.out.Request.payload.RequestType_isWrite := True
     }
+  }
 
-    is(overall_state.s_send2){
-      io.out.Request.valid := True
-      io.out.Request.payload.RequestVirtualAddr := alignedAddr + LineBytesNum
-
-      when(isWrite){
-        io.out.Request.payload.RequestData := writeData1
-        io.out.Request.payload.RequestWStrb := mask1
-      }
-
-      when(io.out.Request.fire){
-        secondSourceID := io.out.ConherentRequsetSourceID.payload
-        state := overall_state.s_wait1
-      }
+  when(io.out.Request.fire) {
+    when(issueBeat0) {
+      firstSourceID := io.out.ConherentRequsetSourceID.payload
+      sendBeat0Pending := False
+    } elsewhen(issueBeat1) {
+      secondSourceID := io.out.ConherentRequsetSourceID.payload
+      sendBeat1Pending := False
     }
+  }
 
-    is(overall_state.s_wait1){
-      io.out.Response.ready := True
-      when(io.out.Response.fire){
-        when(crossBeat){
-          state := overall_state.s_wait2
-          bufferData := io.out.Response.payload.ResponseData
-          hasReceived := Mux(io.out.Response.payload.ResponseSourceID === firstSourceID, False, True)
-        }.otherwise{
-          val shifted = io.out.Response.payload.ResponseData |>> (offset << 3)
+  // ----------------------------
+  // response handling
+  // only receive when all sub-requests have been issued,
+  // and final response buffer is empty
+  // ----------------------------
+  io.out.Response.ready := busy && !sendBeat0Pending && !sendBeat1Pending && !respOutValid
 
-          io.in.Response.valid := True
-          io.in.Response.payload.assignAllByName(io.out.Response.payload)
-
-          when(!isWrite){
-            io.in.Response.payload.ResponseData := shifted
-          }
-
-          when(io.in.Response.ready){
-            state := overall_state.s_idle
-          }
-        }
+  when(io.out.Response.fire) {
+    when(!splitReq) {
+      respOutPayload.assignAllByName(io.out.Response.payload)
+      when(!isWrite) {
+        respOutPayload.ResponseData := io.out.Response.payload.ResponseData |>> (offset << 3)
       }
-    }
+      respOutValid := True
+    } otherwise {
+      val thisIsBeat0 = io.out.Response.payload.ResponseSourceID === firstSourceID
 
-    is(overall_state.s_wait2){
-      io.out.Response.ready := True
-      when(io.out.Response.fire){
-        io.in.Response.valid := True
-        io.in.Response.payload.assignAllByName(io.out.Response.payload)
-        when(!isWrite){
-          val first = Mux(hasReceived, io.out.Response.payload.ResponseData, bufferData) |>> (offset << 3)
-          val second = Mux(hasReceived, bufferData, io.out.Response.payload.ResponseData) |<< (firstBytes << 3)
-          val finalData = first | second
+      when(!gotOneResp) {
+        bufferData    := io.out.Response.payload.ResponseData
+        bufferIsBeat0 := thisIsBeat0
+        gotOneResp    := True
+      } otherwise {
+        val beat0Data = Mux(bufferIsBeat0, bufferData, io.out.Response.payload.ResponseData)
+        val beat1Data = Mux(bufferIsBeat0, io.out.Response.payload.ResponseData, bufferData)
 
-          io.in.Response.valid := True
-          io.in.Response.payload.ResponseData := finalData
+        respOutPayload.assignAllByName(io.out.Response.payload)
+
+        when(!isWrite) {
+          val firstPart = beat0Data |>> (offset << 3)
+          val secondPart = beat1Data |<< (firstBytes << 3)
+          respOutPayload.ResponseData := firstPart | secondPart
         }
 
-        when(io.in.Response.ready){
-          state := overall_state.s_idle
-        }
+        respOutValid := True
       }
     }
   }

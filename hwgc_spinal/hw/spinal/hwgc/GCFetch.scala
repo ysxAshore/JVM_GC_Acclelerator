@@ -299,7 +299,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
     }
 
     // Request 需要 先 ready 保持一拍
-    when(io.Mreq.Request.valid && !io.Mreq.Request.ready){
+    when(io.Mreq.Request.valid && io.Mreq.Request.ready){
       mreqOwner := Mux(wantMainReadMW, MreqOwner.mainReadMW,
         Mux(wantPushReadMW, MreqOwner.pushReadMW,
           Mux(wantPrefetchReadMW, MreqOwner.prefetchReadMW,
