@@ -22,7 +22,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
   io.Mreq.Request.payload.clearAll()
   io.Mreq.RequestSize.valid := False
   io.Mreq.RequestSize.payload.clearAll()
-  io.Mreq.Response.ready := False
+  io.Mreq.Response.ready := True
 
   io.ToAop.clearIn()
 
@@ -201,10 +201,6 @@ class GCTrace extends Module with GCParameters with HWParameters{
     }
   }
 
-
-
-
-
   when(io.TaskDone){
     for(i <- 0 until KlassCacheEntries){
       klassCacheValid(i) := False
@@ -255,14 +251,20 @@ class GCTrace extends Module with GCParameters with HWParameters{
         val addr = DestOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U"xc", U"x10")
         val writeValue = ArrayLength
         issueReq(io.Mreq, addr, True, 4, writeValue, issued){ _ =>
+        }
+        when(issued){
           state := overall_state.states(2)
+          issued := False
         }
       }.elsewhen(Kid === U(ObjectArrayKlassID)){
         val addr = DestOopPtr + U(8)
         val writeLen = StepIndex
         val writeValue = Mux(io.ConfigIO.UseCompressedKlassPointers, Cat(writeLen, KlassPtr(31 downto 0)).resize(96), Cat(writeLen, KlassPtr)).asUInt
         issueReq(io.Mreq, addr, True, objArrayMarkKlassLenSize, writeValue, issued) { _ =>
+        }
+        when(issued){
           state := overall_state.states(2)
+          issued := False
         }
       }.otherwise{
         when(klassCacheHit){
@@ -388,6 +390,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
 
         plus_or_dec := False
       }.otherwise{
+        heap_oop_valid := False
         state := overall_state.states(15)
       }
     }
@@ -405,6 +408,7 @@ class GCTrace extends Module with GCParameters with HWParameters{
 
         plus_or_dec := True
       }.otherwise{
+        heap_oop_valid := False
         state := overall_state.states(4)
       }
     }
@@ -524,6 +528,9 @@ class GCTrace extends Module with GCParameters with HWParameters{
       }.otherwise{
         val addr = (io.ConfigIO.HumongousReclaimCandidatesBoolBase + region).resize(MMUAddrWidth)
         issueReq(io.Mreq, addr, True, U(1), U(0), issued) { _ =>
+        }
+        when(issued){
+          issued := False
           humRegionCacheReplacePtr := humRegionCacheReplacePtr + 1
           state := overall_state.states(13)
         }
@@ -534,6 +541,9 @@ class GCTrace extends Module with GCParameters with HWParameters{
       val addr = (io.ConfigIO.RegionAttrBase + region * U(2) + U(1)).resize(MMUAddrWidth)
       val writeValue = S(-1).asUInt
       issueReq(io.Mreq, addr, True, U(1), writeValue, issued){ _ =>
+      }
+      when(issued){
+        issued := False
         state := overall_state.states(14)
       }
     }

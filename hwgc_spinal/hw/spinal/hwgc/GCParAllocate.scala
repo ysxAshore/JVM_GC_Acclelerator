@@ -18,7 +18,7 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
   io.Mreq.Request.payload.clearAll()
   io.Mreq.RequestSize.valid := False
   io.Mreq.RequestSize.payload.clearAll()
-  io.Mreq.Response.ready := False
+  io.Mreq.Response.ready := True
 
   io.ToParAllocate.clearOut()
   io.ToNewGCAlloc.clearIn()
@@ -164,6 +164,9 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
             val addr = alloc_region_cache(destAttrIdx) + U"x10"
             val writeValue = Cat(alloc_top_cache(destAttrIdx)).asUInt
             issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
+            }
+            when(issued){
+              issued := False
               finish()
             }
           }
@@ -263,6 +266,9 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
         is(overall_state.states(4)){
           val writeValue = ((next_offset_threshold - blk_start) >> 3).resize(8)
           issueReq(io.Mreq, array, True, U(1), writeValue, issued) { _ =>
+          }
+          when(issued){
+            issued := False
             sub_state := overall_state.states(5)
           }
         }
@@ -307,6 +313,9 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
 
             val writeValue = writeBytes.asBits.asUInt
             issueReq(io.Mreq, begin, True, nbytes, writeValue, issued) { _ =>
+            }
+            when(issued){
+              issued := False
               begin := begin + nbytes
               remaining := remaining - nbytes
               iterator := iterator + 1
@@ -327,6 +336,9 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
           val addr = bot_part_ptr
           val writeValue = Cat(index, next_offset_threshold).asUInt
           issueReq(io.Mreq, addr, True, U(16), writeValue, issued) { _ =>
+          }
+          when(issued){
+            issued := False
             par_allocate_valid := False
             finish()
           }
@@ -427,6 +439,9 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
           val writeOff8 = ((alloc_top_cache(destAttrIdx) - start_ptr) / U(8)).resize(GCElementWidth)
           val writeValue = Cat(writeOff8, writeOff0).asUInt
           issueReq(io.Mreq, addr, True, U(16), writeValue, issued) { _ =>
+          }
+          when(issued){
+            issued := False
             idx := idx + 1
             sub_state := overall_state.states(5)
           }
@@ -477,6 +492,9 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
             val writeValue = Cat(writeOff10, region_ptr_off10, writeOff0).asUInt
             val addr = region_ptr_cache(destAttrIdx) + U"x8"
             issueReq(io.Mreq, addr, True, U(24), writeValue, issued) { _ =>
+            }
+            when(issued){
+              issued := False
               write_region_ptr_done := True
             }
           }
@@ -581,6 +599,9 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
       val addr = io.ConfigIO.LockPtr
       val writeValue = Mux(write_lock0, U(0), io.ConfigIO.Thread)
       issueReq(io.Mreq, addr, True, U(8), writeValue, issued) { _ =>
+      }
+      when(issued){
+        issued := False
         when(write_lock0) {
           resetState()
         }.otherwise{

@@ -115,6 +115,17 @@ class GCFetch extends Module with HWParameters with GCParameters {
   val wantPrefetchReadOop = withoutMainReq && withoutPushReq && preFetch_state === overall_state.s_readOop && preFetchBuffer(buffer_ptr).oopType === U(NotArrayOop)
   val wantPrefetchReadMW  = withoutMainReq && withoutPushReq && preFetch_state === overall_state.s_readMW
 
+  val preFetchBufferMarkWordForwarded = Vec(RegInit(False), PreFetchBuffer)
+  val pendingForwardValid = RegInit(False)
+  val pendingForwardObj   = RegInit(U(0, preFetchBuffer(0).fromObj.getWidth bits))
+  val pendingForwardValue = RegInit(U(0, GCElementWidth bits))
+
+  when(io.gcWriteSrcOopPtr.valid) {
+    pendingForwardValid := True
+    pendingForwardObj   := io.gcWriteSrcOopPtr.srcOopPtr
+    pendingForwardValue := io.gcWriteSrcOopPtr.writeValue
+  }
+
   when(io.CopyDone){
     copyDoneSeen := True
   }
@@ -123,8 +134,9 @@ class GCFetch extends Module with HWParameters with GCParameters {
   }
 
   for(i <- 0 until PreFetchBuffer){
-    when(io.gcWriteSrcOopPtr.valid && preFetchBuffer(i).fromObj === io.gcWriteSrcOopPtr.srcOopPtr){
-      preFetchBuffer(i).markWord := io.gcWriteSrcOopPtr.writeValue
+    when(io.gcWriteSrcOopPtr.valid && preFetchBufferDone(i) && preFetchBuffer(i).fromObj === io.gcWriteSrcOopPtr.srcOopPtr){
+        preFetchBuffer(i).markWord := io.gcWriteSrcOopPtr.writeValue
+        preFetchBufferMarkWordForwarded(i) := True
     }
   }
 
@@ -171,6 +183,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
           buffer_top := buffer_top + 1
           buffer_count := buffer_count + 1
           preFetchBufferDone(buffer_top) := False
+          preFetchBufferMarkWordForwarded(buffer_top) := False
           receiveTask(io.toFetch.PrePop.payload, preFetchBuffer(buffer_top))
 
           preFetch_state := overall_state.s_readOop
@@ -185,6 +198,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
             hasSubCount := hasSubCount - 1
             buffer_count := buffer_count + 1
             preFetchBufferDone(idx) := False
+            preFetchBufferMarkWordForwarded(idx) := False
             receiveTask(io.toFetch.PrePop.payload, preFetchBuffer(idx))
 
             preFetch_state := overall_state.s_readOop
@@ -202,6 +216,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
             hasSubCount := push_count - 1
 
             preFetchBufferDone(idx) := False
+            preFetchBufferMarkWordForwarded(idx) := False
             preFetch_state := overall_state.s_readOop
             receiveTask(io.toFetch.PrePop.payload, preFetchBuffer(idx))
           }
@@ -352,17 +367,44 @@ class GCFetch extends Module with HWParameters with GCParameters {
         }
       }
       is(MreqOwner.prefetchReadOop){
-        preFetchBuffer(buffer_ptr).fromObj := decodeReadOopResp(rd)
+        val newFromObj = decodeReadOopResp(rd)
+        preFetchBuffer(buffer_ptr).fromObj := newFromObj
+
+        when(pendingForwardValid && pendingForwardObj === newFromObj) {
+          preFetchBuffer(buffer_ptr).markWord := pendingForwardValue
+          preFetchBufferMarkWordForwarded(buffer_ptr) := True
+          pendingForwardValid := False
+        }
+
         preFetch_state := overall_state.s_readMW
       }
       is(MreqOwner.prefetchReadMW){
         preFetch_state := overall_state.s_idle
+
+        val currentFromObj = preFetchBuffer(buffer_ptr).fromObj
+
+        val hitForwardNow = io.gcWriteSrcOopPtr.valid && (currentFromObj === io.gcWriteSrcOopPtr.srcOopPtr) ||
+          pendingForwardValid && (currentFromObj === pendingForwardObj)
+
+        val finalMarkWord = UInt(GCElementWidth bits)
+        finalMarkWord := decodeMarkWord(rd)
+        when(hitForwardNow) {
+          when(io.gcWriteSrcOopPtr.valid) {
+            finalMarkWord := io.gcWriteSrcOopPtr.writeValue
+          }.otherwise{
+            finalMarkWord := pendingForwardValue
+            pendingForwardValid := False
+          }
+        } elsewhen(preFetchBufferMarkWordForwarded(buffer_ptr)) {
+          finalMarkWord := preFetchBuffer(buffer_ptr).markWord
+        }
+
         when(state === overall_state.s_idle && (io.Trace2Fetch.fire || waitPreFetch)){
           waitPreFetch := False
           main_data.task := preFetchBuffer(buffer_bottom).task
           main_data.oopType := preFetchBuffer(buffer_bottom).oopType
           main_data.fromObj := preFetchBuffer(buffer_bottom).fromObj
-          main_data.markWord := decodeMarkWord(rd)
+          main_data.markWord := finalMarkWord
           main_data.klassPtr := decodeKlassPtr(rd)
           main_data.srcLength := decodeSrcLength(rd)
           //state := Mux((decodeMarkWord(rd) & U(3, GCElementWidth bits)) === U(3), overall_state.s_send, overall_state.s_readMW)
@@ -370,7 +412,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
           buffer_bottom := buffer_bottom + 1
           buffer_count := buffer_count - 1
         }.otherwise{
-          preFetchBuffer(buffer_ptr).markWord := decodeMarkWord(rd)
+          preFetchBuffer(buffer_ptr).markWord := finalMarkWord
           preFetchBuffer(buffer_ptr).klassPtr := decodeKlassPtr(rd)
           preFetchBuffer(buffer_ptr).srcLength := decodeSrcLength(rd)
           preFetchBufferDone(buffer_ptr) := True

@@ -39,7 +39,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
   io.Mreq.Request.payload.clearAll()
   io.Mreq.RequestSize.valid := False
   io.Mreq.RequestSize.payload.clearAll()
-  io.Mreq.Response.ready := False
+  io.Mreq.Response.ready := True
 
   io.Process2CopySurvivor.clearIn()
   io.Process2Aop.clearIn()
@@ -410,8 +410,10 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
 
       is(MmuOp.WRITE_BACK) {
         issueReq(io.Mreq, slotCtx(mmuOwner).task.resize(MMUAddrWidth), True, writeBackSize(), writeBackObjOf(mmuOwner), slotIssued(mmuOwner)) { _ =>
-          val sameRegion =
-           ((slotCtx(mmuOwner).task ^ slotCtx(mmuOwner).destOopPtr) >> io.ConfigIO.LogOfHRGrainBytes) === U(0)
+        }
+        when(slotIssued(mmuOwner)){
+          slotIssued(mmuOwner) := False
+          val sameRegion = ((slotCtx(mmuOwner).task ^ slotCtx(mmuOwner).destOopPtr) >> io.ConfigIO.LogOfHRGrainBytes) === U(0)
 
           when(sameRegion || slotCtx(mmuOwner).heapRegionHumongous) {
             when(mmuOwner === U(0, 1 bits)) {

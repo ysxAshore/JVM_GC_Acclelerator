@@ -69,7 +69,6 @@ trait HWParameters {
 
     // ensure default safe values (caller may have already set globals; safe to reassign)
     port.Request.valid := !reqIssued
-    port.Response.ready := reqIssued
 
     when(!reqIssued) {
       port.RequestSize.valid := True

@@ -17,7 +17,7 @@ class GCAllocate extends Module with GCParameters with HWParameters {
   io.Mreq.Request.payload.clearAll()
   io.Mreq.RequestSize.valid := False
   io.Mreq.RequestSize.payload.clearAll()
-  io.Mreq.Response.ready := False
+  io.Mreq.Response.ready := True
 
   io.ToAllocate.clearOut()
   io.ToParAllocate.clearIn()
@@ -181,6 +181,9 @@ class GCAllocate extends Module with GCParameters with HWParameters {
               Mux(cond, U(20), U(16)))).resize(LineBytesNumBitSize)
 
         issueReq(io.Mreq, top_ptr, True, writeSize, writeValue, issued) { _ =>
+        }
+        when(issued){
+          issued := False
           state := overall_state.states(7)
         }
       }.otherwise{
@@ -215,6 +218,9 @@ class GCAllocate extends Module with GCParameters with HWParameters {
         val writeValue = Cat(off40, off38, off30, off28).asUInt
         val addr = buffer_cache(destAttrIdx) + U"x28"
         issueReq(io.Mreq, addr, True, U(32), writeValue, issued) { _ =>
+        }
+        when(issued){
+          issued := False
           resetState(Mux(delta < size, U(0), destObjPtr))
         }
       }.otherwise{

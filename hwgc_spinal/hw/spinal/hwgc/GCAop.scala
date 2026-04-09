@@ -21,7 +21,7 @@ class GCAop extends Module with GCParameters with HWParameters {
   io.Mreq.Request.payload.clearAll()
   io.Mreq.RequestSize.valid := False
   io.Mreq.RequestSize.payload.clearAll()
-  io.Mreq.Response.ready := False
+  io.Mreq.Response.ready := True
 
   object overall_state extends SpinalEnum {
     val states = Array.tabulate(18)(_ => newElement())
@@ -187,6 +187,9 @@ class GCAop extends Module with GCParameters with HWParameters {
       val addr = old_node
       val writeValue = Cat(offset30_cache, U(0, GCElementWidth bits)).asUInt
       issueReq(io.Mreq, addr, True, U(16), writeValue, issued){ _ =>
+      }
+      when(issued){
+        issued := False
         offset30_cache := old_node
         state := overall_state.states(6)
       }
@@ -216,6 +219,9 @@ class GCAop extends Module with GCParameters with HWParameters {
     is(overall_state.states(8)){
       val addr = node + U(8)
       issueReq(io.Mreq, addr, True, U(8), U(0), issued) { _ =>
+      }
+      when(issued){
+        issued := False
         state := overall_state.states(9)
       }
     }
@@ -223,6 +229,9 @@ class GCAop extends Module with GCParameters with HWParameters {
     is(overall_state.states(9)){
       val addr = node_allocator_ptr_cache + U"x80"
       issueReq(io.Mreq, addr, True, U(8), new_top, issued) { _ =>
+      }
+      when(issued){
+        issued := False
         state := Mux(node === U(0), overall_state.states(10), overall_state.states(11))
         previous_state := Mux(node === U(0), overall_state.states(10), overall_state.states(9))
       }
@@ -262,6 +271,9 @@ class GCAop extends Module with GCParameters with HWParameters {
 
       when(shouldFlush){
         issueReq(io.Mreq, addr, True, writeSize, nextWriteValue, issued) { _ =>
+        }
+        when(issued){
+          issued           := False
           index_cache      := index
           wrcnt            := U(0)
           wraddr           := U(0)

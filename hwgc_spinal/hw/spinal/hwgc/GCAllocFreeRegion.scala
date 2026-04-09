@@ -17,7 +17,7 @@ class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
   io.Mreq.Request.payload.clearAll()
   io.Mreq.RequestSize.valid := False
   io.Mreq.RequestSize.payload.clearAll()
-  io.Mreq.Response.ready := False
+  io.Mreq.Response.ready := True
 
   io.ToAllocFreeRegion.clearOut()
 
@@ -111,6 +111,9 @@ class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
     is(overall_state.states(4)){
       val addr = free_list_ptr + U"x28"
       issueReq(io.Mreq, addr, True, U(24), U(0), issued) { _ =>
+      }
+      when(issued){
+        issued := False
         resetState()
       }
     }
@@ -143,6 +146,9 @@ class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
       }.otherwise{
         val addr = res_conf + Mux(from_head, U"xd8", U"xd0")
         issueReq(io.Mreq, addr, True, U(8), U(0), issued) { _ =>
+        }
+        when(issued){
+          issued := False
           state := overall_state.states(7)
         }
       }
@@ -151,6 +157,9 @@ class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
     is(overall_state.states(7)){
       val addr = newAllocRegion + Mux(from_head, U"xd0", U"xd8")
       issueReq(io.Mreq, addr, True, U(8), U(0), issued) { _ =>
+      }
+      when(issued){
+        issued := False
         when(list_last_ptr === newAllocRegion){
           list_last_ptr := 0
         }

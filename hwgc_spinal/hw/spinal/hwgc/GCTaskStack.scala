@@ -26,7 +26,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   io.Mreq.Request.payload.clearAll()
   io.Mreq.RequestSize.valid := False
   io.Mreq.RequestSize.payload.clearAll()
-  io.Mreq.Response.ready := False
+  io.Mreq.Response.ready := True
 
   io.ConfigIO.Done := False
   io.ConfigIO.TaskReady := False
@@ -307,23 +307,13 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
       io.Mreq.RequestSize.payload := size
       io.Mreq.Response.ready := True
 
-      when(io.Mreq.Request.fire){
-        reqCnt := reqCnt + 1
-      }
-
       when(io.Mreq.Request.fire || !valid){
         when(reqIdx < 6){
           reqIdx := reqIdx + 1
         }
       }
 
-      when(io.Mreq.Response.fire){
-        resCnt := resCnt + 1
-      }
-
-      when(reqIdx === 6 && reqCnt === resCnt){
-        reqCnt := 0
-        resCnt := 0
+      when(reqIdx === 6){
         reqIdx := 0
         state := overall_state.s_idle
         io.ConfigIO.Done := True

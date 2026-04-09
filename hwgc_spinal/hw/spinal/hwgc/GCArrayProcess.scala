@@ -19,7 +19,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
   io.Mreq.Request.payload.clearAll()
   io.Mreq.RequestSize.valid := False
   io.Mreq.RequestSize.payload.clearAll()
-  io.Mreq.Response.ready := False
+  io.Mreq.Response.ready := True
 
   io.Fetch2Process.clearOut()
   io.Process2Trace.clearIn()

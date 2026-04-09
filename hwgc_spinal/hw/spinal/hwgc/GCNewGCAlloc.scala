@@ -18,7 +18,7 @@ class GCNewGCAlloc extends Module with GCParameters with HWParameters {
   io.Mreq.Request.payload.clearAll()
   io.Mreq.RequestSize.valid := False
   io.Mreq.RequestSize.payload.clearAll()
-  io.Mreq.Response.ready := False
+  io.Mreq.Response.ready := True
 
   io.ToNewGCAlloc.clearOut()
   io.ToAllocFreeRegion.clearIn()
@@ -153,6 +153,9 @@ class GCNewGCAlloc extends Module with GCParameters with HWParameters {
     is(overall_state.states(8)){
       val addr = newAllocRegion + U"xbc"
       issueReq(io.Mreq, addr, True, U(4), region_ptr_type(destAttrIdx), issued) { _ =>
+      }
+      when(issued){
+        issued := False
         state := overall_state.states(9)
       }
     }
@@ -185,6 +188,9 @@ class GCNewGCAlloc extends Module with GCParameters with HWParameters {
       when(!callGrowIRQ){
         val writeValue = array_len + U(1)
         issueReq(io.Mreq, grow_array_ptr, True, U(4), writeValue, issued){ _ =>
+        }
+        when(issued){
+          issued := False
           state := overall_state.states(12)
         }
       }
@@ -193,6 +199,9 @@ class GCNewGCAlloc extends Module with GCParameters with HWParameters {
     is(overall_state.states(12)){
       val addr = (data_ptr + array_len * U(8)).resize(MMUAddrWidth)
       issueReq(io.Mreq, addr, True, U(8), newAllocRegion, issued){ _ =>
+      }
+      when(issued){
+        issued := False
         state := overall_state.states(13)
       }
     }
@@ -212,6 +221,9 @@ class GCNewGCAlloc extends Module with GCParameters with HWParameters {
       when(temp_value =/= U(1)){
         val addr = remset_ptr + U"xf0"
         issueReq(io.Mreq, addr, True, U(4), temp_value, issued) { _ =>
+        }
+        when(issued){
+          issued := False
           state := overall_state.states(15)
         }
       }.otherwise{
@@ -223,6 +235,9 @@ class GCNewGCAlloc extends Module with GCParameters with HWParameters {
       val needs_remset_update = (region_ptr_type(destAttrIdx) & U"x10") === U(0)
       val addr = (region_attr_base + hrm_index * 2).resize(MMUAddrWidth)
       issueReq(io.Mreq, addr, True, U(1), needs_remset_update.asUInt, issued) { _ =>
+      }
+      when(issued){
+        issued := False
         io.ToNewGCAlloc.Done := True
         io.ToNewGCAlloc.newAllocRegion := newAllocRegion
         state := overall_state.states(0)

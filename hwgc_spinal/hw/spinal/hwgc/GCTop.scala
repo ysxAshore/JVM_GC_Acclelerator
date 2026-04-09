@@ -22,9 +22,11 @@ class GCTop extends Module with GCParameters with HWParameters {
   val gcLocalMMU = new GCLocalMMU
   val gcUnalignedMMUAdapter = Array.fill(LocalMMUTaskType.TaskTypeMax)(new GCUnalignedMMUAdapter)
 
-  for(i <- 0 until LocalMMUTaskType.TaskTypeMax){
+  for(i <- 0 until 9){
     gcLocalMMU.io.localMMUIOs(i) <> gcUnalignedMMUAdapter(i).io.out
   }
+  gcLocalMMU.io.localMMUIOs(11) <>  gcUnalignedMMUAdapter(11).io.out
+  gcLocalMMU.io.localMMUIOs(12) <>  gcUnalignedMMUAdapter(12).io.out
 
   val task_valid = RegInit(False)
 
@@ -196,8 +198,8 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcAllocFreeRegion.io.DebugTimeStamp := DebugTimeStamp
 
   // gcCopy
-  gcCopy.io.readMReq <> gcUnalignedMMUAdapter(9).io.in
-  gcCopy.io.writeMReq <> gcUnalignedMMUAdapter(10).io.in
+  gcCopy.io.readMReq <> gcLocalMMU.io.localMMUIOs(9)
+  gcCopy.io.writeMReq <> gcLocalMMU.io.localMMUIOs(10)
 
   // gcTrace
   gcTrace.io.Mreq <> gcUnalignedMMUAdapter(11).io.in
