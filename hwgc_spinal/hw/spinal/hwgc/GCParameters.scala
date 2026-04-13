@@ -160,8 +160,11 @@ class GCToSurvivor extends Bundle with GCParameters with IMasterSlave {
   val Ready = out Bool()
 
   val Done = out Bool()
+  val DoneOwner = in UInt(1 bits)
   val DestOopPtr = out UInt(GCElementWidth bits)
+  val isTypeArray = out Bool()
 
+  val Owner = in UInt(1 bits)
   val MarkWord = in UInt(GCElementWidth bits)
   val KlassPtr = in UInt(GCElementWidth bits)
   val SrcOopPtr = in UInt(GCElementWidth bits)
@@ -170,12 +173,13 @@ class GCToSurvivor extends Bundle with GCParameters with IMasterSlave {
   val RegionAttrPtr = in UInt(GCElementWidth bits)
 
   override def asMaster(): Unit = {
-    in(Ready, Done, DestOopPtr)
-    out(Valid, SrcOopPtr, MarkWord, KlassPtr, RegionAttrPtr, SrcLength, SrcRegionAttr)
+    in(Ready, Done, DoneOwner, DestOopPtr, isTypeArray)
+    out(Valid, Owner, SrcOopPtr, MarkWord, KlassPtr, RegionAttrPtr, SrcLength, SrcRegionAttr)
   }
 
   def clearIn(): Unit = {
     Valid := False
+    Owner := U(0)
     MarkWord := U(0)
     KlassPtr := U(0)
     SrcOopPtr := U(0)
@@ -187,7 +191,9 @@ class GCToSurvivor extends Bundle with GCParameters with IMasterSlave {
   def clearOut(): Unit = {
     Ready := False
     Done := False
+    DoneOwner := U(0)
     DestOopPtr := U(0)
+    isTypeArray := False
   }
 }
 

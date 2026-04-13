@@ -43,6 +43,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
 
   io.Process2CopySurvivor.clearIn()
   io.Process2Aop.clearIn()
+  io.Fetch2Process.Done := False
 
   def dbg(msg: Seq[Any]): Unit =
     if (DebugEnable) report(Seq("[GCOopProcess<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
@@ -82,8 +83,9 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
   val slot0Credit = RegInit(False)
   val slot1Credit = RegInit(False)
 
-  val copy2SurvivorBusy = RegInit(False)
-  val copy2SurvivorOwner = Reg(UInt(1 bits)) init(0)
+  val slotCopy2SurvivorInflight = Vec(RegInit(False), 2)
+  val slotCopy2SurvivorTypeArraySeen = Vec(RegInit(False), 2)
+  val slotCopy2SurvivorBypassGranted = Vec(RegInit(False), 2)
 
   val mmuBusy = RegInit(False)
   val mmuOwner = Reg(UInt(1 bits)) init(0)
@@ -121,7 +123,11 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
     slotCtx(i).accessDestRegionAttr := False
     slotCtx(i).destRegionAttr := 0
     slotIssued(i) := False
+
     slotCopy2SurvivorDone(i) := False
+    slotCopy2SurvivorInflight(i) := False
+    slotCopy2SurvivorTypeArraySeen(i) := False
+    slotCopy2SurvivorBypassGranted(i) := False
   }
 
   def allocToSlot(i: Int): Unit = {
@@ -154,11 +160,11 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
     dbg(Seq("Finish slot", i.toString))
   }
 
-  def givePeerCredit(i: Int): Unit = {
-    if (i == 0) {
+  def givePeerCredit(i: UInt): Unit = {
+    when(i === U(0)) {
       slot1Credit := True
       dbg(Seq("slot0 hits fromMarkWord, give credit to slot1"))
-    } else {
+    } otherwise  {
       slot0Credit := True
       dbg(Seq("slot1 hits fromMarkWord, give credit to slot0"))
     }
@@ -194,11 +200,21 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
     heapRegionHitIndex(i) := OHToUInt(heapRegionHitVec.asBits)
   }
 
-  when(copy2SurvivorBusy && io.Process2CopySurvivor.Done) {
-    slotCtx(copy2SurvivorOwner).destOopPtr := io.Process2CopySurvivor.DestOopPtr
-    slotCopy2SurvivorDone(copy2SurvivorOwner) := True
-    copy2SurvivorBusy := False
-    dbg(Seq("Copy2Survivor done for slot", copy2SurvivorOwner))
+  when(io.Process2CopySurvivor.isTypeArray){
+    val isTypeArray_idx = io.Process2CopySurvivor.DoneOwner
+    when(slotCopy2SurvivorInflight(isTypeArray_idx) && !slotCopy2SurvivorBypassGranted(isTypeArray_idx)){
+      givePeerCredit(isTypeArray_idx)
+      slotCopy2SurvivorBypassGranted(isTypeArray_idx) := True
+      io.Fetch2Process.Done := True
+    }
+  }
+
+  when(io.Process2CopySurvivor.Done){
+    val doneOwner = io.Process2CopySurvivor.DoneOwner
+    slotCtx(doneOwner).destOopPtr := io.Process2CopySurvivor.DestOopPtr
+    slotCopy2SurvivorDone(doneOwner) := True
+    slotCopy2SurvivorInflight(doneOwner) := False
+    dbg(Seq("Copy2Survivor done for slot", doneOwner))
   }
 
   val pipeEmpty = !slotValid(0) && !slotValid(1)
@@ -208,7 +224,6 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
   val canAllocSlot1 = !slotValid(1) && slotValid(0) && slot1Credit
 
   io.Fetch2Process.Ready := canAllocSlot0 || canAllocSlot1
-  io.Fetch2Process.Done := False
 
   when(io.Fetch2Process.Valid && io.Fetch2Process.Ready) {
     when(canAllocSlot0) {
@@ -248,6 +263,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
               slotCtx(i).fromMarkWord := True
               givePeerCredit(i)
               slotState(i) := overall_state.states(4)
+              io.Fetch2Process.Done := True
               dbg(Seq("slot", i.toString, " use fromMarkWord path"))
             } otherwise {
               slotCtx(i).fromMarkWord := False
@@ -269,11 +285,11 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
           when(slotCtx(i).fromMarkWord) {
             slotCtx(i).fromMarkWord := False
             slotState(i) := overall_state.states(7)
-            io.Fetch2Process.Done := True
           } elsewhen slotCopy2SurvivorDone(i) {
             slotCopy2SurvivorDone(i) := False
             slotState(i) := overall_state.states(7)
-            io.Fetch2Process.Done := True
+            io.Fetch2Process.Done := !slotCopy2SurvivorBypassGranted(i)
+            slotCopy2SurvivorBypassGranted(i) := False
           }
         }
       }
@@ -282,30 +298,39 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
 
   // centralized copy2survivor arbitration (fixed priority: slot0 > slot1)
   val slotWantCopy2SurvivorReq = Vec(Bool(), 2)
-  slotWantCopy2SurvivorReq(0) := slotValid(0) && (slotState(0) === overall_state.states(3)) && !copy2SurvivorBusy
-  slotWantCopy2SurvivorReq(1) := slotValid(1) && (slotState(1) === overall_state.states(3)) && !copy2SurvivorBusy
+  slotWantCopy2SurvivorReq(0) := slotValid(0) && (slotState(0) === overall_state.states(3)) && !slotCopy2SurvivorInflight(0)
+
+  slotWantCopy2SurvivorReq(1) := slotValid(1) && (slotState(1) === overall_state.states(3)) && !slotCopy2SurvivorInflight(1)
 
   val grantCopy0 = slotWantCopy2SurvivorReq(0)
   val grantCopy1 = !slotWantCopy2SurvivorReq(0) && slotWantCopy2SurvivorReq(1)
 
   when(grantCopy0 || grantCopy1) {
     io.Process2CopySurvivor.Valid := True
+    io.Process2CopySurvivor.Owner := Mux(grantCopy0, U(0), U(1))
     io.Process2CopySurvivor.MarkWord := Mux(grantCopy0, slotCtx(0).markWord, slotCtx(1).markWord)
     io.Process2CopySurvivor.KlassPtr := Mux(grantCopy0, slotCtx(0).klassPtr, slotCtx(1).klassPtr)
     io.Process2CopySurvivor.SrcOopPtr := Mux(grantCopy0, slotCtx(0).srcOopPtr, slotCtx(1).srcOopPtr)
     io.Process2CopySurvivor.SrcLength := Mux(grantCopy0, slotCtx(0).srcLength, slotCtx(1).srcLength)
     io.Process2CopySurvivor.SrcRegionAttr := Mux(grantCopy0, slotCtx(0).srcRegionAttr, slotCtx(1).srcRegionAttr)
-    io.Process2CopySurvivor.RegionAttrPtr := Mux(grantCopy0, srcRegionAttrAddr(0).resize(GCElementWidth), srcRegionAttrAddr(1).resize(GCElementWidth))
+    io.Process2CopySurvivor.RegionAttrPtr := Mux(
+      grantCopy0,
+      srcRegionAttrAddr(0).resize(GCElementWidth),
+      srcRegionAttrAddr(1).resize(GCElementWidth)
+    )
 
     when(io.Process2CopySurvivor.Ready) {
-      copy2SurvivorBusy := True
-
       when(grantCopy0) {
-        copy2SurvivorOwner := U(0, 1 bits)
+        slotCopy2SurvivorInflight(0) := True
+        slotCopy2SurvivorTypeArraySeen(0) := False
+        slotCopy2SurvivorBypassGranted(0) := False
         slotState(0) := overall_state.states(4)
       }
+
       when(grantCopy1) {
-        copy2SurvivorOwner := U(1, 1 bits)
+        slotCopy2SurvivorInflight(1) := True
+        slotCopy2SurvivorTypeArraySeen(1) := False
+        slotCopy2SurvivorBypassGranted(1) := False
         slotState(1) := overall_state.states(4)
       }
     }
@@ -453,9 +478,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
     io.Mreq.Request.payload.RequestData := writeObjDyn.resize(MMUDataWidth)
   }
 
-  // --------------------------------------------------------------------------
   // centralized AOP arbitration (fixed priority: slot0 > slot1)
-  // --------------------------------------------------------------------------
   val slotWantAop = Vec(Bool(), 2)
   slotWantAop(0) := slotValid(0) && (slotState(0) === overall_state.states(8)) && slotCtx(0).accessDestRegionAttr
   slotWantAop(1) := slotValid(1) && (slotState(1) === overall_state.states(8)) && slotCtx(1).accessDestRegionAttr
