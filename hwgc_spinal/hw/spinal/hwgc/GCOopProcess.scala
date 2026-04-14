@@ -43,14 +43,11 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
 
   io.Process2CopySurvivor.clearIn()
   io.Process2Aop.clearIn()
-  io.Fetch2Process.Done := False
 
   def dbg(msg: Seq[Any]): Unit =
     if (DebugEnable) report(Seq("[GCOopProcess<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
 
-  // --------------------------------------------------------------------------
   // state
-  // --------------------------------------------------------------------------
   object overall_state extends SpinalEnum {
     val states = Array.tabulate(9)(_ => newElement())
     for ((state, i) <- states.zipWithIndex) {
@@ -62,9 +59,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
     val NONE, READ_SRC_ATTR, READ_HEAP_PTR, READ_HUMONGOUS, WRITE_BACK, READ_DEST_ATTR = newElement()
   }
 
-  // --------------------------------------------------------------------------
   // two complete slots
-  // --------------------------------------------------------------------------
   val slotValid = Vec(RegInit(False), 2)
   val slotState = Vec(RegInit(overall_state.states(0)), 2)
   val slotCtx = Vec.fill(2)(Reg(SlotCtx()) init (SlotCtx().getZero))
@@ -200,12 +195,22 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
     heapRegionHitIndex(i) := OHToUInt(heapRegionHitVec.asBits)
   }
 
+  val fetchDoneFromTypeArrayBypass = Bool()
+  val fetchDoneFromNegativeRegion = Bool()
+  val fetchDoneFromFromMarkWord = Bool()
+  val fetchDoneFromCopy2SurvivorDone = Bool()
+
+  fetchDoneFromTypeArrayBypass := False
+  fetchDoneFromNegativeRegion := False
+  fetchDoneFromFromMarkWord := False
+  fetchDoneFromCopy2SurvivorDone := False
+
   when(io.Process2CopySurvivor.isTypeArray){
     val isTypeArray_idx = io.Process2CopySurvivor.DoneOwner
     when(slotCopy2SurvivorInflight(isTypeArray_idx) && !slotCopy2SurvivorBypassGranted(isTypeArray_idx)){
       givePeerCredit(isTypeArray_idx)
       slotCopy2SurvivorBypassGranted(isTypeArray_idx) := True
-      io.Fetch2Process.Done := True
+      fetchDoneFromTypeArrayBypass := True
     }
   }
 
@@ -224,6 +229,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
   val canAllocSlot1 = !slotValid(1) && slotValid(0) && slot1Credit
 
   io.Fetch2Process.Ready := canAllocSlot0 || canAllocSlot1
+  io.Fetch2Process.Done := fetchDoneFromCopy2SurvivorDone || fetchDoneFromFromMarkWord || fetchDoneFromTypeArrayBypass || fetchDoneFromNegativeRegion
 
   when(io.Fetch2Process.Valid && io.Fetch2Process.Ready) {
     when(canAllocSlot0) {
@@ -254,7 +260,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
           val srcRegionAttrType = slotCtx(i).srcRegionAttr.asSInt
           when(srcRegionAttrType < 0) {
             finishSlot(i)
-            io.Fetch2Process.Done := True
+            fetchDoneFromNegativeRegion := True
           } otherwise {
             val doCopy2Survivor = (slotCtx(i).markWord & U(3, GCElementWidth bits)) =/= U(3, GCElementWidth bits)
 
@@ -263,7 +269,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
               slotCtx(i).fromMarkWord := True
               givePeerCredit(i)
               slotState(i) := overall_state.states(4)
-              io.Fetch2Process.Done := True
+              fetchDoneFromFromMarkWord := True
               dbg(Seq("slot", i.toString, " use fromMarkWord path"))
             } otherwise {
               slotCtx(i).fromMarkWord := False
@@ -288,7 +294,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
           } elsewhen slotCopy2SurvivorDone(i) {
             slotCopy2SurvivorDone(i) := False
             slotState(i) := overall_state.states(7)
-            io.Fetch2Process.Done := !slotCopy2SurvivorBypassGranted(i)
+            fetchDoneFromCopy2SurvivorDone := !slotCopy2SurvivorBypassGranted(i)
             slotCopy2SurvivorBypassGranted(i) := False
           }
         }
