@@ -1,61 +1,6 @@
-// hwgc_driver.c
-#include <linux/module.h>
-#include <linux/pci.h>
-#include <linux/io.h>
-#include <linux/fs.h>
-#include <linux/cdev.h>
-#include <linux/interrupt.h>
-#include <linux/wait.h>
-#include <linux/sched.h>
-#include <linux/uaccess.h>
 #include "hwgc_ioctl.h"
 
-#define IRQ_ALLOC_SLOW 0x00000001
-#define IRQ_ENQUEUE_FAILED 0x00000010
-#define IRQ_PAGEFAULT 0x00000100
-#define IRQ_COMPLETE 0x00001000
-#define IRQ_DEBUG 0x00010000
-
-#define HWGC_STATUS_COMPUTING 0x01
-#define HWGC_STATUS_WAKE 0x02
-#define HWGC_STATUS_IRQ 0x04
-
 #define HWGC_DEV_NAME "hwgc"
-
-struct HWGCParameter
-{
-    u32 chunkSize;
-    u32 ageThreshold;
-    u32 heapRegionBias;
-    u32 regionAttrShiftBy;
-    u32 heapRegionShiftBy;
-    u32 logOfHRGrainBytes;
-    u64 stepperOffset;
-    u64 youngWordsBase;
-    u64 regionAttrBase;
-    u64 plabAllocatorPtr;
-    u64 regionAttrBiasedBase;
-    u64 heapRegionBiasedBase;
-    u64 parScanThreadStatePtr;
-    u64 taskQueueBottomAddr;
-    u64 taskQueueElemsBase;
-    u64 humogousReclaimCandidateBoolBase;
-    u64 cardTablePtr;
-    u64 g1h;
-    u64 intArrayKlassObj;
-    u64 objectKlass;
-    u64 lockPtr;
-    u64 thread;
-    u64 dummyRegion;
-    u64 numaPtr;
-    u64 compressedOopBase;
-    u64 compressedKlassPointerBase;
-    u8 compressedOopShift;
-    u8 compressedKlassPointerShift;
-    u8 useCompressedOops;
-    u8 useCompressedKlassPointers;
-};
-
 struct hwgc_dev
 {
     dev_t devno;
@@ -73,7 +18,7 @@ struct hwgc_dev
 static irqreturn_t hwgc_irq_handler(int irq, void *dev_id)
 {
     struct hwgc_dev *hwgc = dev_id;
-    u32 irq_status = ioread32(hwgc->mmio + REG_INT_STATUS);
+    u32 irq_status = ioread32(hwgc->mmio + REG_IRQ_STATUS);
     unsigned long flags;
 
     if (!irq_status)
@@ -86,11 +31,9 @@ static irqreturn_t hwgc_irq_handler(int irq, void *dev_id)
         u32 mask;
         enum hwgc_state new_state;
     } irq_map[] = {
-        {IRQ_ALLOC_SLOW, HWGC_WAIT_MALLOC},
-        {IRQ_ENQUEUE_FAILED, HWGC_WAIT_ENQUEUED},
-        {IRQ_PAGEFAULT, HWGC_WAIT_PAGEFAULT},
-        {IRQ_COMPLETE, HWGC_DONE},
-        {IRQ_DEBUG, HWGC_DEBUG},
+        {ATOMIC_IRQ, HWGC_WAIT_ATOMIC},
+        {PAGE_FAULT_IRQ, HWGC_WAIT_PAGEFAULT},
+        {COMPLETE_IRQ, HWGC_DONE},
     };
 
     // 一次只处理一个中断
@@ -117,23 +60,19 @@ static ssize_t hwgc_read(struct file *file, char __user *buf, size_t count, loff
     u64 val = ~0ULL;
     switch (offset)
     {
-    case REG_DEVICE_ID:
-        val = readl(hwgc->mmio + offset);
-        hwgc->state = HWGC_IDLE;
-        break;
     case REG_STATUS:
         val = hwgc->state;
         break;
-    case REG_SOFT_PAR0:
+    case REG_IRQ_PAR0:
         val = readq(hwgc->mmio + offset);
         break;
-    case REG_SOFT_PAR1:
+    case REG_IRQ_PAR1:
         val = readq(hwgc->mmio + offset);
         break;
-    case REG_SOFT_PAR2:
+    case REG_IRQ_PAR2:
         val = readq(hwgc->mmio + offset);
         break;
-    case REG_SOFT_PAR3:
+    case REG_IRQ_PAR3:
         val = readq(hwgc->mmio + offset);
         break;
     default:
@@ -146,39 +85,18 @@ static ssize_t hwgc_read(struct file *file, char __user *buf, size_t count, loff
     return count;
 }
 
-static void hwgc_write_params(struct hwgc_dev *hwgc, const struct HWGCParameter *par)
+static void hwgc_write_params(struct hwgc_dev *hwgc, const struct HWGC_PARALLOCATE_PARS *par)
 {
     void __iomem *base = hwgc->mmio + REG_PAR;
-    writeq(FIELD64(par->chunkSize, par->ageThreshold), base + 0x00);
-    writeq(FIELD64(par->heapRegionBias, par->regionAttrShiftBy), base + 0x08);
-    writeq(FIELD64(par->heapRegionShiftBy, par->logOfHRGrainBytes), base + 0x10);
-    writeq(par->stepperOffset, base + 0x18);
-    writeq(par->youngWordsBase, base + 0x20);
-    writeq(par->regionAttrBase, base + 0x28);
-    writeq(par->plabAllocatorPtr, base + 0x30);
-    writeq(par->regionAttrBiasedBase, base + 0x38);
-    writeq(par->heapRegionBiasedBase, base + 0x40);
-    writeq(par->parScanThreadStatePtr, base + 0x48);
-    writeq(par->taskQueueBottomAddr, base + 0x50);
-    writeq(par->taskQueueElemsBase, base + 0x58);
-    writeq(par->humogousReclaimCandidateBoolBase, base + 0x60);
-    writeq(par->cardTablePtr, base + 0x68);
-    writeq(par->g1h, base + 0x70);
-    writeq(par->intArrayKlassObj, base + 0x78);
-    writeq(par->objectKlass, base + 0x80);
-    writeq(par->lockPtr, base + 0x88);
-    writeq(par->thread, base + 0x90);
-    writeq(par->dummyRegion, base + 0x98);
-    writeq(par->numaPtr, base + 0xa0);
-    writeq(par->compressedOopBase, base + 0xa8);
-    writeq(par->compressedKlassPointerBase, base + 0xb0);
-    writeq((((u64)(par->compressedOopShift) << 24) | ((u64)(par->compressedKlassPointerShift) << 16) | ((u64)(par->useCompressedOops) << 8) | ((u64)(par->useCompressedKlassPointers))), base + 0xb8);
+    writeq(par->alloc_region, base + 0x00);
+    writeq(par->min_word_size, base + 0x08);
+    writeq(par->desired_word_size, base + 0x10);
 }
 
 static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct hwgc_dev *hwgc = file->private_data;
-    struct HWGCParameter hwgc_par;
+    struct HWGC_PARALLOCATE_PARS hwgc_par;
     int state;
     uint64_t res;
     unsigned long flags;
@@ -212,19 +130,13 @@ static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return -EFAULT;
         break;
 
-    case HWGC_IOC_DEBUG_WRITE:
-        if (copy_from_user(&res, (void __user *)arg, sizeof(res)))
-            return -EFAULT;
-        writeq(res, hwgc->mmio + REG_SOFT_PAR3);
-        break;
-
     case HWGC_IOC_SOFT_PROVIDE:
         spin_lock_irqsave(&hwgc->lock, flags);
-        if (hwgc->state == HWGC_WAIT_MALLOC || hwgc->state == HWGC_WAIT_PAGEFAULT || hwgc->state == HWGC_WAIT_ENQUEUED || hwgc->state == HWGC_DEBUG)
+        if (hwgc->state == HWGC_WAIT_PAGEFAULT)
         {
             if (copy_from_user(&res, (void __user *)arg, sizeof(res)))
                 return -EFAULT;
-            writeq(res, hwgc->mmio + REG_SOFT_RES);
+            writeq(res, hwgc->mmio + REG_IRQ_RES1);
         }
         hwgc->state = HWGC_RUNNING;
         spin_unlock_irqrestore(&hwgc->lock, flags);

@@ -1,5 +1,5 @@
 #sudo ./jdk17u/build/linux-loongarch64-server-release/jdk/bin/java -XX:-UseCompressedOops -XX:-UseCompressedClassPointers -XX:ParallelGCThreads=1 -XX:ConcGCThreads=0 -XX:+UseG1GC G1GCDemo 
-obj-m += $(addsuffix .o, $(OBJ-M))
+obj-m += hwgc_driver.o
 
 # assign KDIR determined by arch
 MACHINE := $(shell uname -m)
