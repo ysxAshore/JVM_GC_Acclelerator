@@ -75,6 +75,12 @@ static ssize_t hwgc_read(struct file *file, char __user *buf, size_t count, loff
     case REG_IRQ_PAR3:
         val = readq(hwgc->mmio + offset);
         break;
+    case REG_IRQ_RES1:
+        val = readq(hwgc->mmio + offset);
+        break;
+    case REG_IRQ_RES2:
+        val = readq(hwgc->mmio + offset);
+        break;
     default:
         break;
     }
@@ -95,6 +101,7 @@ static void hwgc_write_params(struct hwgc_dev *hwgc, const struct HWGC_PARALLOCA
 
 static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+    pr_info("hwgc: ioctl called, cmd=0x%x arg=0x%lx\n", cmd, arg);
     struct hwgc_dev *hwgc = file->private_data;
     struct HWGC_PARALLOCATE_PARS hwgc_par;
     int state;
@@ -115,6 +122,8 @@ static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         spin_lock_irqsave(&hwgc->lock, flags);
         hwgc->state = HWGC_RUNNING;
         spin_unlock_irqrestore(&hwgc->lock, flags);
+
+        printk("HWGC_IOC_START called\n");
         break;
 
     case HWGC_IOC_WAIT_EVENT:
@@ -132,10 +141,11 @@ static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     case HWGC_IOC_SOFT_PROVIDE:
         spin_lock_irqsave(&hwgc->lock, flags);
-        if (hwgc->state == HWGC_WAIT_PAGEFAULT)
+        if (hwgc->state == HWGC_WAIT_PAGEFAULT || hwgc->state == HWGC_WAIT_ATOMIC)
         {
             if (copy_from_user(&res, (void __user *)arg, sizeof(res)))
                 return -EFAULT;
+            printk("state %u, res %lx\n", hwgc->state, res);
             writeq(res, hwgc->mmio + REG_IRQ_RES1);
         }
         hwgc->state = HWGC_RUNNING;
