@@ -31,10 +31,12 @@ static irqreturn_t hwgc_irq_handler(int irq, void *dev_id)
         u32 mask;
         enum hwgc_state new_state;
     } irq_map[] = {
-        {ATOMIC_IRQ, HWGC_WAIT_ATOMIC},
+        {ALLOCATE_IRQ, HWGC_WAIT_ALLOCATE},
+        {ATTEMPT_IRQ, HWGC_WAIT_ATTEMPT},
+        {LOCK_WAKE_IRQ, HWGC_WAIT_LOCK_WAKE},
         {PAGE_FAULT_IRQ, HWGC_WAIT_PAGEFAULT},
         {COMPLETE_IRQ, HWGC_DONE},
-    };
+        {ATOMIC_IRQ, HWGC_WAIT_ATOMIC}};
 
     // 一次只处理一个中断
     int i = 0;
@@ -75,10 +77,10 @@ static ssize_t hwgc_read(struct file *file, char __user *buf, size_t count, loff
     case REG_IRQ_PAR3:
         val = readq(hwgc->mmio + offset);
         break;
-    case REG_IRQ_RES1:
+    case REG_IRQ_RES0:
         val = readq(hwgc->mmio + offset);
         break;
-    case REG_IRQ_RES2:
+    case REG_IRQ_RES1:
         val = readq(hwgc->mmio + offset);
         break;
     default:
@@ -93,19 +95,27 @@ static ssize_t hwgc_read(struct file *file, char __user *buf, size_t count, loff
 
 static void hwgc_write_params(struct hwgc_dev *hwgc, const struct HWGC_PARALLOCATE_PARS *par)
 {
-    void __iomem *base = hwgc->mmio + REG_PAR;
-    writeq(par->alloc_region, base + 0x00);
-    writeq(par->min_word_size, base + 0x08);
-    writeq(par->desired_word_size, base + 0x10);
+    void __iomem *base = hwgc->mmio + REG_PAR0;
+    writeq(par->dest_attr_type, base + 0x00);
+    writeq(par->allocator_ptr, base + 0x08);
+    writeq(par->alloc_region, base + 0x10);
+    writeq(par->min_word_size, base + 0x18);
+    writeq(par->desired_word_size, base + 0x20);
+    writeq(par->freelist_lock_ptr, base + 0x28);
+    writeq(par->thread, base + 0x30);
 }
 
 static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    pr_info("hwgc: ioctl called, cmd=0x%x arg=0x%lx\n", cmd, arg);
     struct hwgc_dev *hwgc = file->private_data;
     struct HWGC_PARALLOCATE_PARS hwgc_par;
     int state;
     uint64_t res;
+    struct
+    {
+        uint64_t res;
+        uint64_t word_size;
+    } temp;
     unsigned long flags;
 
     switch (cmd)
@@ -114,16 +124,15 @@ static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         if (copy_from_user(&hwgc_par, (void __user *)arg, sizeof(hwgc_par)))
             return -EFAULT;
 
+        spin_lock_irqsave(&hwgc->lock, flags);
+        hwgc->state = HWGC_RUNNING;
+        spin_unlock_irqrestore(&hwgc->lock, flags);
+
         hwgc_write_params(hwgc, &hwgc_par); // write parameters
 
         writel(HWGC_STATUS_IRQ, hwgc->mmio + REG_STATUS); // enable interrupts
         writel(1, hwgc->mmio + REG_START_WORK);           // start work
 
-        spin_lock_irqsave(&hwgc->lock, flags);
-        hwgc->state = HWGC_RUNNING;
-        spin_unlock_irqrestore(&hwgc->lock, flags);
-
-        printk("HWGC_IOC_START called\n");
         break;
 
     case HWGC_IOC_WAIT_EVENT:
@@ -145,8 +154,14 @@ static long hwgc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         {
             if (copy_from_user(&res, (void __user *)arg, sizeof(res)))
                 return -EFAULT;
-            printk("state %u, res %lx\n", hwgc->state, res);
-            writeq(res, hwgc->mmio + REG_IRQ_RES1);
+            writeq(res, hwgc->mmio + REG_IRQ_RES0);
+        }
+        if (hwgc->state == HWGC_WAIT_ATTEMPT)
+        {
+            if (copy_from_user(&temp, (void __user *)arg, sizeof(temp)))
+                return -EFAULT;
+            writeq(temp.res, hwgc->mmio + REG_IRQ_RES0);
+            writeq(temp.word_size, hwgc->mmio + REG_IRQ_RES1);
         }
         hwgc->state = HWGC_RUNNING;
         spin_unlock_irqrestore(&hwgc->lock, flags);
