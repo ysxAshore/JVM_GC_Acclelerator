@@ -1,12 +1,16 @@
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/io.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/uaccess.h>
 #include <linux/interrupt.h>
 #include <linux/wait.h>
-#include <linux/sched.h>
-#include <linux/uaccess.h>
+#include <linux/spinlock.h>
+#include <linux/io.h>
+#include <linux/mutex.h>
+#include <linux/bitops.h>
+#include <linux/version.h>
 
 enum hwgc_state
 {
