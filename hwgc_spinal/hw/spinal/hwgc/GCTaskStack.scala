@@ -117,6 +117,9 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
 
   io.toFetch.Pop.valid := state === overall_state.s_work && !task_empty
   io.toFetch.Pop.payload := stack_data.readAsync(stack_top)
+  when(io.toFetch.Pop.fire && push_count =/= 0){
+    push_count := push_count - 1
+  }
 
   io.toFetch.PrePop.valid := state === overall_state.s_work && prefetchHit && !not_prefetch
   io.toFetch.PrePop.payload := prefetchData
@@ -231,7 +234,9 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
     def run(): Unit = {
       val wantNum = U(4, queue_bottom.getWidth bits)
       val queueAvail = queue_bottom
-      val reqNum = Mux(wantNum >= queueAvail, queue_bottom, wantNum)
+      val queueBottomElements = elemAddr(queue_bottom)(4 downto 0) >> 3
+      val reqNum_temp = Mux(wantNum >= queueAvail, queue_bottom, wantNum)
+      val reqNum = Mux(reqNum_temp >= queueBottomElements && queueBottomElements =/= 0, queueBottomElements, reqNum_temp)
 
       // 给前台 push 留 1 个槽位，避免返回拍和 push 太紧
       val freeForReadback = Mux(task_free > U(1, task_free.getWidth bits), task_free - 1, U(0, task_free.getWidth bits))
