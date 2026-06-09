@@ -11,23 +11,17 @@ class GCUnalignedMMUAdapter extends Component with HWParameters with GCParameter
     val out = master(new LocalMMUIO)
   }
 
-  // --------------------------------------------------------------------------
   // defaults
-  // --------------------------------------------------------------------------
   io.in.ConherentRequsetSourceID.valid := False
   io.in.ConherentRequsetSourceID.payload.clearAll()
 
   io.out.Request.payload.clearAll()
-
-  io.out.RequestSize.valid := False
   io.out.RequestSize.payload.clearAll()
 
   io.in.Response.valid := False
   io.in.Response.payload.clearAll()
 
-  // --------------------------------------------------------------------------
   // request state
-  // --------------------------------------------------------------------------
   val busy             = RegInit(False)
   val splitReq         = RegInit(False)
   val sendBeat0Pending = RegInit(False)
@@ -51,28 +45,25 @@ class GCUnalignedMMUAdapter extends Component with HWParameters with GCParameter
   val respBufPayload = Reg(cloneOf(io.in.Response.payload))
   respBufPayload.init(io.in.Response.payload.getZero)
 
-  // --------------------------------------------------------------------------
   // derived values from latched request
-  // --------------------------------------------------------------------------
   val offset      = addr(log2Up(LineBytesNum) - 1 downto 0)
   val alignedAddr = addr & ~U(LineBytesNum - 1, addr.getWidth bits)
   val crossBeat   = offset + size > LineBytesNum
   val firstBytes  = Mux(crossBeat, LineBytesNum - offset, size)
   val secondBytes = size - firstBytes
 
+  val inOffsetNow        = io.in.Request.payload.RequestVirtualAddr(log2Up(LineBytesNum) - 1 downto 0)
+  val inCrossBeatNow     = inOffsetNow + io.in.RequestSize.payload > LineBytesNum
+  val alignedAccessNow   = inOffsetNow === 0 && !inCrossBeatNow
+  val directAlignedReqNow = !busy && !respBufValid && io.in.Request.valid && alignedAccessNow
+
   val writeData0 = reqData |<< (offset << 3)
   val writeData1 = reqData |>> (firstBytes << 3)
   val mask0      = ((U(1, LineBytesNum bits) |<< firstBytes) - 1) |<< offset
   val mask1      = (U(1, LineBytesNum bits) |<< secondBytes) - 1
 
-  // --------------------------------------------------------------------------
   // accept one new request
-  // --------------------------------------------------------------------------
-  io.in.Request.ready := !busy && !respBufValid
-
-  val inOffsetNow    =
-    io.in.Request.payload.RequestVirtualAddr(log2Up(LineBytesNum) - 1 downto 0)
-  val inCrossBeatNow = inOffsetNow + io.in.RequestSize.payload > LineBytesNum
+  io.in.Request.ready := (!busy && !respBufValid) && (!alignedAccessNow || io.out.Request.ready)
 
   when(io.in.Request.fire) {
     size    := io.in.RequestSize.payload
@@ -80,20 +71,33 @@ class GCUnalignedMMUAdapter extends Component with HWParameters with GCParameter
     reqData := io.in.Request.payload.RequestData
     isWrite := io.in.Request.payload.RequestType_isWrite
 
-    splitReq         := inCrossBeatNow
-    sendBeat0Pending := True
-    sendBeat1Pending := inCrossBeatNow
-    gotOneResp       := False
-    busy             := True
+    splitReq := inCrossBeatNow && !alignedAccessNow
+    when(alignedAccessNow) {
+      sendBeat0Pending := False
+      sendBeat1Pending := False
+    } otherwise {
+      sendBeat0Pending := True
+      sendBeat1Pending := inCrossBeatNow
+    }
+    gotOneResp := False
+    busy := True
   }
 
-  // --------------------------------------------------------------------------
   // request issuing logic
-  // --------------------------------------------------------------------------
   val issueBeat0 = busy && sendBeat0Pending
   val issueBeat1 = busy && !sendBeat0Pending && sendBeat1Pending
 
-  io.out.Request.valid := issueBeat0 || issueBeat1
+  io.out.Request.valid := issueBeat0 || issueBeat1 || directAlignedReqNow
+  io.out.RequestSize.valid := directAlignedReqNow
+
+  when(directAlignedReqNow) {
+    io.out.Request.payload.RequestVirtualAddr := io.in.Request.payload.RequestVirtualAddr
+    io.out.Request.payload.RequestSourceID := io.out.ConherentRequsetSourceID.payload
+    io.out.Request.payload.RequestData := io.in.Request.payload.RequestData
+    io.out.Request.payload.RequestWStrb := io.in.Request.payload.RequestWStrb
+    io.out.Request.payload.RequestType_isWrite := io.in.Request.payload.RequestType_isWrite
+    io.out.RequestSize.payload := io.in.RequestSize.payload
+  }
 
   when(issueBeat0) {
     io.out.Request.payload.RequestVirtualAddr := alignedAddr
@@ -119,9 +123,11 @@ class GCUnalignedMMUAdapter extends Component with HWParameters with GCParameter
     when(issueBeat0) {
       firstSourceID := io.out.ConherentRequsetSourceID.payload
       sendBeat0Pending := False
-    } elsewhen(issueBeat1) {
+    }.elsewhen(issueBeat1) {
       secondSourceID := io.out.ConherentRequsetSourceID.payload
       sendBeat1Pending := False
+    }.elsewhen(directAlignedReqNow) {
+      firstSourceID := io.out.ConherentRequsetSourceID.payload
     }
   }
 
@@ -160,25 +166,26 @@ class GCUnalignedMMUAdapter extends Component with HWParameters with GCParameter
     }
   }
 
-  // --------------------------------------------------------------------------
   // response output: buffered response has priority, otherwise bypass current one
-  // --------------------------------------------------------------------------
   when(respBufValid) {
     io.in.Response.valid := True
     io.in.Response.payload := respBufPayload
-  } elsewhen(finalRespNow) {
-    io.in.Response.valid := True
-    io.in.Response.payload := bypassRespPayload
+  } otherwise {
+    when(finalRespNow) {
+      io.in.Response.valid := True
+      io.in.Response.payload := bypassRespPayload
+    }
   }
 
-  // Only accept out response when:
-  //   - request(s) have all been issued
-  //   - final response buffer is empty
-  io.out.Response.ready := busy && !sendBeat0Pending && !sendBeat1Pending && !respBufValid
+  // Accept the first split response as soon as beat0 has been issued.
+  // The final response still waits until all beats are issued.
+  val firstSplitRespCanArrive = splitReq && !gotOneResp && !sendBeat0Pending && !respBufValid
+  val finalRespCanArrive = !splitReq && !sendBeat0Pending && !sendBeat1Pending && !respBufValid ||
+    (splitReq && gotOneResp && !sendBeat0Pending && !sendBeat1Pending && !respBufValid)
 
-  // --------------------------------------------------------------------------
+  io.out.Response.ready := busy && (firstSplitRespCanArrive || finalRespCanArrive)
+
   // response state update
-  // --------------------------------------------------------------------------
 
   // 1) buffered final response consumed by upstream
   when(respBufValid && io.in.Response.ready) {
