@@ -79,9 +79,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
   io.Fetch2ArrayProcess.clearIn()
   io.Fetch2OopProcess.clearIn()
 
-  // ------------------------------------------------------------------------
   // Helpers
-  // ------------------------------------------------------------------------
   def receiveTask(payload: UInt, data: GcFetchData): Unit = {
     when(payload(GCOopTagWidth - 1 downto 0) === U(PartialArrayTag, GCOopTagWidth bits)) {
       data.oopType := U(PartialArrayOop)
@@ -126,15 +124,11 @@ class GCFetch extends Module with HWParameters with GCParameters {
   val oopReadSize = U(8, LineBytesNumBitSize bits)
   val mwReadSize  = Mux(io.ConfigIO.UseCompressedKlassPointers, U(16), U(20)).resize(LineBytesNumBitSize)
 
-  // ------------------------------------------------------------------------
   // Data registers
-  // ------------------------------------------------------------------------
   val main_data = RegInit(GcFetchData().getZero)
   val push_data = RegInit(GcFetchData().getZero)
 
-  // ------------------------------------------------------------------------
   // PreFetch ring buffer
-  // ------------------------------------------------------------------------
   val preBuf      = Vec.fill(PreFetchBufferNum)(RegInit(GcFetchData().getZero))
   val preBufDone  = Vec.fill(PreFetchBufferNum)(RegInit(False))
   val preBufMwHit = Vec.fill(PreFetchBufferNum)(RegInit(False))
@@ -153,17 +147,13 @@ class GCFetch extends Module with HWParameters with GCParameters {
     preBufMwHit(idx) := False
   }
 
-  // ------------------------------------------------------------------------
   // State visibility wires
-  // ------------------------------------------------------------------------
   val mainIsIdle     = Bool()
   val mainIsWaitDone = Bool()
 
   val pushIsIdle     = Bool()
 
-  // ------------------------------------------------------------------------
   // Cross-FSM command pulses
-  // ------------------------------------------------------------------------
   val mainGotoIdle    = Bool()
   val mainGotoReadOop = Bool()
   val mainGotoSend    = Bool()
@@ -172,9 +162,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
   mainGotoReadOop := False
   mainGotoSend    := False
 
-  // ------------------------------------------------------------------------
   // Cross-pipeline signals
-  // ------------------------------------------------------------------------
   val targetDone = Mux(
     main_data.oopType === U(NotArrayOop),
     io.Fetch2OopProcess.Done,
@@ -193,9 +181,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
   val waitForPrefetch = RegInit(False)
 
-  // ------------------------------------------------------------------------
   // MarkWord forwarding
-  // ------------------------------------------------------------------------
   val fwdValid = RegInit(False)
   val fwdObj   = RegInit(U(0, preBuf(0).fromObj.getWidth bits))
   val fwdValue = RegInit(U(0, GCElementWidth bits))
@@ -213,9 +199,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
     }
   }
 
-  // ==========================================================================
   // Main StateMachine
-  // ==========================================================================
   val mainFsm = new StateMachine {
     val IDLE          = new State with EntryPoint
     val READ_OOP_REQ  = new State
@@ -339,9 +323,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
     }
   }
 
-  // ==========================================================================
   // Push StateMachine
-  // ==========================================================================
   val pushFsm = new StateMachine {
     val IDLE          = new State with EntryPoint
     val READ_OOP_REQ  = new State
@@ -442,9 +424,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
     }
   }
 
-  // ==========================================================================
   // PreFetch StateMachine
-  // ==========================================================================
   val preFsm = new StateMachine {
     val IDLE          = new State with EntryPoint
     val READ_OOP_REQ  = new State
@@ -618,9 +598,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
     }
   }
 
-  // ------------------------------------------------------------------------
   // State visibility assignments
-  // ------------------------------------------------------------------------
   mainIsIdle     := mainFsm.isActive(mainFsm.IDLE)
   mainIsWaitDone := mainFsm.isActive(mainFsm.WAIT_DONE)
 

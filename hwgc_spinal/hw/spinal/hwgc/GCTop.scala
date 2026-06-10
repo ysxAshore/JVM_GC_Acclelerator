@@ -29,6 +29,7 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcLocalMMU.io.localMMUIOs(12) <>  gcUnalignedMMUAdapter(12).io.out
   gcLocalMMU.io.localMMUIOs(13) <>  gcUnalignedMMUAdapter(13).io.out
   gcLocalMMU.io.localMMUIOs(14) <>  gcUnalignedMMUAdapter(14).io.out
+  gcLocalMMU.io.localMMUIOs(15) <>  gcUnalignedMMUAdapter(15).io.out
 
   val task_valid = RegInit(False)
 
@@ -129,7 +130,8 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcFetch.io.CopyDone := gcCopy.io.ToCopy.Done
 
   // GCOopProcess (ToAop)
-  gcOopProcess.io.Mreq <> gcUnalignedMMUAdapter(2).io.in
+  gcOopProcess.io.Mreq0 <> gcUnalignedMMUAdapter(2).io.in
+  gcOopProcess.io.Mreq1 <> gcUnalignedMMUAdapter(15).io.in
   gcOopProcess.io.Process2CopySurvivor <> gcOopCopy2Survivor.io.ToCopySurvivor
   gcOopProcess.io.ConfigIO.RegionAttrShiftBy := RegionAttrShiftBy
   gcOopProcess.io.ConfigIO.RegionAttrBiasedBase := RegionAttrBiasedBase

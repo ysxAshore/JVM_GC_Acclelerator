@@ -712,7 +712,7 @@ object WrapDec {
 
 
 object LocalMMUTaskType {
-  val TaskTypeMax = 13 + 2
+  val TaskTypeMax = 14 + 2
   val TaskTypeBitWidth = log2Up(TaskTypeMax)
 }
 
