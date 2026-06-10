@@ -27,6 +27,8 @@ class GCTop extends Module with GCParameters with HWParameters {
   }
   gcLocalMMU.io.localMMUIOs(11) <>  gcUnalignedMMUAdapter(11).io.out
   gcLocalMMU.io.localMMUIOs(12) <>  gcUnalignedMMUAdapter(12).io.out
+  gcLocalMMU.io.localMMUIOs(13) <>  gcUnalignedMMUAdapter(13).io.out
+  gcLocalMMU.io.localMMUIOs(14) <>  gcUnalignedMMUAdapter(14).io.out
 
   val task_valid = RegInit(False)
 
@@ -112,7 +114,9 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcTaskStack.io.DebugTimeStamp := DebugTimeStamp
 
   // GCFetch
-  gcFetch.io.Mreq <> gcUnalignedMMUAdapter(1).io.in
+  gcFetch.io.MainMreq <> gcUnalignedMMUAdapter(1).io.in
+  gcFetch.io.PushMreq <> gcUnalignedMMUAdapter(13).io.in
+  gcFetch.io.PreMreq <> gcUnalignedMMUAdapter(14).io.in
   gcFetch.io.Fetch2OopProcess <> gcOopProcess.io.Fetch2Process
   gcFetch.io.Fetch2ArrayProcess <> gcArrayProcess.io.Fetch2Process
   gcFetch.io.Trace2Fetch <> gcTrace.io.Trace2Fetch

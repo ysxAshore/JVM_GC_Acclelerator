@@ -41,9 +41,9 @@ trait GCParameters {
   val TypeArrayKlassID = 4
   val ObjectArrayKlassID = 5
 
-  val PreFetchBuffer = 16
-  val PreFetchScanWindow = PreFetchBuffer
-  val PreFetchBufferWidth = log2Up(PreFetchBuffer)
+  val PreFetchBufferNum = 16
+  val PreFetchScanWindow = PreFetchBufferNum
+  val PreFetchBufferWidth = log2Up(PreFetchBufferNum)
 
 
   val GCTaskQueue_Size = 1 << 17
@@ -61,7 +61,7 @@ trait HWParameters {
   val LineBytesNum = MMUDataWidth / 8
   val LineBytesNumBitSize = log2Up(LineBytesNum) + 1
 
-  val LLCSourceMaxNum = 64
+  val LLCSourceMaxNum = 32
   val LLCSourceMaxNumBitSize = log2Up(LLCSourceMaxNum) + 1
 
   // helper: issueReq
@@ -712,7 +712,7 @@ object WrapDec {
 
 
 object LocalMMUTaskType {
-  val TaskTypeMax = 11 + 2
+  val TaskTypeMax = 13 + 2
   val TaskTypeBitWidth = log2Up(TaskTypeMax)
 }
 

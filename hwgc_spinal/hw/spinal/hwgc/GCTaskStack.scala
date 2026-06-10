@@ -110,8 +110,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   // When push_count == 0, prefetchIdx is selected from candidates and may equal stack_top.
   // Only suppress PrePop when there's an actual address conflict, allowing concurrent
   // Pop + PrePop when they target different elements for higher throughput.
-  val addressConflict = (prefetchIdx === stack_top)
-  io.toFetch.PrePop.valid     := inWork && prefetchHit && !not_prefetch && !addressConflict
+  io.toFetch.PrePop.valid     := inWork && prefetchHit && !not_prefetch
   io.toFetch.PrePop.payload   := prefetchData
   io.toStack.Push.ready       := inWork && task_free =/= U(0)
 

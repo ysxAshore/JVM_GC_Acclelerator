@@ -2,72 +2,113 @@ package hwgc
 
 import spinal.core._
 import spinal.lib._
+import spinal.lib.fsm._
 
 import scala.language.postfixOps
 
+// Data bundle for a single fetch task
 case class GcFetchData() extends Bundle with GCParameters {
-  val task = UInt(GCElementWidth bits)
-  val oopType = UInt(GCOopTypeWidth bits)
-  val fromObj = UInt(GCElementWidth bits)
-  val markWord = UInt(GCElementWidth bits)
-  val klassPtr = UInt(GCElementWidth bits)
+  val task      = UInt(GCElementWidth bits)
+  val oopType   = UInt(GCOopTypeWidth bits)
+  val fromObj   = UInt(GCElementWidth bits)
+  val markWord  = UInt(GCElementWidth bits)
+  val klassPtr  = UInt(GCElementWidth bits)
   val srcLength = UInt(32 bits)
 }
 
-/* GCFetch read task from TaskStack, the dispatch to arrayProcess and oopProcess */
+// ============================================================================
+// GCFetch — Read tasks from TaskStack, fetch OOP/MarkWord via MMU,
+//           and dispatch to ArrayProcess or OopProcess.
+//
+// Three independent MMU ports:
+//   MainMreq — used by mainFsm
+//   PushMreq — used by pushFsm
+//   PreMreq  — used by preFsm
+//
+// No MMU arbitration inside GCFetch.
+// ============================================================================
 class GCFetch extends Module with HWParameters with GCParameters {
-  val io = new Bundle{
-    val Mreq = master(new LocalMMUIO)
-    val toFetch = slave(new GCToFetch)
-    val gcWriteSrcOopPtr = slave (new GCWriteSrcOopPtr)
-    val Trace2Fetch = slave Stream UInt(GCElementWidth bits)
+  val io = new Bundle {
+    val MainMreq           = master(new LocalMMUIO)
+    val PushMreq           = master(new LocalMMUIO)
+    val PreMreq            = master(new LocalMMUIO)
 
-    val CopyDone = in Bool()
+    val toFetch            = slave(new GCToFetch)
+    val gcWriteSrcOopPtr   = slave(new GCWriteSrcOopPtr)
+    val Trace2Fetch        = slave Stream UInt(GCElementWidth bits)
+    val CopyDone           = in Bool()
 
     val Fetch2ArrayProcess = master(new GCToProcessUnit)
-    val Fetch2OopProcess = master(new GCToProcessUnit)
-
-    val ConfigIO = slave(new GCFetchConfigIO)
-    val DebugTimeStamp = in(UInt(64 bits))
+    val Fetch2OopProcess   = master(new GCToProcessUnit)
+    val ConfigIO           = slave(new GCFetchConfigIO)
+    val DebugTimeStamp     = in UInt(64 bits)
   }
 
-  // default value
-  io.Mreq.Request.valid := False
-  io.Mreq.Request.payload.clearAll()
-  io.Mreq.RequestSize.valid := False
-  io.Mreq.RequestSize.payload.clearAll()
+  // ------------------------------------------------------------------------
+  // Helpers for MMU ports
+  // ------------------------------------------------------------------------
+  def clearMreq(m: LocalMMUIO): Unit = {
+    m.Request.valid     := False
+    m.Request.payload.clearAll()
+    m.RequestSize.valid := False
+    m.RequestSize.payload.clearAll()
+    m.Response.ready    := False
+  }
 
-  io.toFetch.Pop.ready := False
+  def driveReadReq(m: LocalMMUIO, addr: UInt, sizeBytes: UInt): Unit = {
+    m.Request.valid     := True
+    m.RequestSize.valid := True
+
+    m.Request.payload.RequestWStrb         := U(0)
+    m.Request.payload.RequestData          := U(0)
+    m.Request.payload.RequestType_isWrite  := False
+    m.Request.payload.RequestSourceID      := m.ConherentRequsetSourceID.payload
+    m.Request.payload.RequestVirtualAddr   := addr
+
+    m.RequestSize.payload := sizeBytes.resize(LineBytesNumBitSize)
+  }
+
+  clearMreq(io.MainMreq)
+  clearMreq(io.PushMreq)
+  clearMreq(io.PreMreq)
+
+  io.toFetch.Pop.ready    := False
   io.toFetch.PrePop.ready := False
-  io.Trace2Fetch.ready := False
+  io.Trace2Fetch.ready    := False
 
   io.Fetch2ArrayProcess.clearIn()
   io.Fetch2OopProcess.clearIn()
 
-  object overall_state extends SpinalEnum {
-    val s_idle, s_readOop, s_readMW, s_send, s_waitDone = newElement()
-  }
-  object MreqOwner extends SpinalEnum {
-    val none, mainReadOop, mainReadMW, pushReadOop, pushReadMW, prefetchReadOop, prefetchReadMW = newElement()
-  }
-
-  def receiveTask(payload: UInt, data: GcFetchData) : Unit = {
-    when(payload(GCOopTagWidth - 1 downto 0) === U(PartialArrayTag, GCOopTagWidth bits)){
+  // ------------------------------------------------------------------------
+  // Helpers
+  // ------------------------------------------------------------------------
+  def receiveTask(payload: UInt, data: GcFetchData): Unit = {
+    when(payload(GCOopTagWidth - 1 downto 0) === U(PartialArrayTag, GCOopTagWidth bits)) {
       data.oopType := U(PartialArrayOop)
-      data.task := payload - U(PartialArrayTag)
-    }.otherwise{
+      data.task    := payload - U(PartialArrayTag)
+    }.otherwise {
       data.oopType := U(NotArrayOop, GCOopTypeWidth bits)
-      data.task := payload - payload(GCOopTagWidth - 1 downto 0)
+      data.task    := payload - payload(GCOopTagWidth - 1 downto 0)
     }
   }
 
-  def decodeReadOopResp(rd: UInt): UInt = {
-    Mux(io.ConfigIO.UseCompressedOop, (io.ConfigIO.CompressedOopBase + (rd(31 downto 0) << io.ConfigIO.CompressedOopShift)).resize(GCElementWidth), rd(GCElementWidth - 1 downto 0))
-  }
+  def decodeReadOopResp(rd: UInt): UInt =
+    Mux(
+      io.ConfigIO.UseCompressedOop,
+      (io.ConfigIO.CompressedOopBase + (rd(31 downto 0) << io.ConfigIO.CompressedOopShift)).resize(GCElementWidth),
+      rd(GCElementWidth - 1 downto 0)
+    )
 
-  def decodeMarkWord(rd: UInt): UInt = rd(GCElementWidth - 1 downto 0)
-  def decodeKlassPtr(rd: UInt): UInt = rd(GCElementWidth * 2 - 1 downto GCElementWidth)
-  def decodeSrcLength(rd : UInt): UInt = Mux(io.ConfigIO.UseCompressedKlassPointers, rd(GCElementWidth * 2 - 1 downto GCElementWidth + 32), rd(GCElementWidth * 2 + 31 downto GCElementWidth * 2))
+  def fillMwKlassLen(rd: UInt, data: GcFetchData): Unit = {
+    data.markWord := rd(GCElementWidth - 1 downto 0)
+    data.klassPtr := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+
+    data.srcLength := Mux(
+      io.ConfigIO.UseCompressedKlassPointers,
+      rd(GCElementWidth * 2 - 1 downto GCElementWidth + 32),
+      rd(GCElementWidth * 2 + 31 downto GCElementWidth * 2)
+    )
+  }
 
   def dbg(msg: Seq[Any]): Unit =
     if (DebugEnable) report(Seq("[GCFetch<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
@@ -82,344 +123,508 @@ class GCFetch extends Module with HWParameters with GCParameters {
     target.SrcLength := payload.srcLength
   }
 
-  val issued = RegInit(False)
-  val mreqOwner = RegInit(MreqOwner.none)
+  val oopReadSize = U(8, LineBytesNumBitSize bits)
+  val mwReadSize  = Mux(io.ConfigIO.UseCompressedKlassPointers, U(16), U(20)).resize(LineBytesNumBitSize)
 
-  val state = RegInit(overall_state.s_idle)
-
-  val push_state = RegInit(overall_state.s_idle)
-  val push_data = RegInit(GcFetchData().getZero)
+  // ------------------------------------------------------------------------
+  // Data registers
+  // ------------------------------------------------------------------------
   val main_data = RegInit(GcFetchData().getZero)
+  val push_data = RegInit(GcFetchData().getZero)
 
-  val preFetch_state = RegInit(overall_state.s_idle)
-  val preFetchBuffer = Vec.fill(PreFetchBuffer)(RegInit(GcFetchData().getZero))
-  val preFetchBufferDone = Vec.fill(PreFetchBuffer)(RegInit(False))
+  // ------------------------------------------------------------------------
+  // PreFetch ring buffer
+  // ------------------------------------------------------------------------
+  val preBuf      = Vec.fill(PreFetchBufferNum)(RegInit(GcFetchData().getZero))
+  val preBufDone  = Vec.fill(PreFetchBufferNum)(RegInit(False))
+  val preBufMwHit = Vec.fill(PreFetchBufferNum)(RegInit(False))
 
-  val buffer_ptr = RegInit(U(0, PreFetchBufferWidth bits)) // 记录当前preFetch state访问的是哪个 因为在idle接收后 top就会变化
-  val buffer_top = RegInit(U(0, PreFetchBufferWidth bits)) // top存
-  val buffer_bottom = RegInit(U(0, PreFetchBufferWidth bits)) // bottom取
-  val buffer_count = RegInit(U(0, PreFetchBufferWidth + 1 bits))
-  val buffer_free = U(PreFetchBuffer - 1, PreFetchBufferWidth + 1 bits) - buffer_count
+  val buf_top    = RegInit(U(0, PreFetchBufferWidth bits))
+  val buf_bottom = RegInit(U(0, PreFetchBufferWidth bits))
+  val buf_count  = RegInit(U(0, PreFetchBufferWidth + 1 bits))
+  val buf_free   = U(PreFetchBufferNum - 1, PreFetchBufferWidth + 1 bits) - buf_count
 
-  val targetDone = Mux(main_data.oopType === U(NotArrayOop), io.Fetch2OopProcess.Done, io.Fetch2ArrayProcess.Done)
-  val copyDoneSeen = RegInit(False)
+  val buf_work = RegInit(U(0, PreFetchBufferWidth bits))
+
+  val pushFollowRem = RegInit(U(0, 32 bits))
+
+  def resetSlot(idx: UInt): Unit = {
+    preBufDone(idx)  := False
+    preBufMwHit(idx) := False
+  }
+
+  // ------------------------------------------------------------------------
+  // State visibility wires
+  // ------------------------------------------------------------------------
+  val mainIsIdle     = Bool()
+  val mainIsWaitDone = Bool()
+
+  val pushIsIdle     = Bool()
+
+  // ------------------------------------------------------------------------
+  // Cross-FSM command pulses
+  // ------------------------------------------------------------------------
+  val mainGotoIdle    = Bool()
+  val mainGotoReadOop = Bool()
+  val mainGotoSend    = Bool()
+
+  mainGotoIdle    := False
+  mainGotoReadOop := False
+  mainGotoSend    := False
+
+  // ------------------------------------------------------------------------
+  // Cross-pipeline signals
+  // ------------------------------------------------------------------------
+  val targetDone = Mux(
+    main_data.oopType === U(NotArrayOop),
+    io.Fetch2OopProcess.Done,
+    io.Fetch2ArrayProcess.Done
+  )
+
   val targetDoneSeen = RegInit(False)
-  val waitPreFetch = RegInit(False) // main_state 接收到了一个已经 预取过得task 等待其预取完
-
-  val wantMainReadOop     = state === overall_state.s_readOop && main_data.oopType === U(NotArrayOop)
-  val wantMainReadMW      = state === overall_state.s_readMW
-  val wantPushReadOop     = (push_state === overall_state.s_readOop) && (push_data.oopType === U(NotArrayOop)) && (main_data.oopType === U(PartialArrayOop) || io.CopyDone || copyDoneSeen)
-  val wantPushReadMW      = push_state === overall_state.s_readMW
-  val withoutMainReq = !wantMainReadMW && !wantMainReadOop
-  val withoutPushReq = !wantPushReadMW && !wantPushReadOop
-  val wantPrefetchReadOop = withoutMainReq && withoutPushReq && preFetch_state === overall_state.s_readOop && preFetchBuffer(buffer_ptr).oopType === U(NotArrayOop)
-  val wantPrefetchReadMW  = withoutMainReq && withoutPushReq && preFetch_state === overall_state.s_readMW
-
-  val preFetchBufferMarkWordForwarded = Vec(RegInit(False), PreFetchBuffer)
-  val pendingForwardValid = RegInit(False)
-  val pendingForwardObj   = RegInit(U(0, preFetchBuffer(0).fromObj.getWidth bits))
-  val pendingForwardValue = RegInit(U(0, GCElementWidth bits))
-
-  when(io.gcWriteSrcOopPtr.valid) {
-    pendingForwardValid := True
-    pendingForwardObj   := io.gcWriteSrcOopPtr.srcOopPtr
-    pendingForwardValue := io.gcWriteSrcOopPtr.writeValue
-  }
-
-  when(io.CopyDone){
-    copyDoneSeen := True
-  }
-  when(targetDone && state =/= overall_state.s_waitDone){
+  when(targetDone && !mainIsWaitDone) {
     targetDoneSeen := True
   }
 
-  for(i <- 0 until PreFetchBuffer){
-    when(io.gcWriteSrcOopPtr.valid && preFetchBufferDone(i) && preFetchBuffer(i).fromObj === io.gcWriteSrcOopPtr.srcOopPtr){
-        preFetchBuffer(i).markWord := io.gcWriteSrcOopPtr.writeValue
-        preFetchBufferMarkWordForwarded(i) := True
+  val copyDoneSeen = RegInit(False)
+  when(io.CopyDone) {
+    copyDoneSeen := True
+  }
+
+  val waitForPrefetch = RegInit(False)
+
+  // ------------------------------------------------------------------------
+  // MarkWord forwarding
+  // ------------------------------------------------------------------------
+  val fwdValid = RegInit(False)
+  val fwdObj   = RegInit(U(0, preBuf(0).fromObj.getWidth bits))
+  val fwdValue = RegInit(U(0, GCElementWidth bits))
+
+  when(io.gcWriteSrcOopPtr.valid) {
+    fwdValid := True
+    fwdObj   := io.gcWriteSrcOopPtr.srcOopPtr
+    fwdValue := io.gcWriteSrcOopPtr.writeValue
+  }
+
+  for (i <- 0 until PreFetchBufferNum) {
+    when(io.gcWriteSrcOopPtr.valid && preBufDone(i) && preBuf(i).fromObj === io.gcWriteSrcOopPtr.srcOopPtr) {
+      preBuf(i).markWord := io.gcWriteSrcOopPtr.writeValue
+      preBufMwHit(i)     := True
     }
   }
 
-  switch(push_state){
-    is(overall_state.s_idle){
-      io.Trace2Fetch.ready := True
-      when(io.Trace2Fetch.fire){
-        val payload = io.Trace2Fetch.payload
-        when(state === overall_state.s_idle){
-          receiveTask(payload, main_data)
-          state := overall_state.s_readOop
-        }.otherwise{
-          receiveTask(payload, push_data)
-          push_state := overall_state.s_readOop
-        }
-      }
-    }
+  // ==========================================================================
+  // Main StateMachine
+  // ==========================================================================
+  val mainFsm = new StateMachine {
+    val IDLE          = new State with EntryPoint
+    val READ_OOP_REQ  = new State
+    val READ_OOP_RESP = new State
+    val READ_MW_REQ   = new State
+    val READ_MW_RESP  = new State
+    val SEND          = new State
+    val WAIT_DONE     = new State
 
-    is(overall_state.s_readOop){
-      when(push_data.oopType === U(PartialArrayOop)) {
-        push_data.fromObj := push_data.task
-        push_state := overall_state.s_readMW
-      }
-    }
-
-    is(overall_state.s_send){
-      when(state === overall_state.s_idle) {
-        main_data := push_data
-        state := overall_state.s_send
-        push_state := overall_state.s_idle
-      }
-    }
-  }
-
-  val hasSubCount = RegInit(U(0, 32 bits))
-
-  switch(preFetch_state){
-    is(overall_state.s_idle) {
-      // not has the trace push to stack, normally prefetch
-      when(io.toFetch.PushCount === U(0) && hasSubCount === U(0)){
-        io.toFetch.PrePop.ready := buffer_free =/= U(0)
-        when(io.toFetch.PrePop.fire) {
-          buffer_ptr := buffer_top
-          buffer_top := buffer_top + 1
-          buffer_count := buffer_count + 1
-          preFetchBufferDone(buffer_top) := False
-          preFetchBufferMarkWordForwarded(buffer_top) := False
-          receiveTask(io.toFetch.PrePop.payload, preFetchBuffer(buffer_top))
-
-          preFetch_state := overall_state.s_readOop
-        }
-      }.otherwise{
-        io.toFetch.PrePop.ready := True // buffer full -> delete some entries
-        when(io.toFetch.PrePop.fire) {
-          when(io.toFetch.PushCount === U(0)) { // watch has_count
-            val idx = buffer_ptr + 1
-
-            buffer_ptr := idx
-            hasSubCount := hasSubCount - 1
-            buffer_count := buffer_count + 1
-            preFetchBufferDone(idx) := False
-            preFetchBufferMarkWordForwarded(idx) := False
-            receiveTask(io.toFetch.PrePop.payload, preFetchBuffer(idx))
-
-            preFetch_state := overall_state.s_readOop
-          }.otherwise {
-            val push_count = Mux(io.toFetch.PushCount > PreFetchBuffer, U(PreFetchBuffer), io.toFetch.PushCount)
-            val idx = WrapDec(buffer_bottom, PreFetchBuffer, push_count)
-            when(buffer_free >= push_count){
-              buffer_count := buffer_count + 1
-            }.otherwise{
-              buffer_top := WrapDec(buffer_top, PreFetchBuffer, push_count - buffer_free)
-              buffer_count := (buffer_count + buffer_free - push_count + 1).resized
-            }
-            buffer_ptr := idx
-            buffer_bottom := idx
-            hasSubCount := push_count - 1
-
-            preFetchBufferDone(idx) := False
-            preFetchBufferMarkWordForwarded(idx) := False
-            preFetch_state := overall_state.s_readOop
-            receiveTask(io.toFetch.PrePop.payload, preFetchBuffer(idx))
-          }
-        }
-      }
-    }
-
-    is(overall_state.s_readOop){
-      when(preFetchBuffer(buffer_ptr).oopType === U(PartialArrayOop)) {
-        preFetchBuffer(buffer_ptr).fromObj := preFetchBuffer(buffer_ptr).task
-        preFetch_state := overall_state.s_readMW
-      }
-    }
-  }
-
-  switch(state){
-    is(overall_state.s_idle){
-      io.toFetch.Pop.ready := push_state === overall_state.s_idle && !io.Trace2Fetch.valid && !waitPreFetch && hasSubCount === U(0)
+    IDLE.whenIsActive {
+      io.toFetch.Pop.ready := pushIsIdle &&
+                              !io.Trace2Fetch.valid &&
+                              !waitForPrefetch &&
+                              pushFollowRem === U(0)
 
       when(io.toFetch.Pop.fire) {
-        val popTaskBase = io.toFetch.Pop.payload - io.toFetch.Pop.payload(GCOopTagWidth - 1 downto 0)
-        when(preFetchBuffer(buffer_bottom).task === popTaskBase && preFetchBufferDone(buffer_bottom)) {
-          buffer_count := buffer_count - 1
-          buffer_bottom := buffer_bottom + 1
+        val popBase =
+          io.toFetch.Pop.payload -
+          io.toFetch.Pop.payload(GCOopTagWidth - 1 downto 0)
 
-          val data = preFetchBuffer(buffer_bottom)
-          main_data := data
-          state := overall_state.s_send
-        }.elsewhen(preFetchBuffer(buffer_bottom).task === popTaskBase){
-          waitPreFetch := True
-        }.otherwise{
-          state := overall_state.s_readOop
+        when(preBuf(buf_bottom).task === popBase && preBufDone(buf_bottom)) {
+          buf_count  := buf_count - 1
+          buf_bottom := buf_bottom + 1
+          main_data  := preBuf(buf_bottom)
+          goto(SEND)
+
+        }.elsewhen(preBuf(buf_bottom).task === popBase) {
+          waitForPrefetch := True
+
+        }.otherwise {
           receiveTask(io.toFetch.Pop.payload, main_data)
           main_data.fromObj := U(0)
+          goto(READ_OOP_REQ)
         }
       }
-
-      when(waitPreFetch && preFetchBufferDone(buffer_bottom)){
-        val data = preFetchBuffer(buffer_bottom)
-        main_data := data
-        state := overall_state.s_send
-
-        buffer_count := buffer_count - 1
-        buffer_bottom := buffer_bottom + 1
-        waitPreFetch := False
-      }
     }
 
-    is(overall_state.s_readOop){
-      when(main_data.oopType === U(PartialArrayOop)){
+    READ_OOP_REQ.whenIsActive {
+      when(main_data.oopType === U(PartialArrayOop)) {
         main_data.fromObj := main_data.task
-        state := overall_state.s_readMW
+        goto(READ_MW_REQ)
+      }.otherwise {
+        driveReadReq(io.MainMreq, main_data.task, oopReadSize)
+
+        when(io.MainMreq.Request.fire) {
+          goto(READ_OOP_RESP)
+        }
       }
     }
 
-    is(overall_state.s_send){
-      // Mux(cond, A, B) could read, but not support write
-      when(main_data.oopType === U(NotArrayOop)){
+    READ_OOP_RESP.whenIsActive {
+      io.MainMreq.Response.ready := True
+
+      when(io.MainMreq.Response.fire) {
+        val rd = io.MainMreq.Response.payload.ResponseData
+        main_data.fromObj := decodeReadOopResp(rd)
+        goto(READ_MW_REQ)
+      }
+    }
+
+    READ_MW_REQ.whenIsActive {
+      driveReadReq(io.MainMreq, main_data.fromObj, mwReadSize)
+
+      when(io.MainMreq.Request.fire) {
+        goto(READ_MW_RESP)
+      }
+    }
+
+    READ_MW_RESP.whenIsActive {
+      io.MainMreq.Response.ready := True
+
+      when(io.MainMreq.Response.fire) {
+        val rd = io.MainMreq.Response.payload.ResponseData
+        fillMwKlassLen(rd, main_data)
+        goto(SEND)
+      }
+    }
+
+    SEND.whenIsActive {
+      val isOop = main_data.oopType === U(NotArrayOop)
+
+      when(isOop) {
         driveProcessUnit(io.Fetch2OopProcess, main_data)
-      }.otherwise{
+      }.otherwise {
         driveProcessUnit(io.Fetch2ArrayProcess, main_data)
       }
 
-      val targetUnit = Mux(main_data.oopType === U(NotArrayOop), io.Fetch2OopProcess, io.Fetch2ArrayProcess)
-      when(targetUnit.Valid && targetUnit.Ready){
-        state := overall_state.s_waitDone
-        dbg(Seq("Dispatch Task=", main_data.task, " OopType=", main_data.oopType, " SrcOopPtr=", main_data.fromObj, " MarkWord=", main_data.markWord, " KlassPtr = ", main_data.klassPtr, " success!"))
+      val unitValid = Mux(isOop, io.Fetch2OopProcess.Valid, io.Fetch2ArrayProcess.Valid)
+      val unitReady = Mux(isOop, io.Fetch2OopProcess.Ready, io.Fetch2ArrayProcess.Ready)
+
+      when(unitValid && unitReady) {
+        goto(WAIT_DONE)
+
+        dbg(Seq(
+          "Dispatch Task=", main_data.task,
+          " OopType=", main_data.oopType,
+          " SrcOopPtr=", main_data.fromObj,
+          " MarkWord=", main_data.markWord,
+          " KlassPtr=", main_data.klassPtr,
+          " success!"
+        ))
       }
     }
 
-    is(overall_state.s_waitDone){
+    WAIT_DONE.whenIsActive {
       when(targetDone || targetDoneSeen) {
         targetDoneSeen := False
-        state := overall_state.s_idle
+        goto(IDLE)
         dbg(Seq("Task=", main_data.task, " done"))
       }
     }
-  }
 
-  when(!issued){
-    val task = Mux(wantMainReadOop || wantMainReadMW, main_data.task, Mux(wantPushReadOop || wantPushReadMW, push_data.task, preFetchBuffer(buffer_ptr).task))
-    val fromObj = Mux(wantMainReadOop || wantMainReadMW, main_data.fromObj, Mux(wantPushReadOop || wantPushReadMW, push_data.fromObj, preFetchBuffer(buffer_ptr).fromObj))
-    io.Mreq.Request.valid := !withoutPushReq || !withoutMainReq || wantPrefetchReadOop || wantPrefetchReadMW
-    io.Mreq.RequestSize.valid := !withoutPushReq || !withoutMainReq || wantPrefetchReadOop || wantPrefetchReadMW
-    io.Mreq.Request.payload.RequestWStrb := U(0)
-    io.Mreq.Request.payload.RequestData := U(0)
-    io.Mreq.Request.payload.RequestType_isWrite := False
-    io.Mreq.Request.payload.RequestSourceID := io.Mreq.ConherentRequsetSourceID.payload
-    when(wantMainReadMW || wantPushReadMW || wantPrefetchReadMW){
-      io.Mreq.RequestSize.payload := Mux(io.ConfigIO.UseCompressedKlassPointers, U(16), U(20)).resize(LineBytesNumBitSize)
-      io.Mreq.Request.payload.RequestVirtualAddr := fromObj
-    }.elsewhen(wantMainReadOop || wantPushReadOop || wantPrefetchReadOop){
-      io.Mreq.RequestSize.payload := U(8)
-      io.Mreq.Request.payload.RequestVirtualAddr := task
-    }
-
-    // Request 需要 先 ready 保持一拍
-    when(io.Mreq.Request.valid && io.Mreq.Request.ready){
-      mreqOwner := Mux(wantMainReadMW, MreqOwner.mainReadMW,
-        Mux(wantPushReadMW, MreqOwner.pushReadMW,
-          Mux(wantPrefetchReadMW, MreqOwner.prefetchReadMW,
-            Mux(wantMainReadOop, MreqOwner.mainReadOop,
-              Mux(wantPushReadOop, MreqOwner.pushReadOop, MreqOwner.prefetchReadOop)))))
-    }
-
-    when(io.Mreq.Request.fire){
-      issued := True
+    always {
+      when(mainGotoIdle) {
+        goto(IDLE)
+      }.elsewhen(mainGotoSend) {
+        goto(SEND)
+      }.elsewhen(mainGotoReadOop) {
+        goto(READ_OOP_REQ)
+      }
     }
   }
 
-  io.Mreq.Response.ready := issued
-  when(io.Mreq.Response.fire){
-    issued := False
-    mreqOwner := MreqOwner.none
+  // ==========================================================================
+  // Push StateMachine
+  // ==========================================================================
+  val pushFsm = new StateMachine {
+    val IDLE          = new State with EntryPoint
+    val READ_OOP_REQ  = new State
+    val READ_OOP_RESP = new State
+    val READ_MW_REQ   = new State
+    val READ_MW_RESP  = new State
+    val SEND          = new State
 
-    val rd = io.Mreq.Response.payload.ResponseData
-    switch(mreqOwner){
-      is(MreqOwner.mainReadOop){
-        main_data.fromObj := decodeReadOopResp(rd)
-        state := overall_state.s_readMW
+    def pushYieldOk: Bool =
+      main_data.oopType === U(PartialArrayOop) || io.CopyDone || copyDoneSeen
+
+    IDLE.whenIsActive {
+      io.Trace2Fetch.ready := True
+
+      when(io.Trace2Fetch.fire) {
+        val payload = io.Trace2Fetch.payload
+
+        when(mainIsIdle) {
+          receiveTask(payload, main_data)
+          main_data.fromObj := U(0)
+          mainGotoReadOop := True
+
+        }.otherwise {
+          receiveTask(payload, push_data)
+          push_data.fromObj := U(0)
+          goto(READ_OOP_REQ)
+        }
       }
-      is(MreqOwner.mainReadMW){
-        main_data.markWord := decodeMarkWord(rd)
-        main_data.klassPtr := decodeKlassPtr(rd)
-        main_data.srcLength := decodeSrcLength(rd)
-        state := overall_state.s_send
+    }
+
+    READ_OOP_REQ.whenIsActive {
+      when(push_data.oopType === U(PartialArrayOop)) {
+        push_data.fromObj := push_data.task
+        goto(READ_MW_REQ)
+
+      }.otherwise {
+        when(pushYieldOk) {
+          driveReadReq(io.PushMreq, push_data.task, oopReadSize)
+
+          when(io.PushMreq.Request.fire) {
+            goto(READ_OOP_RESP)
+          }
+        }
       }
-      is(MreqOwner.pushReadOop){
+    }
+
+    READ_OOP_RESP.whenIsActive {
+      io.PushMreq.Response.ready := True
+
+      when(io.PushMreq.Response.fire) {
+        val rd = io.PushMreq.Response.payload.ResponseData
         push_data.fromObj := decodeReadOopResp(rd)
-        push_state := overall_state.s_readMW
+        goto(READ_MW_REQ)
       }
-      is(MreqOwner.pushReadMW){
+    }
+
+    READ_MW_REQ.whenIsActive {
+      when(pushYieldOk) {
+        driveReadReq(io.PushMreq, push_data.fromObj, mwReadSize)
+
+        when(io.PushMreq.Request.fire) {
+          goto(READ_MW_RESP)
+        }
+      }
+    }
+
+    READ_MW_RESP.whenIsActive {
+      io.PushMreq.Response.ready := True
+
+      when(io.PushMreq.Response.fire) {
+        val rd = io.PushMreq.Response.payload.ResponseData
+
         copyDoneSeen := False
-        when(state === overall_state.s_idle){
-          main_data.task := push_data.task
+
+        when(mainIsIdle) {
+          main_data.task    := push_data.task
           main_data.oopType := push_data.oopType
           main_data.fromObj := push_data.fromObj
-          main_data.markWord := decodeMarkWord(rd)
-          main_data.klassPtr := decodeKlassPtr(rd)
-          main_data.srcLength := decodeSrcLength(rd)
-          state := overall_state.s_send
-          push_state := overall_state.s_idle
-        }.otherwise{
-          push_data.markWord := decodeMarkWord(rd)
-          push_data.klassPtr := decodeKlassPtr(rd)
-          push_data.srcLength := decodeSrcLength(rd)
-          push_state := overall_state.s_send
-        }
-      }
-      is(MreqOwner.prefetchReadOop){
-        val newFromObj = decodeReadOopResp(rd)
-        preFetchBuffer(buffer_ptr).fromObj := newFromObj
 
-        when(pendingForwardValid && pendingForwardObj === newFromObj) {
-          preFetchBuffer(buffer_ptr).markWord := pendingForwardValue
-          preFetchBufferMarkWordForwarded(buffer_ptr) := True
-          pendingForwardValid := False
-        }
+          fillMwKlassLen(rd, main_data)
 
-        preFetch_state := overall_state.s_readMW
-      }
-      is(MreqOwner.prefetchReadMW){
-        preFetch_state := overall_state.s_idle
+          mainGotoSend := True
+          goto(IDLE)
 
-        val currentFromObj = preFetchBuffer(buffer_ptr).fromObj
-
-        val hitForwardNow = io.gcWriteSrcOopPtr.valid && (currentFromObj === io.gcWriteSrcOopPtr.srcOopPtr) ||
-          pendingForwardValid && (currentFromObj === pendingForwardObj)
-
-        val finalMarkWord = UInt(GCElementWidth bits)
-        finalMarkWord := decodeMarkWord(rd)
-        when(hitForwardNow) {
-          when(io.gcWriteSrcOopPtr.valid) {
-            finalMarkWord := io.gcWriteSrcOopPtr.writeValue
-          }.otherwise{
-            finalMarkWord := pendingForwardValue
-            pendingForwardValid := False
-          }
-        } elsewhen(preFetchBufferMarkWordForwarded(buffer_ptr)) {
-          finalMarkWord := preFetchBuffer(buffer_ptr).markWord
-        }
-
-        when(state === overall_state.s_idle && (io.Trace2Fetch.fire || waitPreFetch)){
-          waitPreFetch := False
-          main_data.task := preFetchBuffer(buffer_bottom).task
-          main_data.oopType := preFetchBuffer(buffer_bottom).oopType
-          main_data.fromObj := preFetchBuffer(buffer_bottom).fromObj
-          main_data.markWord := finalMarkWord
-          main_data.klassPtr := decodeKlassPtr(rd)
-          main_data.srcLength := decodeSrcLength(rd)
-          //state := Mux((decodeMarkWord(rd) & U(3, GCElementWidth bits)) === U(3), overall_state.s_send, overall_state.s_readMW)
-          state := overall_state.s_send
-          buffer_bottom := buffer_bottom + 1
-          buffer_count := buffer_count - 1
-        }.otherwise{
-          preFetchBuffer(buffer_ptr).markWord := finalMarkWord
-          preFetchBuffer(buffer_ptr).klassPtr := decodeKlassPtr(rd)
-          preFetchBuffer(buffer_ptr).srcLength := decodeSrcLength(rd)
-          preFetchBufferDone(buffer_ptr) := True
+        }.otherwise {
+          fillMwKlassLen(rd, push_data)
+          goto(SEND)
         }
       }
     }
+
+    SEND.whenIsActive {
+      when(mainIsIdle) {
+        main_data    := push_data
+        mainGotoSend := True
+        goto(IDLE)
+      }
+    }
   }
+
+  // ==========================================================================
+  // PreFetch StateMachine
+  // ==========================================================================
+  val preFsm = new StateMachine {
+    val IDLE          = new State with EntryPoint
+    val READ_OOP_REQ  = new State
+    val READ_OOP_RESP = new State
+    val READ_MW_REQ   = new State
+    val READ_MW_RESP  = new State
+
+    IDLE.whenIsActive {
+      when(io.toFetch.PushCount === U(0) && pushFollowRem === U(0)) {
+        io.toFetch.PrePop.ready := buf_free =/= U(0)
+
+        when(io.toFetch.PrePop.fire) {
+          buf_work := buf_top
+          resetSlot(buf_top)
+
+          buf_top   := buf_top + 1
+          buf_count := buf_count + 1
+
+          receiveTask(io.toFetch.PrePop.payload, preBuf(buf_top))
+          goto(READ_OOP_REQ)
+        }
+
+      }.otherwise {
+        io.toFetch.PrePop.ready := True
+
+        when(io.toFetch.PrePop.fire) {
+          when(io.toFetch.PushCount === U(0)) {
+            pushFollowRem := pushFollowRem - 1
+
+            val idx = buf_work + 1
+            buf_work := idx
+
+            resetSlot(idx)
+            buf_count := buf_count + 1
+
+            receiveTask(io.toFetch.PrePop.payload, preBuf(idx))
+            goto(READ_OOP_REQ)
+
+          }.otherwise {
+            val pushCount = Mux(
+              io.toFetch.PushCount > PreFetchBufferNum,
+              U(PreFetchBufferNum),
+              io.toFetch.PushCount
+            )
+
+            val idx = WrapDec(buf_bottom, PreFetchBufferNum, pushCount)
+
+            when(buf_free >= pushCount) {
+              buf_count := buf_count + 1
+            }.otherwise {
+              buf_top   := WrapDec(buf_top, PreFetchBufferNum, pushCount - buf_free)
+              buf_count := (buf_count + buf_free - pushCount + 1).resized
+            }
+
+            buf_work      := idx
+            buf_bottom    := idx
+            pushFollowRem := pushCount - 1
+
+            resetSlot(idx)
+            receiveTask(io.toFetch.PrePop.payload, preBuf(idx))
+            goto(READ_OOP_REQ)
+          }
+        }
+      }
+    }
+
+    READ_OOP_REQ.whenIsActive {
+      when(preBuf(buf_work).oopType === U(PartialArrayOop)) {
+        preBuf(buf_work).fromObj := preBuf(buf_work).task
+        goto(READ_MW_REQ)
+
+      }.otherwise {
+        driveReadReq(io.PreMreq, preBuf(buf_work).task, oopReadSize)
+
+        when(io.PreMreq.Request.fire) {
+          goto(READ_OOP_RESP)
+        }
+      }
+    }
+
+    READ_OOP_RESP.whenIsActive {
+      io.PreMreq.Response.ready := True
+
+      when(io.PreMreq.Response.fire) {
+        val rd = io.PreMreq.Response.payload.ResponseData
+        val newFromObj = decodeReadOopResp(rd)
+
+        preBuf(buf_work).fromObj := newFromObj
+
+        when(fwdValid && fwdObj === newFromObj) {
+          preBuf(buf_work).markWord := fwdValue
+          preBufMwHit(buf_work)     := True
+          fwdValid := False
+        }
+
+        goto(READ_MW_REQ)
+      }
+    }
+
+    READ_MW_REQ.whenIsActive {
+      driveReadReq(io.PreMreq, preBuf(buf_work).fromObj, mwReadSize)
+
+      when(io.PreMreq.Request.fire) {
+        goto(READ_MW_RESP)
+      }
+    }
+
+    READ_MW_RESP.whenIsActive {
+      io.PreMreq.Response.ready := True
+
+      when(io.PreMreq.Response.fire) {
+        val rd = io.PreMreq.Response.payload.ResponseData
+
+        val currentFromObj = preBuf(buf_work).fromObj
+
+        val hitFwdNow =
+          (io.gcWriteSrcOopPtr.valid &&
+           currentFromObj === io.gcWriteSrcOopPtr.srcOopPtr) ||
+          (fwdValid &&
+           currentFromObj === fwdObj)
+
+        val finalMw = UInt(GCElementWidth bits)
+        finalMw := rd(GCElementWidth - 1 downto 0)
+
+        when(hitFwdNow) {
+          when(io.gcWriteSrcOopPtr.valid) {
+            finalMw := io.gcWriteSrcOopPtr.writeValue
+          }.otherwise {
+            finalMw := fwdValue
+            fwdValid := False
+          }
+        }.elsewhen(preBufMwHit(buf_work)) {
+          finalMw := preBuf(buf_work).markWord
+        }
+
+        when(waitForPrefetch && mainIsIdle && buf_work === buf_bottom) {
+          waitForPrefetch := False
+
+          main_data.task     := preBuf(buf_bottom).task
+          main_data.oopType  := preBuf(buf_bottom).oopType
+          main_data.fromObj  := preBuf(buf_bottom).fromObj
+          main_data.markWord := finalMw
+          main_data.klassPtr := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+
+          main_data.srcLength := Mux(
+            io.ConfigIO.UseCompressedKlassPointers,
+            rd(GCElementWidth * 2 - 1 downto GCElementWidth + 32),
+            rd(GCElementWidth * 2 + 31 downto GCElementWidth * 2)
+          )
+
+          mainGotoSend := True
+
+          buf_bottom := buf_bottom + 1
+          buf_count  := buf_count - 1
+
+        }.otherwise {
+          preBuf(buf_work).markWord := finalMw
+          preBuf(buf_work).klassPtr := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+
+          preBuf(buf_work).srcLength := Mux(
+            io.ConfigIO.UseCompressedKlassPointers,
+            rd(GCElementWidth * 2 - 1 downto GCElementWidth + 32),
+            rd(GCElementWidth * 2 + 31 downto GCElementWidth * 2)
+          )
+
+          preBufDone(buf_work) := True
+        }
+
+        goto(IDLE)
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // State visibility assignments
+  // ------------------------------------------------------------------------
+  mainIsIdle     := mainFsm.isActive(mainFsm.IDLE)
+  mainIsWaitDone := mainFsm.isActive(mainFsm.WAIT_DONE)
+
+  pushIsIdle     := pushFsm.isActive(pushFsm.IDLE)
 }
 
 object GCFetchVerilog extends App {
