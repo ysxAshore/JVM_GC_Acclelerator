@@ -559,9 +559,11 @@ class GCCopy2SurvivorConfigIO extends Bundle with GCParameters with IMasterSlave
   val UseCompressedKlassPointer = in Bool()
   val CompressedKlassPointerBase = in UInt(GCElementWidth bits)
   val CompressedKlassPointerShift = in UInt(8 bits)
+  val objectKlassObj = in UInt(GCElementWidth bits)
+  val intArrayKlassObj = in UInt(GCElementWidth bits)
 
   override def asMaster(): Unit = {
-    out(ParScanThreadStatePtr, PlabAllocatorPtr, AgeThreshold, HeapRegionBiasedBase, HeapRegionShiftBy, ChunkSize, YoungWordsBase, UseCompressedKlassPointer, CompressedKlassPointerBase, CompressedKlassPointerShift)
+    out(ParScanThreadStatePtr, PlabAllocatorPtr, AgeThreshold, HeapRegionBiasedBase, HeapRegionShiftBy, ChunkSize, YoungWordsBase, UseCompressedKlassPointer, CompressedKlassPointerBase, CompressedKlassPointerShift, objectKlassObj, intArrayKlassObj)
     in()
   }
 }
@@ -712,7 +714,7 @@ object WrapDec {
 
 
 object LocalMMUTaskType {
-  val TaskTypeMax = 15 + 2
+  val TaskTypeMax = 14 + 2
   val TaskTypeBitWidth = log2Up(TaskTypeMax)
 }
 

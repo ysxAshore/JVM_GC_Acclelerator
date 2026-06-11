@@ -30,7 +30,6 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcLocalMMU.io.localMMUIOs(13) <>  gcUnalignedMMUAdapter(13).io.out
   gcLocalMMU.io.localMMUIOs(14) <>  gcUnalignedMMUAdapter(14).io.out
   gcLocalMMU.io.localMMUIOs(15) <>  gcUnalignedMMUAdapter(15).io.out
-  gcLocalMMU.io.localMMUIOs(16) <>  gcUnalignedMMUAdapter(16).io.out
 
   val task_valid = RegInit(False)
 
@@ -154,8 +153,7 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcArrayProcess.io.DebugTimeStamp := DebugTimeStamp
 
   // GCOopCopy2Survivor
-  gcOopCopy2Survivor.io.Mreq0 <> gcUnalignedMMUAdapter(4).io.in
-  gcOopCopy2Survivor.io.Mreq1 <> gcUnalignedMMUAdapter(16).io.in
+  gcOopCopy2Survivor.io.Mreq <> gcUnalignedMMUAdapter(4).io.in
   gcOopCopy2Survivor.io.ToCopy <> gcCopy.io.ToCopy
   gcOopCopy2Survivor.io.ToAllocate <> gcAllocate.io.ToAllocate
   gcOopCopy2Survivor.io.TaskDone := io.ctrl2top.Done
@@ -169,6 +167,8 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcOopCopy2Survivor.io.ConfigIO.UseCompressedKlassPointer := CompressedFlag(1)
   gcOopCopy2Survivor.io.ConfigIO.CompressedKlassPointerBase := CompressedKlassPointerBase
   gcOopCopy2Survivor.io.ConfigIO.CompressedKlassPointerShift := CompressedFlag(23 downto 16)
+  gcOopCopy2Survivor.io.ConfigIO.intArrayKlassObj := IntArrayKlassObj
+  gcOopCopy2Survivor.io.ConfigIO.objectKlassObj := ObjectKlass
   gcOopCopy2Survivor.io.DebugTimeStamp := DebugTimeStamp
 
   // gcAllocate(ToParAllocate)
