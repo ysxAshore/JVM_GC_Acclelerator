@@ -234,6 +234,11 @@ class GCFetch extends Module with HWParameters with GCParameters {
           main_data.fromObj := U(0)
           goto(READ_OOP_REQ)
         }
+      }.elsewhen(waitForPrefetch && preBufDone(buf_bottom)) {
+        // 处理 io.toFetch.fire和io.preMreq.Response.fire同时有效 此时会同时设置了waitForPrefetch preBufDone
+        waitForPrefetch := False
+        main_data       := preBuf(buf_bottom)
+        goto(SEND)
       }
     }
 
@@ -579,7 +584,6 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
           buf_bottom := buf_bottom + 1
           buf_count  := buf_count - 1
-
         }.otherwise {
           preBuf(buf_work).markWord := finalMw
           preBuf(buf_work).klassPtr := rd(GCElementWidth * 2 - 1 downto GCElementWidth)

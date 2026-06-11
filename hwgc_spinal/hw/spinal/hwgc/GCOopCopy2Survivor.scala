@@ -2,6 +2,7 @@ package hwgc
 
 import spinal.core._
 import spinal.lib._
+import spinal.lib.fsm._
 
 import scala.language.postfixOps
 
@@ -41,94 +42,111 @@ case class CopySurvivorSlotCtx() extends Bundle with GCParameters {
 }
 
 class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
-  val io = new Bundle{
-    val Mreq = master(new LocalMMUIO)
+  val io = new Bundle {
+    val Mreq0 = master(new LocalMMUIO)
+    val Mreq1 = master(new LocalMMUIO)
+
     val ToCopy = master(new GCToCopy)
     val ToFetch = master(new GCWriteSrcOopPtr)
     val ToTrace = master(new GCToTrace)
     val ToStack = master(new GCUpdatedRegion)
     val ToAllocate = master(new GCToAllocate)
+
     val ToCopySurvivor = slave(new GCToSurvivor)
-    val TaskDone = in(Bool())
+    val TaskDone = in Bool()
     val ConfigIO = slave(new GCCopy2SurvivorConfigIO)
-    val DebugTimeStamp = in(UInt(64 bits))
+    val DebugTimeStamp = in UInt(64 bits)
   }
 
-  // default value
-  io.Mreq.Request.valid := False
-  io.Mreq.Request.payload.clearAll()
-  io.Mreq.RequestSize.valid := False
-  io.Mreq.RequestSize.payload.clearAll()
-  io.Mreq.Response.ready := True
+  // defaults
+  def clearMreq(m: LocalMMUIO): Unit = {
+    m.Request.valid := False
+    m.Request.payload.clearAll()
+
+    m.RequestSize.valid := False
+    m.RequestSize.payload.clearAll()
+
+    m.Response.ready := True
+  }
+
+  clearMreq(io.Mreq0)
+  clearMreq(io.Mreq1)
 
   io.ToCopy.clearIn()
   io.ToFetch.clearIn()
   io.ToTrace.clearIn()
   io.ToAllocate.clearIn()
+
   io.ToCopySurvivor.Done := False
   io.ToCopySurvivor.DoneOwner := U(0)
   io.ToCopySurvivor.DestOopPtr := U(0)
   io.ToCopySurvivor.isTypeArray := False
 
-  object overall_state extends SpinalEnum {
-    val states = Array.tabulate(14)(_ => newElement())
-    for((state, i) <- states.zipWithIndex){
-      state.setName(s"s$i")
+  def slotMreq(i: Int): LocalMMUIO = if (i == 0) io.Mreq0 else io.Mreq1
+
+  def dbg(msg: Seq[Any]): Unit =
+    if (DebugEnable) {
+      report(Seq("[GCOopCopy2Survivor<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
     }
+
+  // slot context
+  val slotValid = Vec.fill(2)(RegInit(False))
+  val slotCtx = Vec.fill(2)(Reg(CopySurvivorSlotCtx()) init (CopySurvivorSlotCtx().getZero))
+
+  val mmuIssued = Vec.fill(2)(RegInit(False))
+
+  val slotStart = Vec.fill(2)(Bool())
+  val slotGotoIdle = Vec.fill(2)(Bool())
+  val slotPlabRefillGrant = Vec.fill(2)(Bool())
+
+  for (i <- 0 until 2) {
+    slotStart(i) := False
+    slotGotoIdle(i) := False
+    slotPlabRefillGrant(i) := False
   }
-
-  object MmuOp extends SpinalEnum {
-    val NONE, READ_KLASS, READ_DEST_ATTR, READ_PLAB_PTR, READ_PLAB_BUF, READ_PLAB_TOPEND, WRITE_SRC_FWD, WRITE_MARK, WRITE_REGION_TOP, WRITE_FORCE_OLD = newElement()
-  }
-
-
-  // slot state and context
-  val slotValid = Vec(RegInit(False), 2)
-  val slotState = Vec(RegInit(overall_state.states(0)), 2)
-  val slotCtx = Vec.fill(2)(Reg(CopySurvivorSlotCtx()) init CopySurvivorSlotCtx().getZero)
-
 
   // shared caches
   val destAttrRegionValid = RegInit(False)
   val destAttrRegionCache = RegInit(U(0, 32 bits))
 
-  val plabCacheBuffer = Vec(Reg(UInt(GCElementWidth bits)) init(0), 2)
-  val plabCacheBufferPtr = Vec(Reg(UInt(GCElementWidth bits)) init(0), 2)
-  val plabCacheBufferValid = Vec(RegInit(False), 2)
-  val plabCacheTop = Vec(Reg(UInt(GCElementWidth bits)) init(0), 2)
-  val plabCacheEnd = Vec(Reg(UInt(GCElementWidth bits)) init(0), 2)
-  val plabCacheValid = Vec(RegInit(False), 2)
-  val plabRefillBusy = Vec(RegInit(False), 2)
-  val plabRefillOwner = Vec(Reg(UInt(1 bits)) init(0), 2)
+  val plabCacheBuffer = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
+  val plabCacheBufferPtr = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
+  val plabCacheBufferValid = Vec.fill(2)(RegInit(False))
+  val plabCacheTop = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
+  val plabCacheEnd = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
+  val plabCacheValid = Vec.fill(2)(RegInit(False))
+  val plabRefillBusy = Vec.fill(2)(RegInit(False))
+  val plabRefillOwner = Vec.fill(2)(RegInit(U(0, 1 bits)))
 
   val KlassCacheEntries = 16
-  val klassCacheValid  = Vec(RegInit(False), KlassCacheEntries)
-  val klassCachePtr    = Vec(Reg(UInt(GCElementWidth bits)) init(0), KlassCacheEntries)
-  val klassCacheKidLh  = Vec(Reg(UInt(GCElementWidth bits)) init(0), KlassCacheEntries)
-
+  val klassCacheValid = Vec.fill(KlassCacheEntries)(RegInit(False))
+  val klassCachePtr = Vec.fill(KlassCacheEntries)(RegInit(U(0, GCElementWidth bits)))
+  val klassCacheKidLh = Vec.fill(KlassCacheEntries)(RegInit(U(0, GCElementWidth bits)))
   val klassCacheReplacePtr = RegInit(U(0, log2Up(KlassCacheEntries) bits))
 
-
   // shared resource owners
-  val mmuBusy = RegInit(False)
-  val mmuOwner = Reg(UInt(1 bits)) init(0)
-  val mmuOp = RegInit(MmuOp.NONE)
-  val mmuIssued = Vec(RegInit(False), 2)
-
   val copyBusy = RegInit(False)
-  val copyOwner = Reg(UInt(1 bits)) init(0)
+  val copyOwner = RegInit(U(0, 1 bits))
 
   val traceBusy = RegInit(False)
-  val traceOwner = Reg(UInt(1 bits)) init(0)
+  val traceOwner = RegInit(U(0, 1 bits))
 
   val allocBusy = RegInit(False)
-  val allocOwner = Reg(UInt(1 bits)) init(0)
+  val allocOwner = RegInit(U(0, 1 bits))
 
+  // pending single-output pulses
+  val typeArrayPending = Vec.fill(2)(RegInit(False))
+  val typeArrayOwner = Vec.fill(2)(RegInit(U(0, 1 bits)))
+
+  val survivorDonePending = Vec.fill(2)(RegInit(False))
+  val survivorDoneOwner = Vec.fill(2)(RegInit(U(0, 1 bits)))
+  val survivorDoneDest = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
+
+  val toFetchPending = Vec.fill(2)(RegInit(False))
+  val toFetchSrcOopPtr = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
+  val toFetchWriteValue = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
 
   // helpers
-  def dbg(msg: Seq[Any]): Unit =
-    if (DebugEnable) report(Seq("[GCOopCopy2Survivor<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
-
   def clearSlotRuntime(i: Int): Unit = {
     slotCtx(i).destOopPtr := 0
     slotCtx(i).lh := 0
@@ -148,12 +166,12 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     slotCtx(i).allocDone := False
     slotCtx(i).allocSelect := False
     slotCtx(i).waitWriteRegionTop := False
+
     mmuIssued(i) := False
   }
 
   def allocSlot(i: Int): Unit = {
     slotValid(i) := True
-    slotState(i) := overall_state.states(1)
 
     slotCtx(i).owner := io.ToCopySurvivor.Owner
     slotCtx(i).srcOopPtr := io.ToCopySurvivor.SrcOopPtr
@@ -164,71 +182,100 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     slotCtx(i).regionAttrPtr := io.ToCopySurvivor.RegionAttrPtr
 
     clearSlotRuntime(i)
+    slotStart(i) := True
+
     dbg(Seq("Allocate task to slot", i.toString, ", src=", io.ToCopySurvivor.SrcOopPtr))
   }
 
   def finishSlot(i: Int): Unit = {
     slotValid(i) := False
-    slotState(i) := overall_state.states(0)
     clearSlotRuntime(i)
+    slotGotoIdle(i) := True
+
     dbg(Seq("Finish slot", i.toString))
   }
 
-  def compressedKlassPtrOf(i: Int): UInt = (io.ConfigIO.CompressedKlassPointerBase + slotCtx(i).klassPtr(31 downto 0) << io.ConfigIO.CompressedKlassPointerShift).resize(GCElementWidth)
+  def compressedKlassPtrOf(i: Int): UInt = (io.ConfigIO.CompressedKlassPointerBase + (slotCtx(i).klassPtr(31 downto 0) << io.ConfigIO.CompressedKlassPointerShift)).resize(GCElementWidth)
 
   def lookupKlassPtrOf(i: Int): UInt = Mux(io.ConfigIO.UseCompressedKlassPointer, compressedKlassPtrOf(i), slotCtx(i).klassPtr)
 
-  def klassCacheHitVecOf(i: Int): Vec[Bool] = {
-    val hitVec = Vec(Bool(), KlassCacheEntries)
-    for(j <- 0 until KlassCacheEntries){
-      hitVec(j) := klassCacheValid(j) && (klassCachePtr(j) === lookupKlassPtrOf(i))
-    }
-    hitVec
-  }
+  def selectDestAttrOfRegionType(regionType: UInt): UInt =
+    Mux(regionType === U(1),
+      destAttrRegionCache(31 downto 16),
+      destAttrRegionCache(15 downto 0)).resize(16)
 
-  def klassCacheHitOf(i: Int): Bool = klassCacheHitVecOf(i).orR
-
-  def klassCacheHitIndexOf(i: Int): UInt = OHToUInt(klassCacheHitVecOf(i).asBits)
-
-  def checkDestRegionAttrValid(i : Int): Unit = {
-    val regionAttrType = slotCtx(i).srcRegionAttr(15 downto 8)
-    slotCtx(i).destAttrPtr := (io.ConfigIO.ParScanThreadStatePtr + U"x178" + regionAttrType * 2).resize(GCElementWidth)
-    when(destAttrRegionValid) {
-      slotCtx(i).destRegionAttr := Mux(regionAttrType === U(1), destAttrRegionCache(31 downto 16), destAttrRegionCache(15 downto 0))
-      slotCtx(i).plabTargetIdx := Mux(regionAttrType === U(1), destAttrRegionCache(31 downto 16), destAttrRegionCache(15 downto 0))(15 downto 8).resize(1)
-      slotState(i) := overall_state.states(5)
-    }.otherwise{
-      slotState(i) := overall_state.states(4)
+  def gotoPlabSelectHelper(i: Int, markWord: UInt): Unit = {
+    val new_age = (markWord >> 3).resize(4).resize(32)
+    slotCtx(i).age := new_age
+    when(new_age < io.ConfigIO.AgeThreshold) {
+      slotCtx(i).destRegionAttr := slotCtx(i).srcRegionAttr
+      slotCtx(i).destAttrPtr := slotCtx(i).regionAttrPtr
+      slotCtx(i).plabTargetIdx := slotCtx(i).srcRegionAttr(15 downto 8).resize(1)
     }
   }
 
-  def selectDestAttrOfRegionType(regionType: UInt): UInt = Mux(regionType === U(1), destAttrRegionCache(31 downto 16), destAttrRegionCache(15 downto 0)).resize(16)
+  // klass cache lookup
+  val klassLookupPtr = Vec.fill(2)(UInt(GCElementWidth bits))
+  val klassCacheHit = Vec.fill(2)(Bool())
+  val klassCacheHitIndex = Vec.fill(2)(UInt(log2Up(KlassCacheEntries) bits))
 
-  def writeBackSizeForCopy(i: UInt): UInt = Mux(slotCtx(i).kid === U(ObjectArrayKlassID, 32 bits),
-    Mux(io.ConfigIO.UseCompressedKlassPointer, U(16), U(20)),
-    U(8)
-  )
+  for (i <- 0 until 2) {
+    klassLookupPtr(i) := lookupKlassPtrOf(i)
 
-  def allocateCacheWithIdx(i : Int): Unit = {
-    val idx = slotCtx(i).plabTargetIdx
-    val selectOld = slotCtx(i).plabForceOld
-    when(((plabCacheEnd(idx) - plabCacheTop(idx)) / U(8)) >= slotCtx(i).size){
-      slotCtx(i).destOopPtr := plabCacheTop(idx)
-      plabCacheTop(idx) := (plabCacheTop(idx) + slotCtx(i).size * U(8)).resize(GCElementWidth)
-      slotState(i) := overall_state.states(9)
-    }.otherwise {
-      // send allocate and write regionTop
-      slotCtx(i).allocSelect := selectOld
-      when(slotCtx(i).allocIssued && slotCtx(i).waitWriteRegionTop){
-        plabCacheValid(idx) := False
-        slotState(i) := overall_state.states(12)
-      }
+    val hitVec = Vec.fill(KlassCacheEntries)(Bool())
+    for (j <- 0 until KlassCacheEntries) {
+      hitVec(j) := klassCacheValid(j) && klassCachePtr(j) === klassLookupPtr(i)
     }
+
+    klassCacheHit(i) := hitVec.orR
+    klassCacheHitIndex(i) := OHToUInt(hitVec.asBits)
   }
 
+  // shared fill requests
+  val klassFillValid = Vec.fill(2)(Bool())
+  val klassFillPtr = Vec.fill(2)(UInt(GCElementWidth bits))
+  val klassFillKidLh = Vec.fill(2)(UInt(GCElementWidth bits))
 
-  // task done update the cache regs
-  when(io.TaskDone){
+  val destAttrFillValid = Vec.fill(2)(Bool())
+  val destAttrFillData = Vec.fill(2)(UInt(32 bits))
+
+  val plabPtrFillValid = Vec.fill(2)(Bool())
+  val plabPtrFillIdx = Vec.fill(2)(UInt(1 bits))
+  val plabPtrFillData = Vec.fill(2)(UInt(GCElementWidth bits))
+
+  val plabBufFillValid = Vec.fill(2)(Bool())
+  val plabBufFillIdx = Vec.fill(2)(UInt(1 bits))
+  val plabBufFillData = Vec.fill(2)(UInt(GCElementWidth bits))
+
+  val plabTopEndFillValid = Vec.fill(2)(Bool())
+  val plabTopEndFillIdx = Vec.fill(2)(UInt(1 bits))
+  val plabTopFillData = Vec.fill(2)(UInt(GCElementWidth bits))
+  val plabEndFillData = Vec.fill(2)(UInt(GCElementWidth bits))
+
+  for (i <- 0 until 2) {
+    klassFillValid(i) := False
+    klassFillPtr(i) := U(0, GCElementWidth bits)
+    klassFillKidLh(i) := U(0, GCElementWidth bits)
+
+    destAttrFillValid(i) := False
+    destAttrFillData(i) := U(0, 32 bits)
+
+    plabPtrFillValid(i) := False
+    plabPtrFillIdx(i) := U(0, 1 bits)
+    plabPtrFillData(i) := U(0, GCElementWidth bits)
+
+    plabBufFillValid(i) := False
+    plabBufFillIdx(i) := U(0, 1 bits)
+    plabBufFillData(i) := U(0, GCElementWidth bits)
+
+    plabTopEndFillValid(i) := False
+    plabTopEndFillIdx(i) := U(0, 1 bits)
+    plabTopFillData(i) := U(0, GCElementWidth bits)
+    plabEndFillData(i) := U(0, GCElementWidth bits)
+  }
+
+  // task done invalidates shared caches
+  when(io.TaskDone) {
     destAttrRegionValid := False
     plabCacheValid(0) := False
     plabCacheValid(1) := False
@@ -244,446 +291,729 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   io.ToStack.RegionTop1 := plabCacheTop(1)
 
   // downstream done capture
-  when(copyBusy && io.ToCopy.Done){
+  when(copyBusy && io.ToCopy.Done) {
     copyBusy := False
     slotCtx(copyOwner).copyDone := True
     dbg(Seq("copy done for slot ", copyOwner))
   }
 
-  when(traceBusy && io.ToTrace.Done){
+  when(traceBusy && io.ToTrace.Done) {
     traceBusy := False
     slotCtx(traceOwner).traceDone := True
     dbg(Seq("trace done for slot ", traceOwner))
   }
 
-  when(allocBusy && io.ToAllocate.Done){
+  when(allocBusy && io.ToAllocate.Done) {
     allocBusy := False
     slotCtx(allocOwner).allocDone := True
     slotCtx(allocOwner).destOopPtr := io.ToAllocate.DestObjPtr
     dbg(Seq("allocate done for slot ", allocOwner))
   }
 
-
-  // single external input -> dual internal slot register
+  // input admission
   val hasFreeSlot = !slotValid(0) || !slotValid(1)
   io.ToCopySurvivor.Ready := hasFreeSlot
 
-  when(io.ToCopySurvivor.Valid && io.ToCopySurvivor.Ready){
-    when(!slotValid(0)){
+  when(io.ToCopySurvivor.Valid && io.ToCopySurvivor.Ready) {
+    when(!slotValid(0)) {
       allocSlot(0)
-    }.otherwise{
+    } otherwise {
       allocSlot(1)
     }
   }
 
+  // slot state visibility
+  val slotIsPlabSelect = Vec.fill(2)(Bool())
+  val slotIsAllocCache = Vec.fill(2)(Bool())
+  val slotIsSendWork = Vec.fill(2)(Bool())
 
-  // local transitions that do not directly drive shared resources
-  for(i <- 0 until 2){
-    when(slotValid(i)){
-      switch(slotState(i)){
-        is(overall_state.states(1)){
-          when(klassCacheHitOf(i)){
-            val idx = klassCacheHitIndexOf(i)
-            slotCtx(i).klassPtr := lookupKlassPtrOf(i)
-            slotCtx(i).lh := klassCacheKidLh(idx)(31 downto 0)
-            slotCtx(i).kid := klassCacheKidLh(idx)(63 downto 32)
-            slotState(i) := overall_state.states(2)
+  // PLAB cache 内部分配 grant。
+  val slotPlabAllocGrant = Vec.fill(2)(Bool())
 
-            io.ToCopySurvivor.isTypeArray := klassCacheKidLh(idx)(63 downto 32) === TypeArrayKlassID
-            io.ToCopySurvivor.DoneOwner := slotCtx(i).owner
+  // per-slot state machines
+  for (i <- 0 until 2) {
+    val m = slotMreq(i)
+
+    val slotFsm = new StateMachine {
+      val IDLE = new State with EntryPoint
+      val READ_KLASS = new State
+      val SIZE_DEICIDE = new State
+      val DEST_ATTR_DECIDE = new State
+      val AGE_DECIDE = new State
+      val PLAB_SELECT = new State
+      val READ_PLAB_PTR = new State
+      val READ_PLAB_BUF = new State
+      val READ_PLAB_TOPEND = new State
+      val ALLOC_CACHE = new State
+      val WAIT_ALLOC = new State
+      val WRITE_FORCE_OLD = new State
+      val SEND_WORK = new State
+      val WRITE_MARK = new State
+      val WAIT_COPY_TRACE = new State
+
+      IDLE.whenIsActive {
+        // wait for slotStart(i)
+      }
+
+      READ_KLASS.whenIsActive {
+        when(klassCacheHit(i)) {
+          val idx = klassCacheHitIndex(i)
+
+          slotCtx(i).klassPtr := klassLookupPtr(i)
+          slotCtx(i).lh := klassCacheKidLh(idx)(31 downto 0)
+          slotCtx(i).kid := klassCacheKidLh(idx)(63 downto 32)
+
+          when(klassCacheKidLh(idx)(63 downto 32) === U(TypeArrayKlassID, 32 bits)) {
+            typeArrayPending(i) := True
+            typeArrayOwner(i) := slotCtx(i).owner
+          }
+
+          goto(SIZE_DEICIDE)
+
+        } otherwise {
+          val newKlassPtr = klassLookupPtr(i)
+          val addr = (newKlassPtr + U(8)).resize(MMUAddrWidth)
+
+          issueReq(m, addr, False, U(8), U(0), mmuIssued(i)) { rd =>
+            slotCtx(i).klassPtr := newKlassPtr
+            slotCtx(i).lh := rd(31 downto 0)
+            slotCtx(i).kid := rd(63 downto 32)
+
+            klassFillValid(i) := True
+            klassFillPtr(i) := newKlassPtr
+            klassFillKidLh(i) := rd(63 downto 0)
+
+            when(rd(63 downto 32) === U(TypeArrayKlassID, 32 bits)) {
+              typeArrayPending(i) := True
+              typeArrayOwner(i) := slotCtx(i).owner
+            }
+
+            goto(SIZE_DEICIDE)
           }
         }
+      }
 
-        is(overall_state.states(2)){
-          when(slotCtx(i).lh.asSInt > S(0)){
+      SIZE_DEICIDE.whenIsActive {
+        when(slotCtx(i).lh.asSInt < S(0)){
+          val temp = ((slotCtx(i).srcLength << slotCtx(i).lh(7 downto 0)) + slotCtx(i).lh(23 downto 16)).resize(32)
+          slotCtx(i).size := Mux(temp(2 downto 0) =/= U(0), (temp >> U(3)) + U(1), temp >> U(3)).resize(32)
+        }.elsewhen(slotCtx(i).lh.asSInt > S(0) && !slotCtx(i).lh(0)){
+          slotCtx(i).size := (slotCtx(i).lh >> U(3)).resize(32)
+        } otherwise {
+          when(slotCtx(i).kid =/= U(InstanceMirrorKlassID, 32 bits)) {
             slotCtx(i).size := (slotCtx(i).lh >> U(3)).resize(32)
-          }.otherwise{
-            val temp = ((slotCtx(i).srcLength << slotCtx(i).lh(7 downto 0)) + slotCtx(i).lh(23 downto 16)).resize(32)
-            slotCtx(i).size := Mux(temp(2 downto 0) =/= U(0), (temp >> U(3)) + U(1), temp >> U(3)).resize(32)
-          }
-
-          slotCtx(i).plabForceOld := False
-
-          val regionAttrType = slotCtx(i).srcRegionAttr(15 downto 8)
-          when(regionAttrType === 0){
-            slotCtx(i).age := ((slotCtx(i).markWord >> U(3)) & U(x"1111", GCElementWidth bits)).resize(32)
-            slotState(i) := overall_state.states(3)
-          }.otherwise{
-            checkDestRegionAttrValid(i)
+          }.otherwise {
+            issueReq(m, slotCtx(i).srcOopPtr + U"x20", False, U(8), U(0), mmuIssued(i)) { rd =>
+              slotCtx(i).size := rd(31 downto 0)
+              goto(DEST_ATTR_DECIDE)
+            }
           }
         }
 
-        is(overall_state.states(3)){
-          when(slotCtx(i).age < io.ConfigIO.AgeThreshold){
-            slotCtx(i).destAttrPtr := slotCtx(i).regionAttrPtr
-            slotCtx(i).destRegionAttr := slotCtx(i).srcRegionAttr
-            slotCtx(i).plabTargetIdx := slotCtx(i).srcRegionAttr(15 downto 8).resize(1)
-            slotState(i) := overall_state.states(5)
-          }.otherwise{
-            checkDestRegionAttrValid(i)
+        when(slotCtx(i).lh.asSInt === S(0) || (slotCtx(i).lh.asSInt > S(0) && slotCtx(i).lh(0))) {
+        } otherwise {
+          goto(DEST_ATTR_DECIDE)
+        }
+      }
+
+      DEST_ATTR_DECIDE.whenIsActive {
+        slotCtx(i).plabForceOld := False
+
+        val src_region_attr_type = slotCtx(i).srcRegionAttr(15 downto 8)
+        val highSelected = src_region_attr_type === U(1)
+        val destAttrBase = (io.ConfigIO.ParScanThreadStatePtr + U"x178").resize(MMUAddrWidth)
+        slotCtx(i).destAttrPtr := destAttrBase + Mux(highSelected, U(2), U(0))
+
+        when(!destAttrRegionValid){
+          issueReq(m, destAttrBase, False, U(2), U(0), mmuIssued(i)) { rd =>
+            
+            slotCtx(i).destRegionAttr := Mux(highSelected, rd(31 downto 16), rd(15 downto 0))
+            slotCtx(i).plabTargetIdx :=Mux(highSelected, rd(31 downto 24), rd(15 downto 8)).resize(1)
+
+            destAttrFillValid(i) := True
+            destAttrFillData(i) := rd(31 downto 0)
+
+            goto(AGE_DECIDE)
           }
+
+        }.otherwise{
+          slotCtx(i).destRegionAttr := Mux(highSelected, destAttrRegionCache(31 downto 16), destAttrRegionCache(15 downto 0))
+          slotCtx(i).plabTargetIdx := Mux(highSelected, destAttrRegionCache(31 downto 24), destAttrRegionCache(15 downto 8)).resize(1)
+          goto(AGE_DECIDE)
         }
+      }
 
-        // access dest attr
-        is(overall_state.states(4)){
+      AGE_DECIDE.whenIsActive {
+        val src_region_attr_type = slotCtx(i).srcRegionAttr(15 downto 8)
+        when(src_region_attr_type =/= U(0)){
+          goto(PLAB_SELECT)
 
-        }
+        }.otherwise{
+          when(slotCtx(i).markWord(0)){
+            gotoPlabSelectHelper(i, slotCtx(i).markWord)
+            goto(PLAB_SELECT)
 
-        is(overall_state.states(5)){
-          val plabIdx = slotCtx(i).plabTargetIdx
-          when(plabCacheValid(plabIdx)) {
-            slotState(i) := overall_state.states(8)
-          }.elsewhen(plabRefillBusy(plabIdx)){
-            // wait
-          }.elsewhen(plabCacheBufferValid(plabIdx)){
-            plabRefillBusy(plabIdx) := True
-            plabRefillOwner(plabIdx) := U(i, 1 bits)
-            slotState(i) := overall_state.states(7)
-          }.otherwise{
-            plabRefillBusy(plabIdx) := True
-            plabRefillOwner(plabIdx) := U(i, 1 bits)
-          }
-        }
-
-        // access plab buffer
-        is(overall_state.states(6)){
-
-        }
-
-        // access plab top and end
-        is(overall_state.states(7)){
-
-        }
-
-        // get the dest obj or write regionTop and send the allocate
-        is(overall_state.states(8)){
-          allocateCacheWithIdx(i)
-        }
-
-        // send trace/copy and write src oop
-        is(overall_state.states(9)){
-          val needTrace = slotCtx(i).kid =/= U(TypeArrayKlassID, 32 bits)
-          val copyIssuedDone = slotCtx(i).copyIssued
-          val traceIssuedDone = slotCtx(i).traceIssued || !needTrace
-          when(copyIssuedDone && traceIssuedDone && slotCtx(i).writeSrcOopPtrDone){
-            slotState(i) := overall_state.states(10)
-          }
-        }
-
-        // write dest oop
-        is(overall_state.states(10)){
-
-        }
-
-        is(overall_state.states(11)){
-          val needTrace = slotCtx(i).kid =/= U(TypeArrayKlassID, 32 bits)
-          //val copyFinished = io.ToCopy.Done && copyOwner === i || slotCtx(i).copyDone || !needTrace
-          //val traceFinished = io.ToTrace.Done && traceOwner === i || slotCtx(i).traceDone || !needTrace
-          val copyFinished = slotCtx(i).copyDone || !needTrace
-          val traceFinished = slotCtx(i).traceDone || !needTrace
-
-          when(copyFinished && traceFinished){
-            finishSlot(i)
-            io.ToCopySurvivor.Done := True
-            io.ToCopySurvivor.DoneOwner := slotCtx(i).owner
-            io.ToCopySurvivor.DestOopPtr := slotCtx(i).destOopPtr
-          }
-        }
-
-        is(overall_state.states(12)){
-          when(slotCtx(i).allocDone){
-            slotCtx(i).allocDone := False
-            when(slotCtx(i).destOopPtr === 0){
-              slotCtx(i).plabTargetIdx := 1
-              slotCtx(i).plabForceOld := True
-              slotState(i) := overall_state.states(5)
-            }.otherwise{
-              slotState(i) := Mux(slotCtx(i).allocSelect, overall_state.states(13), overall_state.states(9))
+          }.otherwise {
+            val addr = Mux(slotCtx(i).markWord(1), slotCtx(i).markWord ^ U"x2".resize(GCElementWidth), slotCtx(i).markWord)
+            issueReq(m, addr, False, U(8), U(0), mmuIssued(i)) { rd =>
+              gotoPlabSelectHelper(i, rd(GCElementWidth - 1 downto 0))
+              goto(PLAB_SELECT)
             }
           }
         }
       }
-    }
-  }
 
-  // MMU request generation conditions
-  val needReadKlassMeta = Vec(Bool(), 2)
-  val needReadDestAttr  = Vec(Bool(), 2)
-  val needReadPlabBufPtr = Vec(Bool(), 2)
-  val needReadPlabBuf = Vec(Bool(), 2)
-  val needReadPlabTopEnd = Vec(Bool(), 2)
-  val needWriteSrcFwd = Vec(Bool(), 2)
-  val needWriteDestMark = Vec(Bool(), 2)
-  val needWriteRegionTop = Vec(Bool(), 2)
-  val needWriteForceOld = Vec(Bool(), 2)
+      PLAB_SELECT.whenIsActive {
+        val plabIdx = slotCtx(i).plabTargetIdx
+        when(plabCacheValid(plabIdx)) {
+          goto(ALLOC_CACHE)
 
-  for(i <- 0 until 2){
-    needReadKlassMeta(i) := slotValid(i) && slotState(i) === overall_state.states(1) && !klassCacheHitOf(i)
-    needReadDestAttr(i) := slotValid(i) && slotState(i) === overall_state.states(4)
-    needReadPlabBufPtr(i) := slotValid(i) && (slotState(i) === overall_state.states(5)) && !plabCacheBufferValid(slotCtx(i).plabTargetIdx) && plabRefillBusy(slotCtx(i).plabTargetIdx) === True && plabRefillOwner(slotCtx(i).plabTargetIdx) === i
-    needReadPlabBuf(i) := slotValid(i) && slotState(i) === overall_state.states(6)
-    needReadPlabTopEnd(i) := slotValid(i) && slotState(i) === overall_state.states(7)
-    needWriteDestMark(i) := slotValid(i) && (slotState(i) === overall_state.states(10))
-    needWriteForceOld(i) := slotValid(i) && (slotState(i) === overall_state.states(13))
+        } elsewhen plabRefillBusy(plabIdx) {
+          // wait current refill
 
-    val idx = slotCtx(i).plabTargetIdx
-    val cond = (plabCacheEnd(idx) - plabCacheTop(idx)) / U(8) < slotCtx(i).size
-    needWriteRegionTop(i) := slotValid(i) && slotState(i) === overall_state.states(8) && cond && !slotCtx(i).waitWriteRegionTop
-    needWriteSrcFwd(i) := slotValid(i) && (slotState(i) === overall_state.states(9)) && !slotCtx(i).writeSrcOopPtrDone
-  }
-
-  // --------------------------------------------------------------------------
-  // MMU arbitration (fixed priority: slot0 > slot1)
-  // --------------------------------------------------------------------------
-  when(!mmuBusy) {
-    when(needReadKlassMeta(0)) {
-      mmuBusy := True
-      mmuOwner := U(0)
-      mmuOp := MmuOp.READ_KLASS
-    } elsewhen needReadDestAttr(0) {
-      mmuBusy := True
-      mmuOwner := U(0)
-      mmuOp := MmuOp.READ_DEST_ATTR
-    } elsewhen needReadPlabBufPtr(0) {
-      mmuBusy := True
-      mmuOwner := U(0)
-      mmuOp := MmuOp.READ_PLAB_PTR
-    } elsewhen needReadPlabBuf(0) {
-      mmuBusy := True
-      mmuOwner := U(0)
-      mmuOp := MmuOp.READ_PLAB_BUF
-    } elsewhen needReadPlabTopEnd(0) {
-      mmuBusy := True
-      mmuOwner := U(0)
-      mmuOp := MmuOp.READ_PLAB_TOPEND
-    } elsewhen needWriteRegionTop(0) {
-      mmuBusy := True
-      mmuOwner := U(0)
-      mmuOp := MmuOp.WRITE_REGION_TOP
-    } elsewhen needWriteSrcFwd(0) {
-      mmuBusy := True
-      mmuOwner := U(0)
-      mmuOp := MmuOp.WRITE_SRC_FWD
-    } elsewhen needWriteDestMark(0) {
-      mmuBusy := True
-      mmuOwner := U(0)
-      mmuOp := MmuOp.WRITE_MARK
-    } elsewhen needWriteForceOld(0) {
-      mmuBusy := True
-      mmuOwner := U(0)
-      mmuOp := MmuOp.WRITE_FORCE_OLD
-    } elsewhen needReadKlassMeta(1) {
-      mmuBusy := True
-      mmuOwner := U(1)
-      mmuOp := MmuOp.READ_KLASS
-    } elsewhen needReadDestAttr(1) {
-      mmuBusy := True
-      mmuOwner := U(1)
-      mmuOp := MmuOp.READ_DEST_ATTR
-    } elsewhen needReadPlabBufPtr(1) {
-      mmuBusy := True
-      mmuOwner := U(1)
-      mmuOp := MmuOp.READ_PLAB_PTR
-    } elsewhen needReadPlabBuf(1) {
-      mmuBusy := True
-      mmuOwner := U(1)
-      mmuOp := MmuOp.READ_PLAB_BUF
-    } elsewhen needReadPlabTopEnd(1) {
-      mmuBusy := True
-      mmuOwner := U(1)
-      mmuOp := MmuOp.READ_PLAB_TOPEND
-    } elsewhen needWriteRegionTop(1){
-      mmuBusy := True
-      mmuOwner := U(1)
-      mmuOp := MmuOp.WRITE_REGION_TOP
-    }elsewhen needWriteSrcFwd(1) {
-      mmuBusy := True
-      mmuOwner := U(1)
-      mmuOp := MmuOp.WRITE_SRC_FWD
-    } elsewhen needWriteDestMark(1) {
-      mmuBusy := True
-      mmuOwner := U(1)
-      mmuOp := MmuOp.WRITE_MARK
-    } elsewhen needWriteForceOld(1) {
-      mmuBusy := True
-      mmuOwner := U(1)
-      mmuOp := MmuOp.WRITE_FORCE_OLD
-    }
-  }
-
-  when(mmuBusy){
-    switch(mmuOp){
-      is(MmuOp.READ_KLASS){
-        val compressedKlassPtr = (io.ConfigIO.CompressedKlassPointerBase + slotCtx(mmuOwner).klassPtr(31 downto 0) << io.ConfigIO.CompressedKlassPointerShift).resize(GCElementWidth)
-        val newKlassPtr = Mux(io.ConfigIO.UseCompressedKlassPointer, compressedKlassPtr, slotCtx(mmuOwner).klassPtr)
-        val addr = newKlassPtr + U(8)
-        issueReq(io.Mreq, addr, False, U(8), U(0), mmuIssued(mmuOwner)) { rd =>
-          slotCtx(mmuOwner).klassPtr := newKlassPtr
-          slotCtx(mmuOwner).lh := rd(31 downto 0)
-          slotCtx(mmuOwner).kid := rd(63 downto 32)
-
-          klassCacheValid(klassCacheReplacePtr) := True
-          klassCachePtr(klassCacheReplacePtr) := newKlassPtr
-          klassCacheKidLh(klassCacheReplacePtr) := rd(63 downto 0)
-          klassCacheReplacePtr := klassCacheReplacePtr + 1
-
-          slotState(mmuOwner) := overall_state.states(2)
-
-          io.ToCopySurvivor.isTypeArray := rd(63 downto 32) === TypeArrayKlassID
-          io.ToCopySurvivor.DoneOwner := slotCtx(mmuOwner).owner
-
-          mmuBusy := False
-          mmuOp := MmuOp.NONE
-        }
-      }
-
-      is(MmuOp.READ_DEST_ATTR){
-        val destAttrBase = (io.ConfigIO.ParScanThreadStatePtr + U"x178").resize(GCElementWidth)
-        issueReq(io.Mreq, destAttrBase, False, U(2), U(0), mmuIssued(mmuOwner)) { rd =>
-          destAttrRegionValid := True
-          destAttrRegionCache := rd(31 downto 0)
-          slotCtx(mmuOwner).destRegionAttr := Mux(slotCtx(mmuOwner).destAttrPtr === destAttrBase + U(2), rd(31 downto 16), rd(15 downto 0))
-          slotCtx(mmuOwner).plabTargetIdx := Mux(slotCtx(mmuOwner).destAttrPtr === destAttrBase + U(2), rd(31 downto 24), rd(15 downto 8)).resize(1)
-          slotState(mmuOwner) := overall_state.states(5)
-          mmuBusy := False
-          mmuOp := MmuOp.NONE
-        }
-      }
-
-      is(MmuOp.READ_PLAB_PTR) {
-        val addr = (io.ConfigIO.PlabAllocatorPtr + U"x10" + slotCtx(mmuOwner).plabTargetIdx * U(8)).resize(MMUAddrWidth)
-        issueReq(io.Mreq, addr, False, U(8), U(0), mmuIssued(mmuOwner)) { rd =>
-          plabCacheBufferPtr(slotCtx(mmuOwner).plabTargetIdx) := rd(GCElementWidth - 1 downto 0)
-          slotState(mmuOwner) := overall_state.states(6)
-          mmuBusy := False
-          mmuOp := MmuOp.NONE
-        }
-      }
-
-      is(MmuOp.READ_PLAB_BUF) {
-        issueReq(io.Mreq, plabCacheBufferPtr(slotCtx(mmuOwner).plabTargetIdx), False, U(8), U(0), mmuIssued(mmuOwner)) { rd =>
-          plabCacheBuffer(slotCtx(mmuOwner).plabTargetIdx) := rd(GCElementWidth - 1 downto 0)
-          plabCacheBufferValid(slotCtx(mmuOwner).plabTargetIdx) := True
-          slotState(mmuOwner) := overall_state.states(7)
-          mmuBusy := False
-          mmuOp := MmuOp.NONE
-        }
-      }
-
-      is(MmuOp.READ_PLAB_TOPEND) {
-        val addr = plabCacheBuffer(slotCtx(mmuOwner).plabTargetIdx) + U"x30"
-        issueReq(io.Mreq, addr, False, U(16), U(0), mmuIssued(mmuOwner)) { rd =>
-          plabCacheTop(slotCtx(mmuOwner).plabTargetIdx) := rd(GCElementWidth - 1 downto 0)
-          plabCacheEnd(slotCtx(mmuOwner).plabTargetIdx) := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
-          plabCacheValid(slotCtx(mmuOwner).plabTargetIdx) := True
-          plabRefillBusy(slotCtx(mmuOwner).plabTargetIdx) := False
-
-          when(slotCtx(mmuOwner).plabForceOld){
-            slotCtx(mmuOwner).destRegionAttr := (slotCtx(mmuOwner).destRegionAttr & U(x"00ff", 16 bits)) | U(x"0100", 16 bits)
+        } elsewhen slotPlabRefillGrant(i) {
+          when(plabCacheBufferValid(plabIdx)) {
+            goto(READ_PLAB_TOPEND)
+          } otherwise {
+            goto(READ_PLAB_PTR)
           }
 
-          slotState(mmuOwner) := overall_state.states(8)
-          mmuBusy := False
-          mmuOp := MmuOp.NONE
+        }
+      }      
+
+      READ_PLAB_PTR.whenIsActive {
+        val addr = (io.ConfigIO.PlabAllocatorPtr + U"x10" + slotCtx(i).plabTargetIdx * U(8)).resize(MMUAddrWidth)
+        issueReq(m, addr, False, U(8), U(0), mmuIssued(i)) { rd =>
+          plabPtrFillValid(i) := True
+          plabPtrFillIdx(i) := slotCtx(i).plabTargetIdx
+          plabPtrFillData(i) := rd(GCElementWidth - 1 downto 0)
+
+          goto(READ_PLAB_BUF)
         }
       }
 
-      is(MmuOp.WRITE_REGION_TOP){
-        val addr = plabCacheBuffer(slotCtx(mmuOwner).plabTargetIdx) + U"x30"
-        issueReq(io.Mreq, addr, True, U(8), plabCacheTop(slotCtx(mmuOwner).plabTargetIdx), mmuIssued(mmuOwner)) { _ =>}
-        when(mmuIssued(mmuOwner)){
-          mmuOp := MmuOp.NONE
-          mmuBusy := False
-          mmuIssued(mmuOwner) := False
-          slotCtx(mmuOwner).waitWriteRegionTop := True
+      READ_PLAB_BUF.whenIsActive {
+        val idx = slotCtx(i).plabTargetIdx
+        issueReq(m, plabCacheBufferPtr(idx).resize(MMUAddrWidth), False, U(8), U(0), mmuIssued(i)) { rd =>
+          plabBufFillValid(i) := True
+          plabBufFillIdx(i) := idx
+          plabBufFillData(i) := rd(GCElementWidth - 1 downto 0)
+
+          goto(READ_PLAB_TOPEND)
         }
       }
 
-      is(MmuOp.WRITE_SRC_FWD){
-        val addr = slotCtx(mmuOwner).srcOopPtr
-        val writeValue = Cat(slotCtx(mmuOwner).destOopPtr(GCElementWidth - 1 downto 2), U(3, 2 bits)).resize(GCElementWidth).asUInt
-        issueReq(io.Mreq, addr, True, U(8), writeValue, mmuIssued(mmuOwner)) { _ =>}
-        when(mmuIssued(mmuOwner)){
-          mmuOp := MmuOp.NONE
-          mmuBusy := False
-          mmuIssued(mmuOwner) := False
-          slotCtx(mmuOwner).writeSrcOopPtrDone := True
+      READ_PLAB_TOPEND.whenIsActive {
+        val idx = slotCtx(i).plabTargetIdx
+        val addr = (plabCacheBuffer(idx) + U"x30").resize(MMUAddrWidth)
 
-          io.ToFetch.valid := True
-          io.ToFetch.srcOopPtr := slotCtx(mmuOwner).srcOopPtr
-          io.ToFetch.writeValue := writeValue
+        issueReq(m, addr, False, U(16), U(0), mmuIssued(i)) { rd =>
+          plabTopEndFillValid(i) := True
+          plabTopEndFillIdx(i) := idx
+          plabTopFillData(i) := rd(GCElementWidth - 1 downto 0)
+          plabEndFillData(i) := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+
+          when(slotCtx(i).plabForceOld) {
+            slotCtx(i).destRegionAttr :=
+              (slotCtx(i).destRegionAttr & U(x"00ff", 16 bits)) | U(x"0100", 16 bits)
+          }
+
+          goto(ALLOC_CACHE)
         }
       }
 
-      is(MmuOp.WRITE_MARK){
-        val cond = slotCtx(mmuOwner).destRegionAttr(15 downto 8) === U(0)
-        val temp = (slotCtx(mmuOwner).markWord & ~(U"x1111" << 3).resize(GCElementWidth)) | ((Mux(slotCtx(mmuOwner).age + U(1) < U(15), slotCtx(mmuOwner).age + U(1), slotCtx(mmuOwner).age) & U(x"1111", 32 bits)) << U(3)).resize(GCElementWidth)
-        val addr = slotCtx(mmuOwner).destOopPtr
-        val writeValue = Mux(cond, temp, slotCtx(mmuOwner).markWord)
-        issueReq(io.Mreq, addr, True, U(8), writeValue, mmuIssued(mmuOwner)) { _ =>}
-        when(mmuIssued(mmuOwner)){
-          mmuOp := MmuOp.NONE
-          mmuBusy := False
-          mmuIssued(mmuOwner) := False
-          slotState(mmuOwner) := overall_state.states(11)
+      ALLOC_CACHE.whenIsActive {
+        val idx = slotCtx(i).plabTargetIdx
+        val enough =
+          ((plabCacheEnd(idx) - plabCacheTop(idx)) / U(8)) >= slotCtx(i).size
+
+        when(enough) {
+          when(slotPlabAllocGrant(i)) {
+            slotCtx(i).destOopPtr := plabCacheTop(idx)
+            plabCacheTop(idx) :=
+              (plabCacheTop(idx) + slotCtx(i).size * U(8)).resize(GCElementWidth)
+
+            goto(SEND_WORK)
+          }
+
+        } otherwise {
+          when(!slotCtx(i).waitWriteRegionTop) {
+            val addr = (plabCacheBuffer(idx) + U"x30").resize(MMUAddrWidth)
+
+            issueReq(
+              m,
+              addr,
+              True,
+              U(8),
+              plabCacheTop(idx),
+              mmuIssued(i)
+            ) { _ =>
+              // write response ignored
+            }
+
+            when(mmuIssued(i)) {
+              mmuIssued(i) := False
+              slotCtx(i).waitWriteRegionTop := True
+            }
+          }
+
+          when(slotCtx(i).allocIssued && slotCtx(i).waitWriteRegionTop) {
+            plabCacheValid(idx) := False
+            goto(WAIT_ALLOC)
+          }
         }
       }
 
-      is(MmuOp.WRITE_FORCE_OLD){
-        val addr = slotCtx(mmuOwner).destAttrPtr + U(1)
-        issueReq(io.Mreq, addr, True, U(1), U(1), mmuIssued(mmuOwner)) { _ => }
-        when(mmuIssued(mmuOwner)) {
-          mmuOp := MmuOp.NONE
-          mmuBusy := False
-          mmuIssued(mmuOwner) := False
-          slotState(mmuOwner) := overall_state.states(9)
+      WAIT_ALLOC.whenIsActive {
+        when(slotCtx(i).allocDone) {
+          slotCtx(i).allocDone := False
+
+          when(slotCtx(i).destOopPtr === U(0, GCElementWidth bits)) {
+            slotCtx(i).plabTargetIdx := U(1, 1 bits)
+            slotCtx(i).plabForceOld := True
+
+            goto(PLAB_SELECT)
+
+          } otherwise {
+            when(slotCtx(i).allocSelect) {
+              goto(WRITE_FORCE_OLD)
+            } otherwise {
+              goto(SEND_WORK)
+            }
+          }
+        }
+      }
+
+      WRITE_FORCE_OLD.whenIsActive {
+        val addr = (slotCtx(i).destAttrPtr + U(1)).resize(MMUAddrWidth)
+
+        issueReq(
+          m,
+          addr,
+          True,
+          U(1),
+          U(1),
+          mmuIssued(i)
+        ) { _ =>
+          // write response ignored
+        }
+
+        when(mmuIssued(i)) {
+          mmuIssued(i) := False
+          goto(SEND_WORK)
+        }
+      }
+
+      SEND_WORK.whenIsActive {
+        val needTrace = slotCtx(i).kid =/= U(TypeArrayKlassID, 32 bits)
+
+        when(!slotCtx(i).writeSrcOopPtrDone) {
+          val addr = slotCtx(i).srcOopPtr.resize(MMUAddrWidth)
+
+          val writeValue =
+            Cat(
+              slotCtx(i).destOopPtr(GCElementWidth - 1 downto 2),
+              U(3, 2 bits)
+            ).resize(GCElementWidth).asUInt
+
+          issueReq(
+            m,
+            addr,
+            True,
+            U(8),
+            writeValue,
+            mmuIssued(i)
+          ) { _ =>
+            // write response ignored
+          }
+
+          when(mmuIssued(i)) {
+            mmuIssued(i) := False
+            slotCtx(i).writeSrcOopPtrDone := True
+
+            toFetchPending(i) := True
+            toFetchSrcOopPtr(i) := slotCtx(i).srcOopPtr
+            toFetchWriteValue(i) := writeValue
+          }
+        }
+
+        val copyIssuedDone = slotCtx(i).copyIssued
+        val traceIssuedDone = slotCtx(i).traceIssued || !needTrace
+
+        when(copyIssuedDone && traceIssuedDone && slotCtx(i).writeSrcOopPtrDone) {
+          goto(WRITE_MARK)
+        }
+      }
+
+      WRITE_MARK.whenIsActive {
+        val cond = slotCtx(i).destRegionAttr(15 downto 8) === U(0)
+
+        val aged =
+          Mux(
+            slotCtx(i).age + U(1) < U(15),
+            slotCtx(i).age + U(1),
+            slotCtx(i).age
+          ) & U(x"1111", 32 bits)
+
+        val writeValue =
+          Mux(
+            cond,
+            (slotCtx(i).markWord & ~(U"x1111" << 3).resize(GCElementWidth)) |
+              (aged << U(3)).resize(GCElementWidth),
+            slotCtx(i).markWord
+          )
+
+        issueReq(
+          m,
+          slotCtx(i).destOopPtr.resize(MMUAddrWidth),
+          True,
+          U(8),
+          writeValue,
+          mmuIssued(i)
+        ) { _ =>
+          // write response ignored
+        }
+
+        when(mmuIssued(i)) {
+          mmuIssued(i) := False
+          goto(WAIT_COPY_TRACE)
+        }
+      }
+
+      WAIT_COPY_TRACE.whenIsActive {
+        val needTrace = slotCtx(i).kid =/= U(TypeArrayKlassID, 32 bits)
+
+        val copyFinished = slotCtx(i).copyDone || !needTrace
+        val traceFinished = slotCtx(i).traceDone || !needTrace
+
+        when(copyFinished && traceFinished) {
+          survivorDonePending(i) := True
+          survivorDoneOwner(i) := slotCtx(i).owner
+          survivorDoneDest(i) := slotCtx(i).destOopPtr
+
+          finishSlot(i)
+        }
+      }
+
+      always {
+        when(slotGotoIdle(i)) {
+          goto(IDLE)
+        } elsewhen(slotStart(i)) {
+          goto(READ_KLASS)
         }
       }
     }
+
+    slotIsPlabSelect(i) := slotFsm.isActive(slotFsm.PLAB_SELECT)
+    slotIsAllocCache(i) := slotFsm.isActive(slotFsm.ALLOC_CACHE)
+    slotIsSendWork(i) := slotFsm.isActive(slotFsm.SEND_WORK)
   }
 
+  // ==========================================================================
+  // PLAB cache allocation arbitration
+  // fixed priority: slot0 > slot1
+  //
+  // 只有拿到 slotPlabAllocGrant 的 slot 才能更新 plabCacheTop。
+  // ==========================================================================
+  val plabAllocReq = Vec.fill(2)(Bool())
+
+  for (i <- 0 until 2) {
+    val idx = slotCtx(i).plabTargetIdx
+
+    val enough =
+      ((plabCacheEnd(idx) - plabCacheTop(idx)) / U(8)) >= slotCtx(i).size
+
+    plabAllocReq(i) :=
+      slotValid(i) &&
+      slotIsAllocCache(i) &&
+      enough
+  }
+
+  val grantPlabAlloc0 = plabAllocReq(0)
+  val grantPlabAlloc1 = !plabAllocReq(0) && plabAllocReq(1)
+
+  slotPlabAllocGrant(0) := grantPlabAlloc0
+  slotPlabAllocGrant(1) := grantPlabAlloc1
+
+  // ==========================================================================
+  // PLAB refill request generation
+  //
+  // 这里的 req 只依赖当前状态和 cache/busy 寄存器。
+  // 不能在 PLAB_SELECT 状态内根据 grant 反推 req。
+  // ==========================================================================
+  val plabRefillReq = Vec.fill(2)(Bool())
+
+  for (i <- 0 until 2) {
+    val idx = slotCtx(i).plabTargetIdx
+
+    plabRefillReq(i) :=
+      slotValid(i) &&
+      slotIsPlabSelect(i) &&
+      !plabCacheValid(idx) &&
+      !plabRefillBusy(idx)
+  }
+
+  // ==========================================================================
+  // shared cache fill: klass cache, fixed priority slot0 > slot1
+  // ==========================================================================
+  val grantKlassFill0 = klassFillValid(0)
+  val grantKlassFill1 = !klassFillValid(0) && klassFillValid(1)
+
+  when(grantKlassFill0 || grantKlassFill1) {
+    val fillPtr =
+      Mux(grantKlassFill0, klassFillPtr(0), klassFillPtr(1))
+
+    val fillKidLh =
+      Mux(grantKlassFill0, klassFillKidLh(0), klassFillKidLh(1))
+
+    klassCacheValid(klassCacheReplacePtr) := True
+    klassCachePtr(klassCacheReplacePtr) := fillPtr
+    klassCacheKidLh(klassCacheReplacePtr) := fillKidLh
+    klassCacheReplacePtr := klassCacheReplacePtr + 1
+  }
+
+  // ==========================================================================
+  // shared dest attr cache fill, fixed priority slot0 > slot1
+  // ==========================================================================
+  val grantDestAttrFill0 = destAttrFillValid(0)
+  val grantDestAttrFill1 = !destAttrFillValid(0) && destAttrFillValid(1)
+
+  when(grantDestAttrFill0 || grantDestAttrFill1) {
+    val fillData =
+      Mux(grantDestAttrFill0, destAttrFillData(0), destAttrFillData(1))
+
+    destAttrRegionValid := True
+    destAttrRegionCache := fillData
+  }
+
+  // ==========================================================================
+  // PLAB refill-start arbitration, fixed priority slot0 > slot1
+  // ==========================================================================
+  val grantPlabRefill0 = plabRefillReq(0)
+  val grantPlabRefill1 = !plabRefillReq(0) && plabRefillReq(1)
+
+  when(grantPlabRefill0) {
+    val idx = slotCtx(0).plabTargetIdx
+
+    plabRefillBusy(idx) := True
+    plabRefillOwner(idx) := U(0, 1 bits)
+    slotPlabRefillGrant(0) := True
+
+  } elsewhen(grantPlabRefill1) {
+    val idx = slotCtx(1).plabTargetIdx
+
+    plabRefillBusy(idx) := True
+    plabRefillOwner(idx) := U(1, 1 bits)
+    slotPlabRefillGrant(1) := True
+  }
+
+  // ==========================================================================
+  // PLAB pointer fill
+  // fixed priority: slot0 > slot1 when same idx
+  // ==========================================================================
+  for (j <- 0 until 2) {
+    when(plabPtrFillValid(0) && plabPtrFillIdx(0) === U(j, 1 bits)) {
+      plabCacheBufferPtr(j) := plabPtrFillData(0)
+
+    } elsewhen(plabPtrFillValid(1) && plabPtrFillIdx(1) === U(j, 1 bits)) {
+      plabCacheBufferPtr(j) := plabPtrFillData(1)
+    }
+  }
+
+  // ==========================================================================
+  // PLAB buffer fill
+  // fixed priority: slot0 > slot1 when same idx
+  // ==========================================================================
+  for (j <- 0 until 2) {
+    when(plabBufFillValid(0) && plabBufFillIdx(0) === U(j, 1 bits)) {
+      plabCacheBuffer(j) := plabBufFillData(0)
+      plabCacheBufferValid(j) := True
+
+    } elsewhen(plabBufFillValid(1) && plabBufFillIdx(1) === U(j, 1 bits)) {
+      plabCacheBuffer(j) := plabBufFillData(1)
+      plabCacheBufferValid(j) := True
+    }
+  }
+
+  // ==========================================================================
+  // PLAB top/end fill
+  // fixed priority: slot0 > slot1 when same idx
+  // ==========================================================================
+  for (j <- 0 until 2) {
+    when(plabTopEndFillValid(0) && plabTopEndFillIdx(0) === U(j, 1 bits)) {
+      plabCacheTop(j) := plabTopFillData(0)
+      plabCacheEnd(j) := plabEndFillData(0)
+      plabCacheValid(j) := True
+      plabRefillBusy(j) := False
+
+    } elsewhen(plabTopEndFillValid(1) && plabTopEndFillIdx(1) === U(j, 1 bits)) {
+      plabCacheTop(j) := plabTopFillData(1)
+      plabCacheEnd(j) := plabEndFillData(1)
+      plabCacheValid(j) := True
+      plabRefillBusy(j) := False
+    }
+  }
+
+  // ==========================================================================
+  // ToCopySurvivor.isTypeArray pulse arbitration
+  // fixed priority: slot0 > slot1
+  // ==========================================================================
+  val grantTypeArray0 = typeArrayPending(0)
+  val grantTypeArray1 = !typeArrayPending(0) && typeArrayPending(1)
+
+  when(grantTypeArray0 || grantTypeArray1) {
+    io.ToCopySurvivor.isTypeArray := True
+    io.ToCopySurvivor.DoneOwner :=
+      Mux(grantTypeArray0, typeArrayOwner(0), typeArrayOwner(1))
+
+    when(grantTypeArray0) {
+      typeArrayPending(0) := False
+    } otherwise {
+      typeArrayPending(1) := False
+    }
+  }
+
+  // ==========================================================================
+  // ToCopySurvivor.Done pulse arbitration
+  // fixed priority: slot0 > slot1
+  // ==========================================================================
+  val grantDone0 = survivorDonePending(0)
+  val grantDone1 = !survivorDonePending(0) && survivorDonePending(1)
+
+  when(grantDone0 || grantDone1) {
+    io.ToCopySurvivor.Done := True
+    io.ToCopySurvivor.DoneOwner :=
+      Mux(grantDone0, survivorDoneOwner(0), survivorDoneOwner(1))
+
+    io.ToCopySurvivor.DestOopPtr :=
+      Mux(grantDone0, survivorDoneDest(0), survivorDoneDest(1))
+
+    when(grantDone0) {
+      survivorDonePending(0) := False
+    } otherwise {
+      survivorDonePending(1) := False
+    }
+  }
+
+  // ==========================================================================
+  // ToFetch forwarding pulse arbitration
+  // fixed priority: slot0 > slot1
+  // ==========================================================================
+  val grantFetch0 = toFetchPending(0)
+  val grantFetch1 = !toFetchPending(0) && toFetchPending(1)
+
+  when(grantFetch0 || grantFetch1) {
+    io.ToFetch.valid := True
+
+    io.ToFetch.srcOopPtr :=
+      Mux(grantFetch0, toFetchSrcOopPtr(0), toFetchSrcOopPtr(1))
+
+    io.ToFetch.writeValue :=
+      Mux(grantFetch0, toFetchWriteValue(0), toFetchWriteValue(1))
+
+    when(grantFetch0) {
+      toFetchPending(0) := False
+    } otherwise {
+      toFetchPending(1) := False
+    }
+  }
+
+  // ==========================================================================
   // copy arbitration
-  val wantCopy = Vec(Bool(), 2)
-  for(i <- 0 until 2) {
-    wantCopy(i) := slotValid(i) && slotState(i) === overall_state.states(9) && !slotCtx(i).copyIssued
+  // fixed priority: slot0 > slot1
+  // ==========================================================================
+  val wantCopy = Vec.fill(2)(Bool())
+
+  for (i <- 0 until 2) {
+    wantCopy(i) :=
+      slotValid(i) &&
+      slotIsSendWork(i) &&
+      !slotCtx(i).copyIssued
   }
 
   when(!copyBusy) {
     when(wantCopy(0)) {
-      val totalSize = (slotCtx(0).size * U(8)).resize(slotCtx(0).size.getWidth)
-      val compressedSize = Mux(io.ConfigIO.UseCompressedKlassPointer, U(16), U(20))
+      val totalSize = (slotCtx(0).size * U(8)).resize(32)
+      val compressedSize =
+        Mux(io.ConfigIO.UseCompressedKlassPointer, U(16), U(20))
 
       io.ToCopy.Valid := True
-      io.ToCopy.Size := Mux(slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits), totalSize - compressedSize, totalSize - U(8))
-      io.ToCopy.SrcOopPtr := Mux(slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits), slotCtx(0).srcOopPtr + compressedSize, slotCtx(0).srcOopPtr + U(8))
-      io.ToCopy.DestOopPtr := Mux(slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits), slotCtx(0).destOopPtr + compressedSize, slotCtx(0).destOopPtr + U(8))
+
+      io.ToCopy.Size :=
+        Mux(
+          slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits),
+          totalSize - compressedSize,
+          totalSize - U(8)
+        )
+
+      io.ToCopy.SrcOopPtr :=
+        Mux(
+          slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits),
+          slotCtx(0).srcOopPtr + compressedSize,
+          slotCtx(0).srcOopPtr + U(8)
+        )
+
+      io.ToCopy.DestOopPtr :=
+        Mux(
+          slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits),
+          slotCtx(0).destOopPtr + compressedSize,
+          slotCtx(0).destOopPtr + U(8)
+        )
 
       when(io.ToCopy.Ready) {
         slotCtx(0).copyIssued := True
         copyBusy := True
-        copyOwner := U(0)
+        copyOwner := U(0, 1 bits)
       }
+
     } elsewhen(wantCopy(1)) {
-      val totalSize = (slotCtx(1).size * U(8)).resize(slotCtx(1).size.getWidth)
-      val compressedSize = Mux(io.ConfigIO.UseCompressedKlassPointer, U(16), U(20))
+      val totalSize = (slotCtx(1).size * U(8)).resize(32)
+      val compressedSize =
+        Mux(io.ConfigIO.UseCompressedKlassPointer, U(16), U(20))
 
       io.ToCopy.Valid := True
-      io.ToCopy.Size := Mux(slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits), totalSize - compressedSize, totalSize - U(8))
-      io.ToCopy.SrcOopPtr := Mux(slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits), slotCtx(1).srcOopPtr + compressedSize, slotCtx(1).srcOopPtr + U(8))
-      io.ToCopy.DestOopPtr := Mux(slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits), slotCtx(1).destOopPtr + compressedSize, slotCtx(1).destOopPtr + U(8))
+
+      io.ToCopy.Size :=
+        Mux(
+          slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits),
+          totalSize - compressedSize,
+          totalSize - U(8)
+        )
+
+      io.ToCopy.SrcOopPtr :=
+        Mux(
+          slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits),
+          slotCtx(1).srcOopPtr + compressedSize,
+          slotCtx(1).srcOopPtr + U(8)
+        )
+
+      io.ToCopy.DestOopPtr :=
+        Mux(
+          slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits),
+          slotCtx(1).destOopPtr + compressedSize,
+          slotCtx(1).destOopPtr + U(8)
+        )
 
       when(io.ToCopy.Ready) {
         slotCtx(1).copyIssued := True
         copyBusy := True
-        copyOwner := U(1)
+        copyOwner := U(1, 1 bits)
       }
     }
   }
 
+  // ==========================================================================
   // trace arbitration
-  val wantTrace = Vec(Bool(), 2)
-  for(i <- 0 until 2) {
-    wantTrace(i) := slotValid(i) && slotState(i) === overall_state.states(9) && !slotCtx(i).traceIssued && slotCtx(i).kid =/= U(TypeArrayKlassID, 32 bits)
+  // fixed priority: slot0 > slot1
+  // ==========================================================================
+  val wantTrace = Vec.fill(2)(Bool())
+
+  for (i <- 0 until 2) {
+    wantTrace(i) :=
+      slotValid(i) &&
+      slotIsSendWork(i) &&
+      !slotCtx(i).traceIssued &&
+      slotCtx(i).kid =/= U(TypeArrayKlassID, 32 bits)
   }
 
   when(!traceBusy) {
@@ -698,13 +1028,19 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       io.ToTrace.ArrayLength := slotCtx(0).srcLength
       io.ToTrace.PartialArrayStart := U(0)
       io.ToTrace.StepIndex := (slotCtx(0).srcLength % io.ConfigIO.ChunkSize).resize(32)
-      io.ToTrace.StepNCreate := Mux(slotCtx(0).srcLength > (slotCtx(0).srcLength % io.ConfigIO.ChunkSize), U(1), U(0)).resize(32)
+      io.ToTrace.StepNCreate :=
+        Mux(
+          slotCtx(0).srcLength > (slotCtx(0).srcLength % io.ConfigIO.ChunkSize),
+          U(1),
+          U(0)
+        ).resize(32)
 
       when(io.ToTrace.Ready) {
         slotCtx(0).traceIssued := True
         traceBusy := True
-        traceOwner := U(0)
+        traceOwner := U(0, 1 bits)
       }
+
     } elsewhen(wantTrace(1)) {
       io.ToTrace.Valid := True
       io.ToTrace.OopType := U(NotArrayOop)
@@ -716,42 +1052,71 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       io.ToTrace.ArrayLength := slotCtx(1).srcLength
       io.ToTrace.PartialArrayStart := U(0)
       io.ToTrace.StepIndex := (slotCtx(1).srcLength % io.ConfigIO.ChunkSize).resize(32)
-      io.ToTrace.StepNCreate := Mux(slotCtx(1).srcLength > (slotCtx(1).srcLength % io.ConfigIO.ChunkSize), U(1), U(0)).resize(32)
+      io.ToTrace.StepNCreate :=
+        Mux(
+          slotCtx(1).srcLength > (slotCtx(1).srcLength % io.ConfigIO.ChunkSize),
+          U(1),
+          U(0)
+        ).resize(32)
 
       when(io.ToTrace.Ready) {
         slotCtx(1).traceIssued := True
         traceBusy := True
-        traceOwner := U(1)
+        traceOwner := U(1, 1 bits)
       }
     }
   }
 
+  // ==========================================================================
   // allocate arbitration
-  val wantAlloc = Vec(Bool(), 2)
-  for(i <- 0 until 2) {
+  // fixed priority: slot0 > slot1
+  // ==========================================================================
+  val wantAlloc = Vec.fill(2)(Bool())
+
+  for (i <- 0 until 2) {
     val idx = slotCtx(i).plabTargetIdx
-    val cond = (plabCacheEnd(idx) - plabCacheTop(idx)) / U(8) < slotCtx(i).size
-    wantAlloc(i) := slotValid(i) && slotState(i) === overall_state.states(8) && !slotCtx(i).allocIssued && cond
+
+    val needAlloc =
+      ((plabCacheEnd(idx) - plabCacheTop(idx)) / U(8)) < slotCtx(i).size
+
+    wantAlloc(i) :=
+      slotValid(i) &&
+      slotIsAllocCache(i) &&
+      !slotCtx(i).allocIssued &&
+      needAlloc
   }
 
   when(!allocBusy) {
     when(wantAlloc(0)) {
       io.ToAllocate.Valid := True
       io.ToAllocate.Size := slotCtx(0).size
-      io.ToAllocate.DestAttrType := Mux(slotCtx(0).allocSelect, U(1, 8 bits), slotCtx(0).destRegionAttr(15 downto 8))
+      io.ToAllocate.DestAttrType :=
+        Mux(
+          slotCtx(0).allocSelect,
+          U(1, 8 bits),
+          slotCtx(0).destRegionAttr(15 downto 8)
+        )
+
       when(io.ToAllocate.Ready) {
         slotCtx(0).allocIssued := True
         allocBusy := True
-        allocOwner := U(0)
+        allocOwner := U(0, 1 bits)
       }
+
     } elsewhen(wantAlloc(1)) {
       io.ToAllocate.Valid := True
       io.ToAllocate.Size := slotCtx(1).size
-      io.ToAllocate.DestAttrType := Mux(slotCtx(1).allocSelect, U(1, 8 bits), slotCtx(1).destRegionAttr(15 downto 8))
+      io.ToAllocate.DestAttrType :=
+        Mux(
+          slotCtx(1).allocSelect,
+          U(1, 8 bits),
+          slotCtx(1).destRegionAttr(15 downto 8)
+        )
+
       when(io.ToAllocate.Ready) {
         slotCtx(1).allocIssued := True
         allocBusy := True
-        allocOwner := U(1)
+        allocOwner := U(1, 1 bits)
       }
     }
   }

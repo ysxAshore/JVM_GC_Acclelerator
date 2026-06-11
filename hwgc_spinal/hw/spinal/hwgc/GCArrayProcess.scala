@@ -50,12 +50,6 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
   val task_limit  = io.ConfigIO.StepperOffset(31 downto 0)
   val task_fanout = io.ConfigIO.StepperOffset(63 downto 32)
 
-  val trace_done = RegInit(False)
-
-  when(io.Process2Trace.Done) {
-    trace_done := True
-  }
-
   // heap region cache
   val heapRegionCacheEntries = 4
   val heapRegionCache = Vec.fill(heapRegionCacheEntries)(RegInit(False))
@@ -95,7 +89,6 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
         srcLength  := io.Fetch2Process.SrcLength
 
         issued := False
-        trace_done := False
 
         goto(READ_DEST_LEN)
 
@@ -136,8 +129,7 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
     }
 
     READ_HUMONGOUS.whenIsActive {
-      val addr =
-        (heap_region.resize(MMUAddrWidth) + U"xbc").resize(MMUAddrWidth)
+      val addr = (heap_region.resize(MMUAddrWidth) + U"xbc").resize(MMUAddrWidth)
 
       issueReq(io.Mreq, addr, False, U(4), U(0),issued) { rd =>
         heapRegionCacheValid(heapRegionCacheReplacePtr) := True
@@ -169,9 +161,9 @@ class GCArrayProcess extends Module with HWParameters with GCParameters {
     }
 
     WAIT_TRACE_DONE.whenIsActive {
-      when(io.Process2Trace.Done || trace_done) {
-        trace_done := False
-
+      // 这里不需要缓存 Process2Trace.Done 信号
+      // 因为在当前设计中，Process2Trace.Done 信号只会在 Trace Module 完成当前任务后发出一次，并且在 FSM 中，我们已经确保只有在发送了有效的 Process2Trace 信号后才会进入 WAIT_TRACE_DONE 状态。因此，在 WAIT_TRACE_DONE 状态中，我们可以直接监测 Process2Trace.Done 信号，而不需要担心它会被重复触发或者丢失
+      when(io.Process2Trace.Done) {
         io.Fetch2Process.Done := True
 
         goto(IDLE)
