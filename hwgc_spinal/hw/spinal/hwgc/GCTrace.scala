@@ -2,22 +2,26 @@ package hwgc
 
 import spinal.core._
 import spinal.lib._
+import spinal.lib.fsm._
 
 import scala.language.postfixOps
 
-class GCTrace extends Module with GCParameters with HWParameters{
+class GCTrace extends Module with GCParameters with HWParameters {
   val io = new Bundle {
-    val Mreq = master(new LocalMMUIO)
-    val ToAop = master(new GCToAop)
-    val ToTrace = slave(new GCToTrace)
-    val ToStack = master(new GCToStack)
-    val Trace2Fetch = master Stream UInt(GCElementWidth bits)
-    val TaskDone = in(Bool())
-    val ConfigIO = slave(new GCTraceConfigIO)
+    val Mreq           = master(new LocalMMUIO)
+    val ToAop          = master(new GCToAop)
+    val ToTrace        = slave(new GCToTrace)
+    val ToStack        = master(new GCToStack)
+    val Trace2Fetch    = master Stream UInt(GCElementWidth bits)
+    val TaskDone       = in Bool()
+    val ConfigIO       = slave(new GCTraceConfigIO)
     val DebugTimeStamp = in UInt(64 bits)
   }
 
-  // default value
+  // --------------------------------------------------------------------------
+  // Default outputs
+  // --------------------------------------------------------------------------
+
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
   io.Mreq.RequestSize.valid := False
@@ -25,7 +29,6 @@ class GCTrace extends Module with GCParameters with HWParameters{
   io.Mreq.Response.ready := True
 
   io.ToAop.clearIn()
-
   io.ToTrace.clearOut()
 
   io.ToStack.Push.valid := False
@@ -35,545 +38,1336 @@ class GCTrace extends Module with GCParameters with HWParameters{
   io.Trace2Fetch.valid := False
   io.Trace2Fetch.payload.clearAll()
 
-  // State Machine
-  object overall_state extends SpinalEnum {
-    val states = Array.tabulate(16)(_ => newElement())
-    for((state, i) <- states.zipWithIndex){
-      state.setName(s"s$i")
-    }
-  }
+  // --------------------------------------------------------------------------
+  // Request context
+  // --------------------------------------------------------------------------
 
-  val state = RegInit(overall_state.states(0))
   val issued = RegInit(False)
 
-  val Kid = RegInit(U(0, 32 bits))
-  val OopType = RegInit(U(0, GCOopTypeWidth bits))
-  val KlassPtr = RegInit(U(0, GCElementWidth bits))
-  val SrcOopPtr = RegInit(U(0, GCElementWidth bits))
-  val DestOopPtr = RegInit(U(0, GCElementWidth bits))
-  val ScanningInYoung = RegInit(False)
-  val StepIndex = RegInit(U(0, 32 bits))
-  val StepNCreate = RegInit(U(0, 32 bits))
-  val ArrayLength = RegInit(U(0, 32 bits))
+  val Kid               = RegInit(U(0, 32 bits))
+  val OopType           = RegInit(U(0, GCOopTypeWidth bits))
+  val KlassPtr          = RegInit(U(0, GCElementWidth bits))
+  val SrcOopPtr         = RegInit(U(0, GCElementWidth bits))
+  val DestOopPtr        = RegInit(U(0, GCElementWidth bits))
+  val ScanningInYoung   = RegInit(False)
+  val StepIndex         = RegInit(U(0, 32 bits))
+  val StepNCreate       = RegInit(U(0, 32 bits))
+  val ArrayLength       = RegInit(U(0, 32 bits))
   val PartialArrayStart = RegInit(U(0, 32 bits))
 
-  val p = RegInit(U(0, GCElementWidth bits))
-  val q = RegInit(U(0, GCElementWidth bits))
-  val vtable_len = RegInit(U(0, 32 bits))
-  val start_map = RegInit(U(0, GCElementWidth bits))
-  val end_map = RegInit(U(0, GCElementWidth bits))
-  val src = RegInit(U(0, GCElementWidth bits))
-  val dest = RegInit(U(0, GCElementWidth bits))
-  val heap_oop = RegInit(U(0, GCElementWidth bits))
-  val regionAttr = RegInit(U(0, 16 bits))
-  val region = RegInit(U(0, 32 bits))
-  val bool_base_value = RegInit(U(0, 8 bits))
-
-  val previousState = RegInit(overall_state.states(0))
-  val for_counter = RegInit(U(0, 32 bits))
-
-  val pendingPushValid   = RegInit(False)
-  val pendingPushPayload = RegInit(U(0, GCElementWidth bits))
-
-  // klass meta data cache
-  val KlassCacheEntries = 16
-  val klassCacheValid  = Vec(RegInit(False), KlassCacheEntries)
-  val klassCachePtr    = Vec(Reg(UInt(GCElementWidth bits)) init(0), KlassCacheEntries)
-  val klassCacheVtable = Vec(Reg(UInt(32 bits)) init(0), KlassCacheEntries)
-  val klassCacheStartMap  = Vec(Reg(UInt(GCElementWidth bits)) init(0), KlassCacheEntries)
-  val klassCacheEndMap  = Vec(Reg(UInt(GCElementWidth bits)) init(0), KlassCacheEntries)
-
-  val klassCacheHit      = Bool()
-  val klassCacheHitIndex = UInt(log2Up(KlassCacheEntries) bits)
-  val klassCacheAllocIndex = UInt(log2Up(KlassCacheEntries) bits)
-
-  val klassCacheHitVec = Vec(Bool(), KlassCacheEntries)
-  for(i <- 0 until KlassCacheEntries){
-    klassCacheHitVec(i) := klassCacheValid(i) && (klassCachePtr(i) === KlassPtr)
-  }
-
-  // Hit only -> can use OHToUInt
-  klassCacheHit := klassCacheHitVec.orR
-  klassCacheHitIndex := OHToUInt(klassCacheHitVec.asBits)
-  val klassCacheReplacePtr = RegInit(U(0, log2Up(KlassCacheEntries) bits))
-
-  // region cache
-  val humRegionCacheEntries = 8
-  val humRegionCacheValid = Vec(RegInit(False), humRegionCacheEntries)
-  val humRegionCacheTag   = Vec(Reg(UInt(32 bits)) init(0), humRegionCacheEntries)
-  val regionLookup = ((heap_oop - (io.ConfigIO.HeapRegionBias << io.ConfigIO.HeapRegionShiftBy(4 downto 0))) >> io.ConfigIO.LogOfHRGrainBytes).resize(32)
-
-  val humRegionHitVec = Vec(Bool(), humRegionCacheEntries)
-  for(i <- 0 until humRegionCacheEntries){
-    humRegionHitVec(i) := humRegionCacheValid(i) && (humRegionCacheTag(i) === regionLookup)
-  }
-  val humRegionHit = humRegionHitVec.orR
-  val humRegionCacheReplacePtr = RegInit(U(0, log2Up(humRegionCacheEntries) bits))
-
-  // region attr cache
-  val regionAttrCacheEntries = 8
-  val regionAttrCacheValid = Vec(RegInit(False), regionAttrCacheEntries)
-  val regionAttrCacheTag = Vec(RegInit(U(0, GCElementWidth bits)), regionAttrCacheEntries)
-  val regionAttrCache = Vec(RegInit(U(0, 16 bits)), regionAttrCacheEntries)
-  val compressed_oop = (io.ConfigIO.CompressedOopBase + (heap_oop << io.ConfigIO.CompressedOopShift)).resize(GCElementWidth)
-  val current_oop = Mux(io.ConfigIO.UseCompressedOops, compressed_oop, heap_oop)
-  val regionAttrAddrLookup = (io.ConfigIO.RegionAttrBiasedBase + (current_oop >> io.ConfigIO.RegionAttrShiftBy) * U(2)).resize(MMUAddrWidth)
-
-  val regionAttrHitVec = Vec(Bool(), regionAttrCacheEntries)
-  for(i <- 0 until regionAttrCacheEntries){
-    regionAttrHitVec(i) := regionAttrCacheValid(i) && (regionAttrCacheTag(i) === regionAttrAddrLookup)
-  }
-  val regionAttrHit = regionAttrHitVec.orR
-  val regionAttrHitIndex = OHToUInt(regionAttrHitVec.asBits)
-  val regionAttrCacheReplacePtr = RegInit(U(0, log2Up(regionAttrCacheEntries) bits))
-
-  val plus_or_dec = RegInit(False)
-  val heap_oop_valid = RegInit(False)
+  // Current scanning interval [p, q).
+  val p           = RegInit(U(0, GCElementWidth bits))
+  val q           = RegInit(U(0, GCElementWidth bits))
   val remainCount = RegInit(U(0, 32 bits))
-  val heap_oop_cache = RegInit(U(0, MMUDataWidth bits))
-  val heap_oop_addr = RegInit(U(0, MMUAddrWidth bits))
 
-  // some const value
-  val oopStride = Mux(io.ConfigIO.UseCompressedOops, U(4), U(8))
-  val objArrayHeaderSize = Mux(io.ConfigIO.UseCompressedKlassPointers, U(16), U(24))
-  val objArrayMarkKlassLenSize = Mux(io.ConfigIO.UseCompressedKlassPointers, U(8), U(12))
+  // Klass metadata.
+  val vtableLen = RegInit(U(0, 32 bits))
+  val startMap  = RegInit(U(0, GCElementWidth bits))
+  val endMap    = RegInit(U(0, GCElementWidth bits))
 
-  val counter = RegInit(U(0, GCElementWidth bits))
-  when(state =/= overall_state.states(0)){
-    counter := counter + 1
-  }
+  // Current oop slot.
+  val src  = RegInit(U(0, GCElementWidth bits))
+  val dest = RegInit(U(0, GCElementWidth bits))
 
-  def dbg(msg: Seq[Any]): Unit =
-    if (DebugEnable) report(Seq("[GCTrace<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
+  /*
+   * rawHeapOop:
+   *   Value loaded from the object field. It may still be compressed.
+   *
+   * heapOop:
+   *   Fully decoded heap address used by region processing.
+   *
+   * Keeping these separate prevents repeated decompression if CHECK_OOP stalls.
+   */
+  val rawHeapOop = RegInit(U(0, GCElementWidth bits))
+  val heapOop    = RegInit(U(0, GCElementWidth bits))
 
-  def resetState(): Unit = {
-    io.ToTrace.Done := True
-    state := overall_state.states(0)
-  }
+  val regionAttr = RegInit(U(0, 16 bits))
+  val region     = RegInit(U(0, 32 bits))
 
-  def pushTask(task: UInt)(afterAccept: => Unit): Unit = {
+  val partialTaskCounter = RegInit(U(0, 32 bits))
+  val refFieldIndex      = RegInit(U(0, 2 bits))
+
+  // --------------------------------------------------------------------------
+  // Pending task buffer
+  //
+  // Keep the newest task locally. When another task arrives, spill the older
+  // task to ToStack. The final task is emitted through Trace2Fetch.
+  // --------------------------------------------------------------------------
+
+  val pendingPushValid =
+    RegInit(False)
+
+  val pendingPushPayload =
+    RegInit(U(0, GCElementWidth bits))
+
+  def enqueueTask(task: UInt)(afterAccepted: => Unit): Unit = {
     when(!pendingPushValid) {
       pendingPushValid := True
       pendingPushPayload := task
-      afterAccept
-    }.otherwise {
+      afterAccepted
+    } otherwise {
       io.ToStack.Push.valid := True
       io.ToStack.Push.payload := pendingPushPayload
+
       when(io.ToStack.Push.fire) {
         pendingPushPayload := task
         pendingPushValid := True
-        afterAccept
+        afterAccepted
       }
     }
   }
 
-  def readFromWindow(base: UInt, data: UInt): Unit = {
-    when(io.ConfigIO.UseCompressedOops) {
-      val idx32 = ((src - base) >> 2).resize(3 bits)   // 32B / 4B = 8 entries
-      val split32 = data.subdivideIn(32 bits)
-      heap_oop := Cat(U(0, 32 bits), split32(idx32)).asUInt
-    } otherwise {
-      val idx64 = ((src - base) >> 3).resize(2 bits)   // 32B / 8B = 4 entries
-      val split64 = data.subdivideIn(GCElementWidth bits)
-      heap_oop := split64(idx64)
-    }
-    state := overall_state.states(9)
+  // --------------------------------------------------------------------------
+  // Klass metadata cache
+  // --------------------------------------------------------------------------
+
+  private val KlassCacheEntries    = 16
+  private val KlassCacheIndexWidth = log2Up(KlassCacheEntries)
+
+  val klassCacheValid =
+    Vec(RegInit(False), KlassCacheEntries)
+
+  val klassCachePtr =
+    Vec(
+      Reg(UInt(GCElementWidth bits)) init 0,
+      KlassCacheEntries
+    )
+
+  val klassCacheVtable =
+    Vec(
+      Reg(UInt(32 bits)) init 0,
+      KlassCacheEntries
+    )
+
+  val klassCacheStartMap =
+    Vec(
+      Reg(UInt(GCElementWidth bits)) init 0,
+      KlassCacheEntries
+    )
+
+  val klassCacheEndMap =
+    Vec(
+      Reg(UInt(GCElementWidth bits)) init 0,
+      KlassCacheEntries
+    )
+
+  val klassCacheHitVec =
+    Vec(Bool(), KlassCacheEntries)
+
+  for (i <- 0 until KlassCacheEntries) {
+    klassCacheHitVec(i) :=
+      klassCacheValid(i) &&
+        klassCachePtr(i) === KlassPtr
   }
 
-  def issueElemRead(addr: UInt): Unit = {
-    val elemBytes = Mux(io.ConfigIO.UseCompressedOops, U(4), U(8))
-    issueReq(io.Mreq, addr, False, elemBytes, U(0), issued) { rd =>
+  val klassCacheHit =
+    klassCacheHitVec.orR
+
+  val klassCacheHitIndex =
+    OHToUInt(klassCacheHitVec.asBits)
+
+  val klassCacheReplacePtr =
+    RegInit(U(0, KlassCacheIndexWidth bits))
+
+  // --------------------------------------------------------------------------
+  // Humongous region cache
+  // --------------------------------------------------------------------------
+
+  private val HumRegionCacheEntries    = 8
+  private val HumRegionCacheIndexWidth = log2Up(HumRegionCacheEntries)
+
+  val humRegionCacheValid =
+    Vec(RegInit(False), HumRegionCacheEntries)
+
+  val humRegionCacheTag =
+    Vec(
+      Reg(UInt(32 bits)) init 0,
+      HumRegionCacheEntries
+    )
+
+  val humRegionCacheReplacePtr =
+    RegInit(U(0, HumRegionCacheIndexWidth bits))
+
+  /*
+   * heapOop is guaranteed to be decoded before entering the humongous
+   * processing states.
+   */
+  val regionLookup =
+    (
+      (
+        heapOop -
+          (
+            io.ConfigIO.HeapRegionBias <<
+              io.ConfigIO.HeapRegionShiftBy(4 downto 0)
+            )
+        ) >> io.ConfigIO.LogOfHRGrainBytes
+      ).resize(32)
+
+  val humRegionHitVec =
+    Vec(Bool(), HumRegionCacheEntries)
+
+  for (i <- 0 until HumRegionCacheEntries) {
+    humRegionHitVec(i) :=
+      humRegionCacheValid(i) &&
+        humRegionCacheTag(i) === regionLookup
+  }
+
+  val humRegionHit =
+    humRegionHitVec.orR
+
+  // --------------------------------------------------------------------------
+  // Region attribute cache
+  // --------------------------------------------------------------------------
+
+  private val RegionAttrCacheEntries    = 8
+  private val RegionAttrCacheIndexWidth = log2Up(RegionAttrCacheEntries)
+
+  val regionAttrCacheValid =
+    Vec(RegInit(False), RegionAttrCacheEntries)
+
+  /*
+   * This is an MMU address. Using MMUAddrWidth avoids implicit comparison
+   * resizing against regionAttrAddrLookup.
+   */
+  val regionAttrCacheTag =
+    Vec(
+      Reg(UInt(MMUAddrWidth bits)) init 0,
+      RegionAttrCacheEntries
+    )
+
+  val regionAttrCache =
+    Vec(
+      Reg(UInt(16 bits)) init 0,
+      RegionAttrCacheEntries
+    )
+
+  val regionAttrCacheReplacePtr =
+    RegInit(U(0, RegionAttrCacheIndexWidth bits))
+
+  val decodedRawHeapOop =
+    Mux(
+      io.ConfigIO.UseCompressedOops,
+      (
+        io.ConfigIO.CompressedOopBase +
+          (rawHeapOop << io.ConfigIO.CompressedOopShift)
+        ).resize(GCElementWidth),
+      rawHeapOop
+    )
+
+  val regionAttrAddrLookup =
+    (
+      io.ConfigIO.RegionAttrBiasedBase +
+        (
+          decodedRawHeapOop >>
+            io.ConfigIO.RegionAttrShiftBy
+          ) * U(2)
+      ).resize(MMUAddrWidth)
+
+  val regionAttrHitVec =
+    Vec(Bool(), RegionAttrCacheEntries)
+
+  for (i <- 0 until RegionAttrCacheEntries) {
+    regionAttrHitVec(i) :=
+      regionAttrCacheValid(i) &&
+        regionAttrCacheTag(i) === regionAttrAddrLookup
+  }
+
+  val regionAttrHit =
+    regionAttrHitVec.orR
+
+  val regionAttrHitIndex =
+    OHToUInt(regionAttrHitVec.asBits)
+
+  // --------------------------------------------------------------------------
+  // 32-byte oop read window
+  // --------------------------------------------------------------------------
+
+  val heapWindowValid =
+    RegInit(False)
+
+  val heapWindowData =
+    RegInit(U(0, MMUDataWidth bits))
+
+  val heapWindowAddr =
+    RegInit(U(0, MMUAddrWidth bits))
+
+  // --------------------------------------------------------------------------
+  // Derived constants
+  // --------------------------------------------------------------------------
+
+  val oopStride =
+    Mux(
+      io.ConfigIO.UseCompressedOops,
+      U(4),
+      U(8)
+    )
+
+  val objArrayHeaderSize =
+    Mux(
+      io.ConfigIO.UseCompressedKlassPointers,
+      U(16),
+      U(24)
+    )
+
+  val objArrayMarkKlassLenSize =
+    Mux(
+      io.ConfigIO.UseCompressedKlassPointers,
+      U(8),
+      U(12)
+    )
+
+  def dbg(msg: Seq[Any]): Unit = {
+    if (DebugEnable) {
+      report(
+        Seq(
+          "[GCTrace<",
+          io.DebugTimeStamp,
+          ">] "
+        ) ++ msg ++ Seq("\n")
+      )
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Traversal resume selector
+  // --------------------------------------------------------------------------
+
+  object ResumePoint extends SpinalEnum {
+    val Forward, Backward, ReferenceFields = newElement()
+  }
+
+  val resumePoint =
+    RegInit(ResumePoint.Forward)
+
+  // --------------------------------------------------------------------------
+  // State machine
+  // --------------------------------------------------------------------------
+
+  val fsm = new StateMachine {
+    val IDLE                = new State with EntryPoint
+    val DISPATCH            = new State
+    val PREPARE_ARRAY       = new State
+    val READ_KLASS_LAYOUT   = new State
+    val SCAN_OOP_MAP        = new State
+    val POST_INSTANCE_SCAN  = new State
+    val SCAN_FORWARD        = new State
+    val SCAN_BACKWARD       = new State
+    val READ_OOP            = new State
+    val CHECK_OOP           = new State
+    val DECIDE_REGION       = new State
+    val CHECK_HUMONGOUS     = new State
+    val CLEAR_HUM_CANDIDATE = new State
+    val MARK_HUM_REGION     = new State
+    val SEND_AOP            = new State
+    val FINISH              = new State
+
+    // ------------------------------------------------------------------------
+    // FSM helper methods
+    // ------------------------------------------------------------------------
+
+    def finishTask(): Unit = {
+      io.ToTrace.Done := True
+      goto(IDLE)
+    }
+
+    def resumeTraversal(): Unit = {
+      switch(resumePoint) {
+        is(ResumePoint.Forward) {
+          goto(SCAN_FORWARD)
+        }
+
+        is(ResumePoint.Backward) {
+          goto(SCAN_BACKWARD)
+        }
+
+        is(ResumePoint.ReferenceFields) {
+          goto(POST_INSTANCE_SCAN)
+        }
+      }
+    }
+
+    /*
+     * Consume one element from a 32-byte read window.
+     *
+     * remainCount includes the current element when READ_OOP is active.
+     * Therefore it is decremented here, when the element is actually consumed.
+     */
+    def consumeWindow(base: UInt, data: UInt): Unit = {
       when(io.ConfigIO.UseCompressedOops) {
-        heap_oop := Cat(U(0, 32 bits), rd(31 downto 0)).asUInt
+        val index =
+          ((src - base) >> 2).resize(3 bits)
+
+        val words =
+          data.subdivideIn(32 bits)
+
+        rawHeapOop :=
+          words(index).resize(GCElementWidth)
       } otherwise {
-        heap_oop := rd(GCElementWidth - 1 downto 0)
+        val index =
+          ((src - base) >> 3).resize(2 bits)
+
+        val words =
+          data.subdivideIn(GCElementWidth bits)
+
+        rawHeapOop :=
+          words(index)
       }
-      state := overall_state.states(9)
-    }
-  }
 
-  def issueWindowRead(addr: UInt): Unit = {
-    issueReq(io.Mreq, addr, False, U(32), U(0), issued) { rd =>
-      heap_oop_addr  := addr
-      heap_oop_cache := rd
-      heap_oop_valid := True
-      readFromWindow(addr, rd)
+      remainCount := remainCount - 1
+      goto(CHECK_OOP)
     }
-  }
 
-  when(io.TaskDone){
-    for(i <- 0 until KlassCacheEntries){
-      klassCacheValid(i) := False
-    }
-    for(i <- 0 until humRegionCacheEntries){
-      humRegionCacheValid(i) := False
-    }
-    for(i <- 0 until regionAttrCacheEntries){
-      regionAttrCacheValid(i) := False
-    }
-  }
+    def issueElementRead(address: UInt): Unit = {
+      val elementBytes =
+        Mux(
+          io.ConfigIO.UseCompressedOops,
+          U(4),
+          U(8)
+        )
 
-  switch(state){
-    is(overall_state.states(0)){
+      issueReq(
+        io.Mreq,
+        address,
+        False,
+        elementBytes,
+        U(0),
+        issued
+      ) { readData =>
+        when(io.ConfigIO.UseCompressedOops) {
+          rawHeapOop :=
+            readData(31 downto 0)
+              .resize(GCElementWidth)
+        } otherwise {
+          rawHeapOop :=
+            readData(GCElementWidth - 1 downto 0)
+        }
+
+        remainCount := remainCount - 1
+        goto(CHECK_OOP)
+      }
+    }
+
+    def issueWindowRead(address: UInt): Unit = {
+      issueReq(
+        io.Mreq,
+        address,
+        False,
+        U(32),
+        U(0),
+        issued
+      ) { readData =>
+        heapWindowAddr := address
+        heapWindowData := readData
+        heapWindowValid := True
+
+        consumeWindow(address, readData)
+      }
+    }
+
+    /*
+     * Common region decision logic.
+     *
+     * attr and oop are passed directly so that cache-hit processing does not
+     * depend on reading registers assigned in the same clock cycle.
+     */
+    def processRegion(attr: UInt, oop: UInt): Unit = {
+      val attrType =
+        attr(15 downto 8).asSInt
+
+      val crossesRegion =
+        (
+          (dest ^ oop) >>
+            io.ConfigIO.LogOfHRGrainBytes(5 downto 0)
+          ).orR
+
+      when(attrType >= S(0, 8 bits)) {
+        val task =
+          dest +
+            Mux(
+              io.ConfigIO.UseCompressedOops,
+              U(1),
+              U(0)
+            )
+
+        enqueueTask(task) {
+          resumeTraversal()
+        }
+      } elsewhen (crossesRegion) {
+        when(attrType === S(-2, 8 bits)) {
+          goto(CHECK_HUMONGOUS)
+        } otherwise {
+          goto(SEND_AOP)
+        }
+      } otherwise {
+        resumeTraversal()
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // IDLE
+    // ------------------------------------------------------------------------
+
+    IDLE.whenIsActive {
       io.ToTrace.Ready := True
-      when(io.ToTrace.Valid && io.ToTrace.Ready){
-        Kid := io.ToTrace.Kid
-        OopType := io.ToTrace.OopType
-        KlassPtr := io.ToTrace.KlassPtr
-        SrcOopPtr := io.ToTrace.SrcOopPtr
-        DestOopPtr := io.ToTrace.DestOopPtr
+
+      when(io.ToTrace.Valid && io.ToTrace.Ready) {
+        Kid             := io.ToTrace.Kid
+        OopType         := io.ToTrace.OopType
+        KlassPtr        := io.ToTrace.KlassPtr
+        SrcOopPtr       := io.ToTrace.SrcOopPtr
+        DestOopPtr      := io.ToTrace.DestOopPtr
         ScanningInYoung := io.ToTrace.ScanningInYoung
-        StepIndex := io.ToTrace.StepIndex
-        StepNCreate := io.ToTrace.StepNCreate
-        ArrayLength := io.ToTrace.ArrayLength
-        PartialArrayStart := Mux(io.ToTrace.OopType === U(PartialArrayOop), io.ToTrace.PartialArrayStart, U(0))
+        StepIndex       := io.ToTrace.StepIndex
+        StepNCreate     := io.ToTrace.StepNCreate
+        ArrayLength     := io.ToTrace.ArrayLength
 
-        for_counter := U(0)
-        state := overall_state.states(1)
+        PartialArrayStart :=
+          Mux(
+            io.ToTrace.OopType === U(PartialArrayOop),
+            io.ToTrace.PartialArrayStart,
+            U(0)
+          )
 
-        heap_oop_addr := U(0)
+        partialTaskCounter := 0
+        refFieldIndex := 0
+        remainCount := 0
 
-        dbg(Seq(
-          "Receive GCTrace Task", ", RegionAttrBase = ", io.ConfigIO.RegionAttrBase, ", RegionAttrShiftBy = ", io.ConfigIO.RegionAttrShiftBy,
-          ", RegionAttrBiasedBase = ", io.ConfigIO.RegionAttrBiasedBase, ", HeapRegionBias = ", io.ConfigIO.HeapRegionBias,
-          ", HeapRegionShiftBy = ", io.ConfigIO.HeapRegionShiftBy, ", LogOfHRGrainBytes = ", io.ConfigIO.LogOfHRGrainBytes,
-          ", HumongousReclaimCandidatesBoolBase = ", io.ConfigIO.HumongousReclaimCandidatesBoolBase, ", OopType = ", io.ToTrace.OopType,
-          ", KlassPtr = ", io.ToTrace.KlassPtr, ", SrcOopPtr = ", io.ToTrace.SrcOopPtr, ", DestOopPtr = ", io.ToTrace.DestOopPtr,
-          ", Kid = ", io.ToTrace.Kid, ", ArrayLength = ", io.ToTrace.ArrayLength, ", PartialArrayStart = ", io.ToTrace.PartialArrayStart,
-          ", StepIndex = ", io.ToTrace.StepIndex, ", StepNCreate = ", io.ToTrace.StepNCreate,
-          "\n"
-        ))
+        /*
+         * Do not allow a read window from the previous trace request to hit.
+         */
+        heapWindowValid := False
+        heapWindowAddr := 0
+
+        issued := False
+
+        goto(DISPATCH)
+
+        dbg(
+          Seq(
+            "Receive GCTrace Task",
+            ", RegionAttrBase = ",
+            io.ConfigIO.RegionAttrBase,
+            ", RegionAttrShiftBy = ",
+            io.ConfigIO.RegionAttrShiftBy,
+            ", RegionAttrBiasedBase = ",
+            io.ConfigIO.RegionAttrBiasedBase,
+            ", HeapRegionBias = ",
+            io.ConfigIO.HeapRegionBias,
+            ", HeapRegionShiftBy = ",
+            io.ConfigIO.HeapRegionShiftBy,
+            ", LogOfHRGrainBytes = ",
+            io.ConfigIO.LogOfHRGrainBytes,
+            ", OopType = ",
+            io.ToTrace.OopType,
+            ", KlassPtr = ",
+            io.ToTrace.KlassPtr,
+            ", SrcOopPtr = ",
+            io.ToTrace.SrcOopPtr,
+            ", DestOopPtr = ",
+            io.ToTrace.DestOopPtr,
+            ", Kid = ",
+            io.ToTrace.Kid,
+            ", ArrayLength = ",
+            io.ToTrace.ArrayLength,
+            ", PartialArrayStart = ",
+            io.ToTrace.PartialArrayStart,
+            ", StepIndex = ",
+            io.ToTrace.StepIndex,
+            ", StepNCreate = ",
+            io.ToTrace.StepNCreate
+          )
+        )
       }
     }
 
-    is(overall_state.states(1)) {
-      when(OopType === U(PartialArrayOop)){
-        val addr = DestOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U"xc", U"x10")
-        val writeValue = ArrayLength
-        issueReq(io.Mreq, addr, True, 4, writeValue, issued){ _ =>
+    // ------------------------------------------------------------------------
+    // Initial task dispatch
+    // ------------------------------------------------------------------------
+
+    DISPATCH.whenIsActive {
+      when(OopType === U(PartialArrayOop)) {
+        val address =
+          DestOopPtr +
+            Mux(
+              io.ConfigIO.UseCompressedKlassPointers,
+              U"xc",
+              U"x10"
+            )
+
+        issueReq(
+          io.Mreq,
+          address,
+          True,
+          U(4),
+          ArrayLength,
+          issued
+        ) { _ =>
         }
-        when(issued){
-          state := overall_state.states(2)
+
+        /*
+         * This follows the original write-request completion convention:
+         * transition when issued becomes true.
+         */
+        when(issued) {
           issued := False
+          goto(PREPARE_ARRAY)
         }
-      }.elsewhen(Kid === U(ObjectArrayKlassID)){
-        val addr = DestOopPtr + U(8)
-        val writeLen = StepIndex
-        val writeValue = Mux(io.ConfigIO.UseCompressedKlassPointers, Cat(writeLen, KlassPtr(31 downto 0)).resize(96), Cat(writeLen, KlassPtr)).asUInt
-        issueReq(io.Mreq, addr, True, objArrayMarkKlassLenSize, writeValue, issued) { _ =>
+      } elsewhen (Kid === U(ObjectArrayKlassID)) {
+        val address =
+          DestOopPtr + U(8)
+
+        val writeValue =
+          Mux(
+            io.ConfigIO.UseCompressedKlassPointers,
+            Cat(
+              StepIndex,
+              KlassPtr(31 downto 0)
+            ).resize(96),
+            Cat(
+              StepIndex,
+              KlassPtr
+            ).resize(96)
+          ).asUInt
+
+        issueReq(
+          io.Mreq,
+          address,
+          True,
+          objArrayMarkKlassLenSize,
+          writeValue,
+          issued
+        ) { _ =>
         }
-        when(issued){
-          state := overall_state.states(2)
+
+        when(issued) {
           issued := False
+          goto(PREPARE_ARRAY)
         }
-      }.otherwise{
-        when(klassCacheHit){
-          vtable_len := klassCacheVtable(klassCacheHitIndex)
-          start_map := klassCacheStartMap(klassCacheHitIndex)
-          end_map := klassCacheEndMap(klassCacheHitIndex)
-          state := overall_state.states(4)
-        }.otherwise {
-          val addr = KlassPtr + U(160)
-          issueReq(io.Mreq, addr, False, U(4), U(0), issued) { rd =>
-            vtable_len := rd(31 downto 0)
-            state := overall_state.states(3)
+      } otherwise {
+        when(klassCacheHit) {
+          vtableLen :=
+            klassCacheVtable(klassCacheHitIndex)
+
+          startMap :=
+            klassCacheStartMap(klassCacheHitIndex)
+
+          endMap :=
+            klassCacheEndMap(klassCacheHitIndex)
+
+          goto(SCAN_OOP_MAP)
+        } otherwise {
+          val address =
+            KlassPtr + U(160)
+
+          issueReq(
+            io.Mreq,
+            address,
+            False,
+            U(4),
+            U(0),
+            issued
+          ) { readData =>
+            vtableLen :=
+              readData(31 downto 0)
+
+            goto(READ_KLASS_LAYOUT)
           }
         }
       }
     }
 
-    is(overall_state.states(2)){
-      val cond = Mux(OopType === U(PartialArrayOop), for_counter < StepNCreate, ArrayLength > StepIndex)
-      val low = (DestOopPtr + objArrayHeaderSize + PartialArrayStart * oopStride).resize(GCElementWidth)
-      val high = (DestOopPtr + objArrayHeaderSize + StepIndex * oopStride).resize(GCElementWidth)
-      val temp_p = DestOopPtr + objArrayHeaderSize
-      val temp_q = (temp_p + ArrayLength * oopStride).resize(GCElementWidth)
-      val q_value = Mux(temp_q > high, high, temp_q)
-      val p_value = Mux(temp_p < low, low, temp_p)
+    // ------------------------------------------------------------------------
+    // Object-array preparation
+    // ------------------------------------------------------------------------
 
-      p := p_value
-      q := q_value
-      remainCount := ((q_value - p_value) >> Mux(io.ConfigIO.UseCompressedOops, U(2), U(3))).resize(32)
+    PREPARE_ARRAY.whenIsActive {
+      val low =
+        (
+          DestOopPtr +
+            objArrayHeaderSize +
+            PartialArrayStart * oopStride
+          ).resize(GCElementWidth)
 
-      when(cond){
-        val task = SrcOopPtr + U(2)
-        pushTask(task) {
-          when(OopType === U(PartialArrayOop)){
-            for_counter := for_counter + U(1)
-            state := overall_state.states(2)
-          }.otherwise{
-            state := overall_state.states(6)
+      val high =
+        (
+          DestOopPtr +
+            objArrayHeaderSize +
+            StepIndex * oopStride
+          ).resize(GCElementWidth)
+
+      val objectBegin =
+        (
+          DestOopPtr +
+            objArrayHeaderSize
+          ).resize(GCElementWidth)
+
+      val objectEnd =
+        (
+          objectBegin +
+            ArrayLength * oopStride
+          ).resize(GCElementWidth)
+
+      val nextP =
+        Mux(
+          objectBegin < low,
+          low,
+          objectBegin
+        )
+
+      val nextQ =
+        Mux(
+          objectEnd > high,
+          high,
+          objectEnd
+        )
+
+      p := nextP
+      q := nextQ
+
+      remainCount :=
+        (
+          (nextQ - nextP) >>
+            Mux(
+              io.ConfigIO.UseCompressedOops,
+              U(2),
+              U(3)
+            )
+          ).resize(32)
+
+      val needCreateTask =
+        Mux(
+          OopType === U(PartialArrayOop),
+          partialTaskCounter < StepNCreate,
+          ArrayLength > StepIndex
+        )
+
+      when(needCreateTask) {
+        /*
+         * Preserve the original tagged task representation.
+         */
+        val createTask =
+          SrcOopPtr + U(2)
+
+        enqueueTask(createTask) {
+          when(OopType === U(PartialArrayOop)) {
+            partialTaskCounter :=
+              partialTaskCounter + 1
+          } otherwise {
+            goto(SCAN_FORWARD)
           }
         }
-      }.otherwise{
-        state := overall_state.states(6)
+      } otherwise {
+        goto(SCAN_FORWARD)
       }
     }
 
-    is(overall_state.states(3)){
-      val addr = KlassPtr + U(296)
-      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
-        val new_startMap = (KlassPtr + U(464) + (vtable_len + rd(63 downto 32)) * U(8)).resize(GCElementWidth)
-        val new_endMap = (KlassPtr + U(464) + (vtable_len + rd(63 downto 32) + rd(31 downto 0)) * U(8)).resize(GCElementWidth)
+    // ------------------------------------------------------------------------
+    // Dependent klass metadata read
+    // ------------------------------------------------------------------------
 
-        klassCacheValid(klassCacheReplacePtr) := True
-        klassCachePtr(klassCacheReplacePtr) := KlassPtr
-        klassCacheVtable(klassCacheReplacePtr) := vtable_len
-        klassCacheStartMap(klassCacheReplacePtr) := new_startMap
-        klassCacheEndMap(klassCacheReplacePtr)   := new_endMap
+    READ_KLASS_LAYOUT.whenIsActive {
+      val address =
+        KlassPtr + U(296)
 
-        klassCacheReplacePtr := klassCacheReplacePtr + 1
+      issueReq(
+        io.Mreq,
+        address,
+        False,
+        U(8),
+        U(0),
+        issued
+      ) { readData =>
+        val oopMapOffset =
+          readData(63 downto 32)
 
-        start_map := new_startMap
-        end_map := new_endMap
-        state := overall_state.states(4)
+        val oopMapCount =
+          readData(31 downto 0)
+
+        val newStartMap =
+          (
+            KlassPtr +
+              U(464) +
+              (vtableLen + oopMapOffset) * U(8)
+            ).resize(GCElementWidth)
+
+        val newEndMap =
+          (
+            KlassPtr +
+              U(464) +
+              (
+                vtableLen +
+                  oopMapOffset +
+                  oopMapCount
+                ) * U(8)
+            ).resize(GCElementWidth)
+
+        klassCacheValid(klassCacheReplacePtr) :=
+          True
+
+        klassCachePtr(klassCacheReplacePtr) :=
+          KlassPtr
+
+        klassCacheVtable(klassCacheReplacePtr) :=
+          vtableLen
+
+        klassCacheStartMap(klassCacheReplacePtr) :=
+          newStartMap
+
+        klassCacheEndMap(klassCacheReplacePtr) :=
+          newEndMap
+
+        klassCacheReplacePtr :=
+          klassCacheReplacePtr + 1
+
+        startMap := newStartMap
+        endMap := newEndMap
+
+        goto(SCAN_OOP_MAP)
       }
     }
 
-    is(overall_state.states(4)){
-      when(start_map < end_map){
-        val addr = end_map - U(8)
-        issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
-          p := (DestOopPtr + rd(31 downto 0)).resize(GCElementWidth)
-          q := (DestOopPtr + rd(31 downto 0) + rd(63 downto 32) * oopStride).resize(GCElementWidth)
-          remainCount := rd(63 downto 32)
-          end_map := addr
+    // ------------------------------------------------------------------------
+    // Scan klass oop-map entries from the end
+    // ------------------------------------------------------------------------
 
-          // TRACE_DEC -> done to the state
-          state := overall_state.states(7)
+    SCAN_OOP_MAP.whenIsActive {
+      when(startMap < endMap) {
+        val address =
+          endMap - U(8)
+
+        issueReq(
+          io.Mreq,
+          address,
+          False,
+          U(8),
+          U(0),
+          issued
+        ) { readData =>
+          val mapOffset =
+            readData(31 downto 0)
+
+          val mapCount =
+            readData(63 downto 32)
+
+          p :=
+            (
+              DestOopPtr +
+                mapOffset
+              ).resize(GCElementWidth)
+
+          q :=
+            (
+              DestOopPtr +
+                mapOffset +
+                mapCount * oopStride
+              ).resize(GCElementWidth)
+
+          remainCount :=
+            mapCount.resize(32)
+
+          endMap :=
+            address
+
+          goto(SCAN_BACKWARD)
         }
-      }.otherwise{
-        for_counter := U(0)
-        state := overall_state.states(5)
+      } otherwise {
+        refFieldIndex := 0
+        goto(POST_INSTANCE_SCAN)
       }
     }
 
-    is(overall_state.states(5)){
-      when(Kid === U(InstanceMirrorKlassID)){
-        val addr = SrcOopPtr + U(40)
-        issueReq(io.Mreq, addr, False, U(4), U(0), issued) { rd =>
-          p := DestOopPtr + U(184)
-          q := (DestOopPtr + U(184) + rd(31 downto 0) * oopStride).resize(GCElementWidth)
-          remainCount := rd(31 downto 0)
+    // ------------------------------------------------------------------------
+    // Mirror and java.lang.ref.Reference special fields
+    // ------------------------------------------------------------------------
 
-          // TRACE_PLUS -> done to end
-          state := overall_state.states(6)
+    POST_INSTANCE_SCAN.whenIsActive {
+      when(Kid === U(InstanceMirrorKlassID)) {
+        val address =
+          SrcOopPtr + U"x24"
+
+        issueReq(
+          io.Mreq,
+          address,
+          False,
+          U(4),
+          U(0),
+          issued
+        ) { readData =>
+          val mirrorArrayLength =
+            readData(31 downto 0)
+
+          p :=
+            DestOopPtr + U"x70"
+
+          q :=
+            (
+              DestOopPtr +
+                U"x70" +
+                mirrorArrayLength * oopStride
+              ).resize(GCElementWidth)
+
+          remainCount :=
+            mirrorArrayLength.resize(32)
+
+          goto(SCAN_FORWARD)
         }
-      }.elsewhen(Kid === U(InstanceRefKlassID)){
-        when(for_counter === U(3)){
-          state := overall_state.states(15)
-        }.otherwise {
-          val discovered_offset = Mux(io.ConfigIO.UseCompressedOops && io.ConfigIO.UseCompressedKlassPointers, U"x18", Mux(io.ConfigIO.UseCompressedOops, U"x1c", U"x28"))
-          val referent_offset = Mux(io.ConfigIO.UseCompressedOops && io.ConfigIO.UseCompressedKlassPointers, U"xc", U"x10")
+      } elsewhen (Kid === U(InstanceRefKlassID)) {
+        /*
+         * Original behavior:
+         *
+         *   index 0 -> discovered
+         *   index 1 -> referent
+         *   index 2 -> discovered
+         *
+         * The third access is identical to the first one. The rewritten
+         * implementation scans discovered and referent once each.
+         */
+        when(refFieldIndex === U(2)) {
+          goto(FINISH)
+        } otherwise {
+          val discoveredOffset =
+            Mux(
+              io.ConfigIO.UseCompressedOops &&
+                io.ConfigIO.UseCompressedKlassPointers,
+              U"x18",
+              Mux(
+                io.ConfigIO.UseCompressedOops,
+                U"x1c",
+                U"x28"
+              )
+            )
 
-          src := Mux(for_counter === U(1), SrcOopPtr + referent_offset, SrcOopPtr + discovered_offset)
-          dest := Mux(for_counter === U(1), DestOopPtr + referent_offset, DestOopPtr + discovered_offset)
+          val referentOffset =
+            Mux(
+              io.ConfigIO.UseCompressedOops &&
+                io.ConfigIO.UseCompressedKlassPointers,
+              U"xc",
+              U"x10"
+            )
 
-          for_counter := for_counter + U(1)
-          previousState := overall_state.states(5)
-          state := overall_state.states(8)
+          val fieldOffset =
+            Mux(
+              refFieldIndex === U(0),
+              discoveredOffset,
+              referentOffset
+            )
+
+          src :=
+            SrcOopPtr + fieldOffset
+
+          dest :=
+            DestOopPtr + fieldOffset
+
+          refFieldIndex :=
+            refFieldIndex + 1
+
+          /*
+           * A Reference special field is exactly one element. This guarantees
+           * that READ_OOP selects the scalar-read path.
+           */
+          remainCount := 1
+          resumePoint := ResumePoint.ReferenceFields
+
+          goto(READ_OOP)
         }
-      }.otherwise{
-        state := overall_state.states(15)
+      } otherwise {
+        goto(FINISH)
       }
     }
 
-    // TRACE_PLUS
-    is(overall_state.states(6)){
-      when(p < q){
-        src := p - DestOopPtr + SrcOopPtr
+    // ------------------------------------------------------------------------
+    // Forward traversal
+    // ------------------------------------------------------------------------
+
+    SCAN_FORWARD.whenIsActive {
+      when(p < q) {
+        src :=
+          p -
+            DestOopPtr +
+            SrcOopPtr
+
         dest := p
         p := p + oopStride
 
-        previousState := overall_state.states(6)
-        state := overall_state.states(8)
-
-        plus_or_dec := False
-      }.otherwise{
-        heap_oop_valid := False
-        state := overall_state.states(15)
+        resumePoint := ResumePoint.Forward
+        goto(READ_OOP)
+      } otherwise {
+        heapWindowValid := False
+        goto(FINISH)
       }
     }
 
-    // TRACE_DEC
-    is(overall_state.states(7)){
-      when(p < q){
-        val current_q = q - oopStride
-        src := current_q - DestOopPtr + SrcOopPtr
-        dest := current_q
-        q:= current_q
+    // ------------------------------------------------------------------------
+    // Backward traversal
+    // ------------------------------------------------------------------------
 
-        previousState := overall_state.states(7)
-        state := overall_state.states(8)
+    SCAN_BACKWARD.whenIsActive {
+      when(p < q) {
+        val currentQ =
+          q - oopStride
 
-        plus_or_dec := True
-      }.otherwise{
-        heap_oop_valid := False
-        state := overall_state.states(4)
+        src :=
+          currentQ -
+            DestOopPtr +
+            SrcOopPtr
+
+        dest := currentQ
+        q := currentQ
+
+        resumePoint := ResumePoint.Backward
+        goto(READ_OOP)
+      } otherwise {
+        heapWindowValid := False
+        goto(SCAN_OOP_MAP)
       }
     }
 
-    is(overall_state.states(8)){
-      val alignedBase  = src & ~U(31, src.getWidth bits)
-      val cacheHit     = heap_oop_valid && (src >= heap_oop_addr) && (src < heap_oop_addr + LineBytesNum)
+    // ------------------------------------------------------------------------
+    // Oop memory-read selection
+    // ------------------------------------------------------------------------
 
-      val offAligned = src - alignedBase
-      val idxAligned32 = (offAligned >> 2).resize(4 bits) // 0..7
-      val idxAligned64 = (offAligned >> 3).resize(3 bits) // 0..3
+    READ_OOP.whenIsActive {
+      val alignedBase =
+        src & ~U(31, src.getWidth bits)
 
-      // 当前对齐 line 对后续遍历最多还能覆盖多少个元素
-      val usableAligned = UInt(4 bits)
-      usableAligned := 0
+      val cacheHit =
+        heapWindowValid &&
+          src >= heapWindowAddr &&
+          src < heapWindowAddr + LineBytesNum
+
+      val offsetInAlignedWindow =
+        src - alignedBase
+
+      val index32 =
+        (offsetInAlignedWindow >> 2).resize(4 bits)
+
+      val index64 =
+        (offsetInAlignedWindow >> 3).resize(3 bits)
+
+      val backward =
+        resumePoint === ResumePoint.Backward
+
+      /*
+       * Number of elements, including the current one, that are covered by the
+       * aligned 32-byte line in the current traversal direction.
+       */
+      val alignedCoverage =
+        UInt(4 bits)
+
+      alignedCoverage := 0
+
       when(io.ConfigIO.UseCompressedOops) {
-        when(plus_or_dec) {
-          usableAligned := (idxAligned32 + 1).resized
+        when(backward) {
+          alignedCoverage :=
+            (index32 + 1).resized
         } otherwise {
-          usableAligned := (U(8) - idxAligned32).resized
+          alignedCoverage :=
+            (U(8) - index32).resized
         }
       } otherwise {
-        when(plus_or_dec) {
-          usableAligned := (idxAligned64 + 1).resized
+        when(backward) {
+          alignedCoverage :=
+            (index64 + 1).resized
         } otherwise {
-          usableAligned := (U(4) - idxAligned64).resized
+          alignedCoverage :=
+            (U(4) - index64).resized
         }
       }
 
-      // backward 时，为了覆盖更多前面的元素，window 起点往前挪
-      val shiftedBase = UInt(src.getWidth bits)
+      /*
+       * For a sufficiently long backward run, place the current element at
+       * the end of the 32-byte window.
+       */
+      val shiftedBase =
+        UInt(src.getWidth bits)
+
       shiftedBase := src
-      when(plus_or_dec) {
-        shiftedBase := Mux(io.ConfigIO.UseCompressedOops, src - 28, src - 24)
+
+      when(backward) {
+        shiftedBase :=
+          Mux(
+            io.ConfigIO.UseCompressedOops,
+            src - U(28, src.getWidth bits),
+            src - U(24, src.getWidth bits)
+          )
       }
 
       when(cacheHit) {
-        // 已经在缓存窗口里，直接切
-        readFromWindow(heap_oop_addr, heap_oop_cache)
+        consumeWindow(
+          heapWindowAddr,
+          heapWindowData
+        )
+      } elsewhen (remainCount === U(1)) {
+        issueElementRead(src)
+      } elsewhen (
+        remainCount <= alignedCoverage.resize(32)
+        ) {
+        issueWindowRead(alignedBase)
       } otherwise {
-        when(remainCount === 1) {
-          // 只读一个，就别读整 32B
-          issueElemRead(src)
-        } elsewhen(remainCount <= usableAligned.resized) {
-          // 当前 src 所在的“对齐 32B line”已经足够覆盖接下来要读的元素
-          issueWindowRead(alignedBase)
-        } otherwise {
-          // 当前对齐 line 不够用，才读偏移窗口
-          issueWindowRead(shiftedBase)
+        issueWindowRead(shiftedBase)
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // Null check, compressed-oop decode and region-attribute lookup
+    // ------------------------------------------------------------------------
+
+    CHECK_OOP.whenIsActive {
+      when(rawHeapOop === U(0)) {
+        resumeTraversal()
+      } elsewhen (regionAttrHit) {
+        val cachedAttr =
+          regionAttrCache(regionAttrHitIndex)
+
+        heapOop :=
+          decodedRawHeapOop
+
+        regionAttr :=
+          cachedAttr
+
+        /*
+         * The hit path directly performs the region decision, avoiding the
+         * DECIDE_REGION state.
+         */
+        processRegion(
+          cachedAttr,
+          decodedRawHeapOop
+        )
+      } otherwise {
+        issueReq(
+          io.Mreq,
+          regionAttrAddrLookup,
+          False,
+          U(2),
+          U(0),
+          issued
+        ) { readData =>
+          val loadedAttr =
+            readData(15 downto 0)
+
+          heapOop :=
+            decodedRawHeapOop
+
+          regionAttr :=
+            loadedAttr
+
+          regionAttrCacheValid(
+            regionAttrCacheReplacePtr
+          ) := True
+
+          regionAttrCacheTag(
+            regionAttrCacheReplacePtr
+          ) := regionAttrAddrLookup
+
+          regionAttrCache(
+            regionAttrCacheReplacePtr
+          ) := loadedAttr
+
+          regionAttrCacheReplacePtr :=
+            regionAttrCacheReplacePtr + 1
+
+          goto(DECIDE_REGION)
         }
       }
     }
 
-    is(overall_state.states(9)){
-      when(heap_oop === U(0)){
-        state := previousState
-      }.otherwise{
-        when(regionAttrHit){
-          regionAttr := regionAttrCache(regionAttrHitIndex)
-          heap_oop := current_oop
-          state := overall_state.states(10)
-        }.otherwise {
-          issueReq(io.Mreq, regionAttrAddrLookup, False, U(2), U(0), issued) { rd =>
-            regionAttr := rd(15 downto 0)
-            heap_oop := current_oop
+    DECIDE_REGION.whenIsActive {
+      processRegion(
+        regionAttr,
+        heapOop
+      )
+    }
 
-            regionAttrCacheValid(regionAttrCacheReplacePtr) := True
-            regionAttrCacheTag(regionAttrCacheReplacePtr) := regionAttrAddrLookup
-            regionAttrCache(regionAttrCacheReplacePtr) := rd(15 downto 0)
-            regionAttrCacheReplacePtr := regionAttrCacheReplacePtr + 1
+    // ------------------------------------------------------------------------
+    // Humongous candidate lookup
+    // ------------------------------------------------------------------------
 
-            state := overall_state.states(10)
+    CHECK_HUMONGOUS.whenIsActive {
+      when(humRegionHit) {
+        goto(SEND_AOP)
+      } otherwise {
+        val candidateAddress =
+          (
+            io.ConfigIO.HumongousReclaimCandidatesBoolBase +
+              regionLookup
+            ).resize(MMUAddrWidth)
+
+        issueReq(
+          io.Mreq,
+          candidateAddress,
+          False,
+          U(1),
+          U(0),
+          issued
+        ) { readData =>
+          val lookedUpRegion =
+            regionLookup
+
+          humRegionCacheValid(
+            humRegionCacheReplacePtr
+          ) := True
+
+          humRegionCacheTag(
+            humRegionCacheReplacePtr
+          ) := lookedUpRegion
+
+          humRegionCacheReplacePtr :=
+            humRegionCacheReplacePtr + 1
+
+          region :=
+            lookedUpRegion
+
+          /*
+           * The old implementation entered another state merely to branch on
+           * this byte. The zero path can transition immediately.
+           */
+          when(readData(7 downto 0) === U(0)) {
+            goto(SEND_AOP)
+          } otherwise {
+            goto(CLEAR_HUM_CANDIDATE)
           }
         }
       }
     }
 
-    is(overall_state.states(10)){
-      val regionAttrType = regionAttr(15 downto 8).asSInt
-      val cond = ((dest ^ heap_oop) >> io.ConfigIO.LogOfHRGrainBytes(5 downto 0)) =/= U(0)
-      when(regionAttrType >= 0){
-        val task = dest + Mux(io.ConfigIO.UseCompressedOops, U(1), U(0))
-        pushTask(task) {
-          state := previousState
-        }
-      }.elsewhen(cond){
-        when(regionAttrType === S(-2)){
-          state := overall_state.states(11)
-        }.otherwise{
-          state := overall_state.states(14)
-        }
-      }.otherwise{
-        state := previousState
-      }
-    }
+    // ------------------------------------------------------------------------
+    // Clear humongous reclaim-candidate byte
+    // ------------------------------------------------------------------------
 
-    is(overall_state.states(11)){
-      when(humRegionHit){
-        state := overall_state.states(14)
-      }.otherwise {
-        val addr = (io.ConfigIO.HumongousReclaimCandidatesBoolBase + regionLookup).resize(MMUAddrWidth)
-        issueReq(io.Mreq, addr, False, U(1), U(0), issued) { rd =>
-          bool_base_value := rd(7 downto 0)
-          region := regionLookup
-          state := overall_state.states(12)
-        }
-      }
-    }
+    CLEAR_HUM_CANDIDATE.whenIsActive {
+      val address =
+        (
+          io.ConfigIO.HumongousReclaimCandidatesBoolBase +
+            region
+          ).resize(MMUAddrWidth)
 
-    is(overall_state.states(12)){
-      humRegionCacheValid(humRegionCacheReplacePtr) := True
-      humRegionCacheTag(humRegionCacheReplacePtr) := region
-
-      when(bool_base_value === U(0)){
-        state := overall_state.states(14)
-        humRegionCacheReplacePtr := humRegionCacheReplacePtr + 1
-      }.otherwise{
-        val addr = (io.ConfigIO.HumongousReclaimCandidatesBoolBase + region).resize(MMUAddrWidth)
-        issueReq(io.Mreq, addr, True, U(1), U(0), issued) { _ =>
-        }
-        when(issued){
-          issued := False
-          humRegionCacheReplacePtr := humRegionCacheReplacePtr + 1
-          state := overall_state.states(13)
-        }
+      issueReq(
+        io.Mreq,
+        address,
+        True,
+        U(1),
+        U(0),
+        issued
+      ) { _ =>
       }
-    }
 
-    is(overall_state.states(13)){
-      val addr = (io.ConfigIO.RegionAttrBase + region * U(2) + U(1)).resize(MMUAddrWidth)
-      val writeValue = S(-1).asUInt
-      issueReq(io.Mreq, addr, True, U(1), writeValue, issued){ _ =>
-      }
-      when(issued){
+      when(issued) {
         issued := False
-        state := overall_state.states(14)
+        goto(MARK_HUM_REGION)
       }
     }
 
-    is(overall_state.states(14)){
-      when(ScanningInYoung){
-        state := previousState
-      }.otherwise{
+    // ------------------------------------------------------------------------
+    // Change region attribute type to -1
+    // ------------------------------------------------------------------------
+
+    MARK_HUM_REGION.whenIsActive {
+      val address =
+        (
+          io.ConfigIO.RegionAttrBase +
+            region * U(2) +
+            U(1)
+          ).resize(MMUAddrWidth)
+
+      issueReq(
+        io.Mreq,
+        address,
+        True,
+        U(1),
+        S(-1, 8 bits).asUInt,
+        issued
+      ) { _ =>
+      }
+
+      when(issued) {
+        issued := False
+
+        /*
+         * The high byte in backing memory is now 0xff. Update matching cache
+         * entries to prevent future accesses from observing the stale -2 type.
+         *
+         * regionAttr itself is intentionally left unchanged so ToAop sees the
+         * same value as in the original implementation.
+         */
+        for (i <- 0 until RegionAttrCacheEntries) {
+          when(
+            regionAttrCacheValid(i) &&
+              regionAttrCacheTag(i) === regionAttrAddrLookup
+          ) {
+            regionAttrCache(i) :=
+              Cat(
+                U(0xff, 8 bits),
+                regionAttrCache(i)(7 downto 0)
+              ).asUInt
+          }
+        }
+
+        goto(SEND_AOP)
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // AOP handoff
+    // ------------------------------------------------------------------------
+
+    SEND_AOP.whenIsActive {
+      when(ScanningInYoung) {
+        resumeTraversal()
+      } otherwise {
         io.ToAop.Valid := True
         io.ToAop.Task := dest
         io.ToAop.RegionAttr := regionAttr
 
-        when(io.ToAop.Valid && io.ToAop.Ready){
-          state := previousState
+        when(io.ToAop.Valid && io.ToAop.Ready) {
+          resumeTraversal()
         }
       }
     }
 
-    is(overall_state.states(15)){
-      when(pendingPushValid){
+    // ------------------------------------------------------------------------
+    // Final pending task and task completion
+    // ------------------------------------------------------------------------
+
+    FINISH.whenIsActive {
+      when(pendingPushValid) {
         io.Trace2Fetch.valid := True
         io.Trace2Fetch.payload := pendingPushPayload
-        when(io.Trace2Fetch.fire){
+
+        when(io.Trace2Fetch.fire) {
           pendingPushValid := False
-          resetState()
+          finishTask()
         }
-      }.otherwise{
-        resetState()
+      } otherwise {
+        finishTask()
       }
     }
+  }
+
+  // --------------------------------------------------------------------------
+  // Batch-level cache invalidation
+  //
+  // This block is intentionally after the FSM. Under SpinalHDL assignment
+  // priority rules, invalidation wins over a cache fill in the same cycle.
+  // --------------------------------------------------------------------------
+
+  when(io.TaskDone) {
+    for (i <- 0 until KlassCacheEntries) {
+      klassCacheValid(i) := False
+    }
+
+    for (i <- 0 until HumRegionCacheEntries) {
+      humRegionCacheValid(i) := False
+    }
+
+    for (i <- 0 until RegionAttrCacheEntries) {
+      regionAttrCacheValid(i) := False
+    }
+
+    klassCacheReplacePtr := 0
+    humRegionCacheReplacePtr := 0
+    regionAttrCacheReplacePtr := 0
+
+    heapWindowValid := False
   }
 }
 
