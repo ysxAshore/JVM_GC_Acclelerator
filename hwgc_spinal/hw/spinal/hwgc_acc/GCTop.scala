@@ -1,4 +1,4 @@
-package hwgc
+package hwgc_acc
 
 import spinal.core._
 

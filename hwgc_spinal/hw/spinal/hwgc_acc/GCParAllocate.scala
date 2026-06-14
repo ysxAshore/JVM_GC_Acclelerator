@@ -1,6 +1,5 @@
-package hwgc
+package hwgc_acc
 
-import spinal.core
 import spinal.core._
 import spinal.lib._
 

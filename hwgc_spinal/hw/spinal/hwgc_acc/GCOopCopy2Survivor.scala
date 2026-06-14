@@ -1,4 +1,4 @@
-package hwgc
+package hwgc_acc
 
 import spinal.core._
 import spinal.lib._
@@ -359,10 +359,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     allocBusy := False
     slotCtx(allocOwner).allocDone := True
     slotCtx(allocOwner).destOopPtr := io.ToAllocate.DestObjPtr
-
-    // Keep original behavior.
-    // If GCToAllocate has a real refill-failed field, replace this line with that field.
-    slotCtx(allocOwner).plab_refill_failed := io.ToAllocate.Done
+    slotCtx(allocOwner).plab_refill_failed := io.ToAllocate.PlabRefillFailed
 
     dbg(Seq("allocate done for slot ", allocOwner))
   }

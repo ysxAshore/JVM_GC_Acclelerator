@@ -1,4 +1,4 @@
-package hwgc
+package hwgc_acc
 
 import spinal.core._
 import spinal.core.sim.SimConfig
@@ -253,9 +253,10 @@ class GCToAllocate extends Bundle with GCParameters with IMasterSlave{
   val Size = in UInt(32 bits)
   val DestAttrType = in UInt(8 bits)
   val DestObjPtr = out UInt(GCElementWidth bits)
+  val PlabRefillFailed = out Bool()
 
   override def asMaster(): Unit = {
-    in(Ready, Done, DestObjPtr)
+    in(Ready, Done, DestObjPtr, PlabRefillFailed)
     out(Valid, Size, DestAttrType)
   }
 
@@ -269,6 +270,7 @@ class GCToAllocate extends Bundle with GCParameters with IMasterSlave{
     Ready := False
     Done := False
     DestObjPtr := U(0)
+    PlabRefillFailed := False
   }
 }
 

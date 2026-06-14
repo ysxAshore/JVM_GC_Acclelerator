@@ -10,6 +10,6 @@ lazy val hwgc = (project in file("."))
   .settings(
     Compile / scalaSource := baseDirectory.value / "hw" / "spinal",
     libraryDependencies ++= Seq(spinalCore, spinalLib, spinalIdslPlugin),
-    name := "hwgc"
+    name := "hwgc_acc"
   )
 fork := true
