@@ -1,5 +1,6 @@
 package hwgc_acc
 
+import hwgc_allocate.{GCAllocFreeRegion, GCNewGCAlloc}
 import spinal.core._
 
 import scala.language.postfixOps
