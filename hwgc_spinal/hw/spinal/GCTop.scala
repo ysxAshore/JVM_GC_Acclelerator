@@ -1,6 +1,4 @@
-package hwgc_acc
-
-import hwgc_allocate.{GCAllocFreeRegion, GCNewGCAlloc}
+import hwgc_acc._
 import spinal.core._
 
 import scala.language.postfixOps
@@ -15,23 +13,18 @@ class GCTop extends Module with GCParameters with HWParameters {
   val gcOopCopy2Survivor = new GCOopCopy2Survivor
   val gcAllocate = new GCAllocate
   val gcParAllocate = new GCParAllocate
+  val gcDoAllocate = new GCDoAllocate
   val gcNewGCAlloc = new GCNewGCAlloc
   val gcAllocFreeRegion = new GCAllocFreeRegion
   val gcCopy = new GCCopy
   val gcTrace = new GCTrace
   val gcAop = new GCAop
   val gcLocalMMU = new GCLocalMMU
-  val gcUnalignedMMUAdapter = Array.fill(LocalMMUTaskType.TaskTypeMax)(new GCUnalignedMMUAdapter)
+  val gcUnalignedMMUAdapter = Array.fill(LocalMMUTaskType.TaskTypeMax-2)(new GCUnalignedMMUAdapter)
 
-  for(i <- 0 until 9){
+  for(i <- 0 until LocalMMUTaskType.TaskTypeMax - 2){
     gcLocalMMU.io.localMMUIOs(i) <> gcUnalignedMMUAdapter(i).io.out
   }
-  gcLocalMMU.io.localMMUIOs(11) <>  gcUnalignedMMUAdapter(11).io.out
-  gcLocalMMU.io.localMMUIOs(12) <>  gcUnalignedMMUAdapter(12).io.out
-  gcLocalMMU.io.localMMUIOs(13) <>  gcUnalignedMMUAdapter(13).io.out
-  gcLocalMMU.io.localMMUIOs(14) <>  gcUnalignedMMUAdapter(14).io.out
-  gcLocalMMU.io.localMMUIOs(15) <>  gcUnalignedMMUAdapter(15).io.out
-  gcLocalMMU.io.localMMUIOs(16) <>  gcUnalignedMMUAdapter(16).io.out
 
   val task_valid = RegInit(False)
 
@@ -118,8 +111,8 @@ class GCTop extends Module with GCParameters with HWParameters {
 
   // GCFetch
   gcFetch.io.MainMreq <> gcUnalignedMMUAdapter(1).io.in
-  gcFetch.io.PushMreq <> gcUnalignedMMUAdapter(13).io.in
-  gcFetch.io.PreMreq <> gcUnalignedMMUAdapter(14).io.in
+  gcFetch.io.PushMreq <> gcUnalignedMMUAdapter(2).io.in
+  gcFetch.io.PreMreq <> gcUnalignedMMUAdapter(3).io.in
   gcFetch.io.Fetch2OopProcess <> gcOopProcess.io.Fetch2Process
   gcFetch.io.Fetch2ArrayProcess <> gcArrayProcess.io.Fetch2Process
   gcFetch.io.Trace2Fetch <> gcTrace.io.Trace2Fetch
@@ -132,8 +125,8 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcFetch.io.CopyDone := gcCopy.io.ToCopy.Done
 
   // GCOopProcess (ToAop)
-  gcOopProcess.io.Mreq0 <> gcUnalignedMMUAdapter(2).io.in
-  gcOopProcess.io.Mreq1 <> gcUnalignedMMUAdapter(15).io.in
+  gcOopProcess.io.Mreq0 <> gcUnalignedMMUAdapter(4).io.in
+  gcOopProcess.io.Mreq1 <> gcUnalignedMMUAdapter(5).io.in
   gcOopProcess.io.Process2CopySurvivor <> gcOopCopy2Survivor.io.ToCopySurvivor
   gcOopProcess.io.ConfigIO.RegionAttrShiftBy := RegionAttrShiftBy
   gcOopProcess.io.ConfigIO.RegionAttrBiasedBase := RegionAttrBiasedBase
@@ -146,7 +139,7 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcOopProcess.io.DebugTimeStamp := DebugTimeStamp
 
   // GCArrayProcess (ToTrace)
-  gcArrayProcess.io.Mreq <> gcUnalignedMMUAdapter(3).io.in
+  gcArrayProcess.io.Mreq <> gcUnalignedMMUAdapter(6).io.in
   gcArrayProcess.io.ConfigIO.ChunkSize := ChunkSize
   gcArrayProcess.io.ConfigIO.StepperOffset := StepperOffset
   gcArrayProcess.io.ConfigIO.HeapRegionShiftBy := HeapRegionShiftBy
@@ -155,8 +148,8 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcArrayProcess.io.DebugTimeStamp := DebugTimeStamp
 
   // GCOopCopy2Survivor
-  gcOopCopy2Survivor.io.Mreq0 <> gcUnalignedMMUAdapter(4).io.in
-  gcOopCopy2Survivor.io.Mreq1 <> gcUnalignedMMUAdapter(16).io.in
+  gcOopCopy2Survivor.io.Mreq0 <> gcUnalignedMMUAdapter(7).io.in
+  gcOopCopy2Survivor.io.Mreq1 <> gcUnalignedMMUAdapter(8).io.in
   gcOopCopy2Survivor.io.ToCopy <> gcCopy.io.ToCopy
   gcOopCopy2Survivor.io.ToAllocate <> gcAllocate.io.ToAllocate
   gcOopCopy2Survivor.io.TaskDone := io.ctrl2top.Done
@@ -175,7 +168,7 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcOopCopy2Survivor.io.DebugTimeStamp := DebugTimeStamp
 
   // gcAllocate(ToParAllocate)
-  gcAllocate.io.Mreq <> gcUnalignedMMUAdapter(5).io.in
+  gcAllocate.io.Mreq <> gcUnalignedMMUAdapter(9).io.in
   gcAllocate.io.ToParAllocate <> gcParAllocate.io.ToParAllocate
   gcAllocate.io.ConfigIO.G1h := G1h
   gcAllocate.io.ConfigIO.objectKlassObj := ObjectKlass
@@ -187,33 +180,36 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcAllocate.io.DebugTimeStamp := DebugTimeStamp
 
   // gcParAllocate
-  gcParAllocate.io.Mreq <> gcUnalignedMMUAdapter(6).io.in
-  gcParAllocate.io.ToNewGCAlloc <> gcNewGCAlloc.io.ToNewGCAlloc
-  gcParAllocate.io.ConfigIO.G1h := G1h
-  gcParAllocate.io.ConfigIO.Thread := Thread
-  gcParAllocate.io.ConfigIO.LockPtr := LockPtr
-  gcParAllocate.io.ConfigIO.DummyRegion := DummyRegion
+  gcParAllocate.io.Mreq <> gcUnalignedMMUAdapter(10).io.in
+  gcParAllocate.io.ToDoAllocate <> gcDoAllocate.io.ToDoAllocate
   gcParAllocate.io.DebugTimeStamp := DebugTimeStamp
 
+  // gcDoAllocate
+  gcDoAllocate.io.MreqMainIml <> gcUnalignedMMUAdapter(11).io.in
+  gcDoAllocate.io.MreqPar <> gcUnalignedMMUAdapter(12).io.in
+  gcDoAllocate.io.MreqAttempt <> gcUnalignedMMUAdapter(13).io.in
+  gcDoAllocate.io.ConfigIO.G1h := G1h
+  gcDoAllocate.io.ConfigIO.Thread := Thread
+  gcDoAllocate.io.ConfigIO.LockPtr := LockPtr
+  gcDoAllocate.io.ConfigIO.DummyRegion := DummyRegion
+  gcDoAllocate.io.DebugTimeStamp := DebugTimeStamp
+
   // gcNewGCAloc
-  gcNewGCAlloc.io.Mreq <> gcUnalignedMMUAdapter(7).io.in
+  gcNewGCAlloc.io.ToNewGCAlloc <> gcDoAllocate.io.ToNewGCAlloc
+  gcNewGCAlloc.io.Mreq <> gcUnalignedMMUAdapter(14).io.in
   gcNewGCAlloc.io.ToAllocFreeRegion <> gcAllocFreeRegion.io.ToAllocFreeRegion
   gcNewGCAlloc.io.ConfigIO.G1h := G1h
   gcNewGCAlloc.io.ConfigIO.DummyRegion := DummyRegion
   gcNewGCAlloc.io.DebugTimeStamp := DebugTimeStamp
 
   // gcAllocFreeRegion
-  gcAllocFreeRegion.io.Mreq <> gcUnalignedMMUAdapter(8).io.in
+  gcAllocFreeRegion.io.Mreq <> gcUnalignedMMUAdapter(15).io.in
   gcAllocFreeRegion.io.ConfigIO.G1h := G1h
   gcAllocFreeRegion.io.ConfigIO.NumaPtr := NumaPtr
   gcAllocFreeRegion.io.DebugTimeStamp := DebugTimeStamp
 
-  // gcCopy
-  gcCopy.io.readMReq <> gcLocalMMU.io.localMMUIOs(9)
-  gcCopy.io.writeMReq <> gcLocalMMU.io.localMMUIOs(10)
-
   // gcTrace
-  gcTrace.io.Mreq <> gcUnalignedMMUAdapter(11).io.in
+  gcTrace.io.Mreq <> gcUnalignedMMUAdapter(16).io.in
   gcTrace.io.ConfigIO.ChunkSize                        := ChunkSize
   gcTrace.io.ConfigIO.RegionAttrBase                   := RegionAttrBase
   gcTrace.io.ConfigIO.RegionAttrShiftBy                := RegionAttrShiftBy
@@ -230,11 +226,15 @@ class GCTop extends Module with GCParameters with HWParameters {
   gcTrace.io.TaskDone := io.ctrl2top.Done
 
   // gcAop
-  gcAop.io.Mreq <> gcUnalignedMMUAdapter(12).io.in
+  gcAop.io.Mreq <> gcUnalignedMMUAdapter(17).io.in
   gcAop.io.TaskDone := io.ctrl2top.Done
   gcAop.io.ConfigIO.CardTablePtr := CardTablePtr
   gcAop.io.ConfigIO.ParScanThreadStatePtr := ParScanThreadStatePtr
   gcAop.io.DebugTimeStamp := DebugTimeStamp
+
+  // gcCopy
+  gcCopy.io.readMReq <> gcLocalMMU.io.localMMUIOs(18)
+  gcCopy.io.writeMReq <> gcLocalMMU.io.localMMUIOs(19)
 
   // gcLocalMMU
   gcLocalMMU.io.LastLevelCacheTLIO <> io.mmu2llc

@@ -111,7 +111,7 @@ class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
 
       when(io.ToAllocFreeRegion.Valid && io.ToAllocFreeRegion.Ready) {
         freeListPtr := io.ConfigIO.G1h + FREE_LIST_OFFSET
-        fromHead := (io.ToAllocFreeRegion.heapRegionType & U(2, 8 bits)) === U(0, 8 bits)
+        fromHead := (io.ToAllocFreeRegion.heapRegionType & U(2, 32 bits)) === U(0, 32 bits)
 
         newAllocRegion := zeroPtr
         neighborPtr := zeroPtr
