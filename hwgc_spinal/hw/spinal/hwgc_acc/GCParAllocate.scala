@@ -2,8 +2,10 @@ package hwgc_acc
 
 import spinal.core._
 import spinal.lib._
+import spinal.lib.fsm._
 
 import scala.language.postfixOps
+
 class GCParAllocate extends Module with GCParameters with HWParameters {
   val io = new Bundle{
     val Mreq = master(new LocalMMUIO)
@@ -21,17 +23,9 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
   io.ToParAllocate.clearOut()
   io.ToDoAllocate.clearIn()
 
-  object overall_state extends SpinalEnum {
-    val states = Array.tabulate(10)(_ => newElement())
-    for((state, i) <- states.zipWithIndex){
-      state.setName(s"s$i")
-    }
-  }
-
   def dbg(msg: Seq[Any]): Unit =
     if (DebugEnable) report(Seq("[GCParAllocate<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
 
-  val state = RegInit(overall_state.states(0))
   val issued = RegInit(False)
 
   val nodeIndex =  RegInit(U(0, 8 bits))
@@ -53,52 +47,59 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
     }
   }
 
-  switch(state){
-    is(overall_state.states(0)){
+  val fsm = new StateMachine {
+    val s0 = new State with EntryPoint
+    val s1 = new State
+    val s2 = new State
+    val s3 = new State
+    val s4 = new State
+
+    s0.whenIsActive {
       io.ToParAllocate.Ready := True
+
       when(io.ToParAllocate.Valid && io.ToParAllocate.Ready){
         nodeIndex := io.ToParAllocate.NodeIndex
         minWordSize := io.ToParAllocate.MinWordSize
         destAttrIdx := io.ToParAllocate.DestAttrIdx
         allocatorPtr := io.ToParAllocate.AllocatorPtr
         desiredWordSize := io.ToParAllocate.DesiredWordSize
-        state := overall_state.states(1)
+        goto(s1)
       }
     }
 
-    is(overall_state.states(1)){
+    s1.whenIsActive {
       when(!region_ptr_valid(destAttrIdx)){
         when(destAttrIdx === 0){
           val addr = allocatorPtr + U"x28"
           issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
             region_ptr_valid(destAttrIdx) := True
             region_ptr_cache(destAttrIdx) := rd(GCElementWidth - 1 downto 0)
-            state := overall_state.states(2)
+            goto(s2)
           }
         }.otherwise{
           region_ptr_valid(destAttrIdx) := True
           region_ptr_cache(destAttrIdx) := allocatorPtr + U"x30"
-          state := overall_state.states(2)
+          goto(s2)
         }
       }.otherwise{
-        state := overall_state.states(2)
+        goto(s2)
       }
     }
 
-    is(overall_state.states(2)){
+    s2.whenIsActive {
       when(!alloc_region_valid(destAttrIdx)){
         val addr = region_ptr_cache(destAttrIdx) + U"x8"
         issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
           alloc_region_valid(destAttrIdx) := True
           alloc_region_cache(destAttrIdx) := rd(GCElementWidth - 1 downto 0)
-          state := overall_state.states(3)
+          goto(s3)
         }
       }.otherwise{
-        state := overall_state.states(3)
+        goto(s3)
       }
     }
 
-    is(overall_state.states(3)){
+    s3.whenIsActive {
       io.ToDoAllocate.Valid := True
       io.ToDoAllocate.regionPtr := region_ptr_cache(destAttrIdx)
       io.ToDoAllocate.allocRegion := alloc_region_cache(destAttrIdx)
@@ -109,16 +110,16 @@ class GCParAllocate extends Module with GCParameters with HWParameters {
       io.ToDoAllocate.DesiredWordSize := desiredWordSize
 
       when(io.ToDoAllocate.Valid && io.ToDoAllocate.Ready){
-        state := overall_state.states(4)
+        goto(s4)
       }
     }
 
-    is(overall_state.states(4)){
+    s4.whenIsActive {
       when(io.ToDoAllocate.Done){
         io.ToParAllocate.Done := True
         io.ToParAllocate.DestObjPtr := io.ToDoAllocate.DestObjPtr
         io.ToParAllocate.ActualPlabSize := io.ToDoAllocate.ActualPlabSize
-        state := overall_state.states(0)
+        goto(s0)
       }
     }
   }

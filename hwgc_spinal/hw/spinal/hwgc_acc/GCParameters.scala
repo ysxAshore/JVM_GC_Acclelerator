@@ -45,14 +45,13 @@ trait GCParameters {
   val PreFetchScanWindow = PreFetchBufferNum
   val PreFetchBufferWidth = log2Up(PreFetchBufferNum)
 
-
   val GCTaskQueue_Size = 1 << 17
 
   val UINT_MAX = U(BigInt(2147483647L * 2 + 1), 32 bits)
 }
 
 trait HWParameters {
-  //true is boolean, True is Bool
+  // true is boolean, True is Bool
   val DebugEnable = true
 
   val MMUAddrWidth = 64
@@ -65,7 +64,14 @@ trait HWParameters {
   val LLCSourceMaxNumBitSize = log2Up(LLCSourceMaxNum) + 1
 
   // helper: issueReq
-  def issueReq(port: LocalMMUIO, addr: UInt, Write: Bool, Size: UInt, WriteData: UInt, reqIssued: Bool)(onResp: UInt => Unit): Unit = {
+  def issueReq(
+      port: LocalMMUIO,
+      addr: UInt,
+      Write: Bool,
+      Size: UInt,
+      WriteData: UInt,
+      reqIssued: Bool
+  )(onResp: UInt => Unit): Unit = {
 
     // ensure default safe values (caller may have already set globals; safe to reassign)
     port.Request.valid := !reqIssued
@@ -77,7 +83,9 @@ trait HWParameters {
       port.Request.payload.RequestVirtualAddr := addr
       port.Request.payload.RequestSourceID := port.ConherentRequsetSourceID.payload
       port.Request.payload.RequestType_isWrite := Write
-      port.Request.payload.RequestWStrb := getWstrb(Size.resize(LineBytesNumBitSize))
+      port.Request.payload.RequestWStrb := getWstrb(
+        Size.resize(LineBytesNumBitSize)
+      )
       port.Request.payload.RequestData := WriteData.resize(MMUDataWidth)
     }
 
@@ -95,7 +103,12 @@ trait HWParameters {
 
   def getWstrb(bytes: UInt): UInt = {
     val mask = Bits(LineBytesNum bits)
-    mask := Mux(bytes >= U(LineBytesNum), B(LineBytesNum bits, default -> true), ((U(1) << bytes.resize(LineBytesNumBitSize)) - U(1)).asBits.resize(LineBytesNum))
+    mask := Mux(
+      bytes >= U(LineBytesNum),
+      B(LineBytesNum bits, default -> true),
+      ((U(1) << bytes.resize(LineBytesNumBitSize)) - U(1)).asBits
+        .resize(LineBytesNum)
+    )
     mask.asUInt
   }
 }
@@ -122,17 +135,17 @@ class GCToStack extends Bundle with GCParameters with IMasterSlave {
 }
 
 class GCToProcessUnit extends Bundle with GCParameters with IMasterSlave {
-  val Valid = in Bool()
-  val Ready = out Bool()
+  val Valid = in Bool ()
+  val Ready = out Bool ()
 
-  val Done = out Bool()
+  val Done = out Bool ()
 
-  val Task = in UInt(GCElementWidth bits)
-  val OopType = in UInt(GCOopTypeWidth bits)
-  val SrcOopPtr = in UInt(GCElementWidth bits)
-  val MarkWord = in UInt(GCElementWidth bits)
-  val KlassPtr = in UInt(GCElementWidth bits)
-  val SrcLength = in UInt(32 bits)
+  val Task = in UInt (GCElementWidth bits)
+  val OopType = in UInt (GCOopTypeWidth bits)
+  val SrcOopPtr = in UInt (GCElementWidth bits)
+  val MarkWord = in UInt (GCElementWidth bits)
+  val KlassPtr = in UInt (GCElementWidth bits)
+  val SrcLength = in UInt (32 bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done)
@@ -156,25 +169,34 @@ class GCToProcessUnit extends Bundle with GCParameters with IMasterSlave {
 }
 
 class GCToSurvivor extends Bundle with GCParameters with IMasterSlave {
-  val Valid = in Bool()
-  val Ready = out Bool()
+  val Valid = in Bool ()
+  val Ready = out Bool ()
 
-  val Done = out Bool()
-  val DoneOwner = in UInt(1 bits)
-  val DestOopPtr = out UInt(GCElementWidth bits)
-  val isTypeArray = out Bool()
+  val Done = out Bool ()
+  val DoneOwner = in UInt (1 bits)
+  val DestOopPtr = out UInt (GCElementWidth bits)
+  val isTypeArray = out Bool ()
 
-  val Owner = in UInt(1 bits)
-  val MarkWord = in UInt(GCElementWidth bits)
-  val KlassPtr = in UInt(GCElementWidth bits)
-  val SrcOopPtr = in UInt(GCElementWidth bits)
-  val SrcLength = in UInt(32 bits)
-  val SrcRegionAttr = in UInt(16 bits)
-  val RegionAttrPtr = in UInt(GCElementWidth bits)
+  val Owner = in UInt (1 bits)
+  val MarkWord = in UInt (GCElementWidth bits)
+  val KlassPtr = in UInt (GCElementWidth bits)
+  val SrcOopPtr = in UInt (GCElementWidth bits)
+  val SrcLength = in UInt (32 bits)
+  val SrcRegionAttr = in UInt (16 bits)
+  val RegionAttrPtr = in UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done, DoneOwner, DestOopPtr, isTypeArray)
-    out(Valid, Owner, SrcOopPtr, MarkWord, KlassPtr, RegionAttrPtr, SrcLength, SrcRegionAttr)
+    out(
+      Valid,
+      Owner,
+      SrcOopPtr,
+      MarkWord,
+      KlassPtr,
+      RegionAttrPtr,
+      SrcLength,
+      SrcRegionAttr
+    )
   }
 
   def clearIn(): Unit = {
@@ -197,10 +219,10 @@ class GCToSurvivor extends Bundle with GCParameters with IMasterSlave {
   }
 }
 
-class GCWriteSrcOopPtr extends Bundle with GCParameters with IMasterSlave{
-  val valid = in Bool()
-  val srcOopPtr = in UInt(GCElementWidth bits)
-  val writeValue = in UInt(GCElementWidth bits)
+class GCWriteSrcOopPtr extends Bundle with GCParameters with IMasterSlave {
+  val valid = in Bool ()
+  val srcOopPtr = in UInt (GCElementWidth bits)
+  val writeValue = in UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
     out(valid, srcOopPtr, writeValue)
@@ -213,47 +235,60 @@ class GCWriteSrcOopPtr extends Bundle with GCParameters with IMasterSlave{
   }
 }
 
-class GCUpdatedRegion extends Bundle with GCParameters with IMasterSlave{
-  val Valid0 = in Bool()
-  val Valid1 = in Bool()
-  val Buffer0 = in UInt(GCElementWidth bits)
-  val Buffer1 = in UInt(GCElementWidth bits)
-  val RegionTop0 = in UInt(GCElementWidth bits)
-  val RegionTop1 = in UInt(GCElementWidth bits)
+class GCUpdatedRegion extends Bundle with GCParameters with IMasterSlave {
+  val Valid0 = in Bool ()
+  val Valid1 = in Bool ()
+  val Buffer0 = in UInt (GCElementWidth bits)
+  val Buffer1 = in UInt (GCElementWidth bits)
+  val RegionTop0 = in UInt (GCElementWidth bits)
+  val RegionTop1 = in UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
     out(Valid0, Valid1, Buffer0, Buffer1, RegionTop0, RegionTop1)
   }
 }
 
-class GCUpdatedAop extends Bundle with GCParameters with IMasterSlave{
-  val Valid0 = in Bool()
-  val Valid1 = in Bool()
-  val Valid2 = in Bool()
-  val Valid3 = in Bool()
+class GCUpdatedAop extends Bundle with GCParameters with IMasterSlave {
+  val Valid0 = in Bool ()
+  val Valid1 = in Bool ()
+  val Valid2 = in Bool ()
+  val Valid3 = in Bool ()
   val Addr0 = in UInt (GCElementWidth bits)
-  val Addr1 = in UInt(GCElementWidth bits)
-  val Addr2 = in UInt(GCElementWidth bits)
-  val Addr3 = in UInt(GCElementWidth bits)
-  val Data0 = in UInt(GCElementWidth bits)
-  val Data1 = in UInt(GCElementWidth * 3 bits)
-  val Data2 = in UInt(GCElementWidth * 2 bits)
-  val Data3 = in UInt(GCElementWidth * 4 bits)
+  val Addr1 = in UInt (GCElementWidth bits)
+  val Addr2 = in UInt (GCElementWidth bits)
+  val Addr3 = in UInt (GCElementWidth bits)
+  val Data0 = in UInt (GCElementWidth bits)
+  val Data1 = in UInt (GCElementWidth * 3 bits)
+  val Data2 = in UInt (GCElementWidth * 2 bits)
+  val Data3 = in UInt (GCElementWidth * 4 bits)
 
   override def asMaster(): Unit = {
-    out(Valid0, Valid1, Valid2, Valid3, Addr0, Addr1, Addr2, Addr3, Data0, Data1, Data2, Data3)
+    out(
+      Valid0,
+      Valid1,
+      Valid2,
+      Valid3,
+      Addr0,
+      Addr1,
+      Addr2,
+      Addr3,
+      Data0,
+      Data1,
+      Data2,
+      Data3
+    )
   }
 }
 
-class GCToAllocate extends Bundle with GCParameters with IMasterSlave{
-  val Valid = in Bool()
-  val Ready = out Bool()
-  val Done = out Bool()
+class GCToAllocate extends Bundle with GCParameters with IMasterSlave {
+  val Valid = in Bool ()
+  val Ready = out Bool ()
+  val Done = out Bool ()
 
-  val Size = in UInt(32 bits)
-  val DestAttrType = in UInt(8 bits)
-  val DestObjPtr = out UInt(GCElementWidth bits)
-  val PlabRefillFailed = out Bool()
+  val Size = in UInt (32 bits)
+  val DestAttrType = in UInt (8 bits)
+  val DestObjPtr = out UInt (GCElementWidth bits)
+  val PlabRefillFailed = out Bool ()
 
   override def asMaster(): Unit = {
     in(Ready, Done, DestObjPtr, PlabRefillFailed)
@@ -274,23 +309,30 @@ class GCToAllocate extends Bundle with GCParameters with IMasterSlave{
   }
 }
 
-class GCToParAllocate extends Bundle with GCParameters with IMasterSlave{
-  val Valid = in Bool()
-  val Ready = out Bool()
-  val Done = out Bool()
+class GCToParAllocate extends Bundle with GCParameters with IMasterSlave {
+  val Valid = in Bool ()
+  val Ready = out Bool ()
+  val Done = out Bool ()
 
-  val NodeIndex = in UInt(8 bits)
-  val DestAttrIdx = in UInt(1 bits)
-  val MinWordSize = in UInt(GCElementWidth bits)
-  val AllocatorPtr = in UInt(GCElementWidth bits)
-  val DesiredWordSize = in UInt(GCElementWidth bits)
+  val NodeIndex = in UInt (8 bits)
+  val DestAttrIdx = in UInt (1 bits)
+  val MinWordSize = in UInt (GCElementWidth bits)
+  val AllocatorPtr = in UInt (GCElementWidth bits)
+  val DesiredWordSize = in UInt (GCElementWidth bits)
 
-  val DestObjPtr = out UInt(GCElementWidth bits)
-  val ActualPlabSize = out UInt(GCElementWidth bits)
+  val DestObjPtr = out UInt (GCElementWidth bits)
+  val ActualPlabSize = out UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done, DestObjPtr, ActualPlabSize)
-    out(Valid, NodeIndex, MinWordSize, DestAttrIdx, AllocatorPtr, DesiredWordSize)
+    out(
+      Valid,
+      NodeIndex,
+      MinWordSize,
+      DestAttrIdx,
+      AllocatorPtr,
+      DesiredWordSize
+    )
   }
 
   def clearIn(): Unit = {
@@ -311,30 +353,47 @@ class GCToParAllocate extends Bundle with GCParameters with IMasterSlave{
 }
 
 class GCToDoAllocate extends Bundle with GCParameters with IMasterSlave {
-  val Valid = in Bool()
-  val Ready = out Bool()
+  val Valid = in Bool ()
+  val Ready = out Bool ()
 
-  val Done = out Bool()
+  val Done = out Bool ()
 
-  val regionPtr = in UInt(GCElementWidth bits)
-  val allocRegion = in UInt(GCElementWidth bits)
+  val regionPtr = in UInt (GCElementWidth bits)
+  val allocRegion = in UInt (GCElementWidth bits)
 
-  val NodeIndex = in UInt(8 bits)
-  val DestAttrIdx = in UInt(1 bits)
-  val MinWordSize = in UInt(GCElementWidth bits)
-  val AllocatorPtr = in UInt(GCElementWidth bits)
-  val DesiredWordSize = in UInt(GCElementWidth bits)
+  val NodeIndex = in UInt (8 bits)
+  val DestAttrIdx = in UInt (1 bits)
+  val MinWordSize = in UInt (GCElementWidth bits)
+  val AllocatorPtr = in UInt (GCElementWidth bits)
+  val DesiredWordSize = in UInt (GCElementWidth bits)
 
-  val DestObjPtr = out UInt(GCElementWidth bits)
-  val ActualPlabSize = out UInt(GCElementWidth bits)
+  val DestObjPtr = out UInt (GCElementWidth bits)
+  val ActualPlabSize = out UInt (GCElementWidth bits)
 
-  val updateCacheValid = out Bool()
-  val updateRegionPtr = out UInt(GCElementWidth bits)
-  val updateRegion = out UInt(GCElementWidth bits)
+  val updateCacheValid = out Bool ()
+  val updateRegionPtr = out UInt (GCElementWidth bits)
+  val updateRegion = out UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
-    in(Ready, Done, DestObjPtr,ActualPlabSize, updateCacheValid, updateRegionPtr, updateRegion)
-    out(Valid, regionPtr, allocRegion, NodeIndex, DestAttrIdx, MinWordSize, AllocatorPtr, DesiredWordSize)
+    in(
+      Ready,
+      Done,
+      DestObjPtr,
+      ActualPlabSize,
+      updateCacheValid,
+      updateRegionPtr,
+      updateRegion
+    )
+    out(
+      Valid,
+      regionPtr,
+      allocRegion,
+      NodeIndex,
+      DestAttrIdx,
+      MinWordSize,
+      AllocatorPtr,
+      DesiredWordSize
+    )
   }
   def clearIn(): Unit = {
     Valid := False
@@ -365,16 +424,16 @@ class GCToDoAllocate extends Bundle with GCParameters with IMasterSlave {
 }
 
 class GCToAttemptAllocate extends Bundle with GCParameters with IMasterSlave {
-  val Valid = in Bool()
-  val Ready = out Bool()
-  val Done = out Bool()
+  val Valid = in Bool ()
+  val Ready = out Bool ()
+  val Done = out Bool ()
 
-  val regionPtr = in UInt(GCElementWidth bits)
-  val allocRegion = in UInt(GCElementWidth bits)
-  val desiredWordSize = in UInt(GCElementWidth bits)
+  val regionPtr = in UInt (GCElementWidth bits)
+  val allocRegion = in UInt (GCElementWidth bits)
+  val desiredWordSize = in UInt (GCElementWidth bits)
 
-  val DestObjPtr = out UInt(GCElementWidth bits)
-  val ActualPlabSize = out UInt(GCElementWidth bits)
+  val DestObjPtr = out UInt (GCElementWidth bits)
+  val ActualPlabSize = out UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done, DestObjPtr, ActualPlabSize)
@@ -397,14 +456,14 @@ class GCToAttemptAllocate extends Bundle with GCParameters with IMasterSlave {
 }
 
 class GCToNewGCAlloc extends Bundle with GCParameters with IMasterSlave {
-  val Valid = in Bool()
-  val Ready = out Bool()
-  val Done = out Bool()
+  val Valid = in Bool ()
+  val Ready = out Bool ()
+  val Done = out Bool ()
 
-  val regionPtr = in UInt(GCElementWidth bits)
-  val regionType = in UInt(8 bits)
+  val regionPtr = in UInt (GCElementWidth bits)
+  val regionType = in UInt (8 bits)
 
-  val newAllocRegion = out UInt(GCElementWidth bits)
+  val newAllocRegion = out UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done, newAllocRegion)
@@ -425,13 +484,13 @@ class GCToNewGCAlloc extends Bundle with GCParameters with IMasterSlave {
 }
 
 class GCToAllocFreeRegion extends Bundle with GCParameters with IMasterSlave {
-  val Valid = in Bool()
-  val Ready = out Bool()
-  val Done = out Bool()
+  val Valid = in Bool ()
+  val Ready = out Bool ()
+  val Done = out Bool ()
 
-  val heapRegionType = in UInt(32 bits)
+  val heapRegionType = in UInt (32 bits)
 
-  val newAllocRegion = out UInt(GCElementWidth bits)
+  val newAllocRegion = out UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done, newAllocRegion)
@@ -451,25 +510,37 @@ class GCToAllocFreeRegion extends Bundle with GCParameters with IMasterSlave {
 }
 
 class GCToTrace extends Bundle with GCParameters with IMasterSlave {
-  val Valid = in Bool()
-  val Ready = out Bool()
-  val Done = out Bool()
+  val Valid = in Bool ()
+  val Ready = out Bool ()
+  val Done = out Bool ()
 
   // some parse module calculate parameters
-  val Kid = in UInt(32 bits)
-  val OopType = in UInt(GCOopTypeWidth bits)
-  val KlassPtr = in UInt(GCElementWidth bits)
-  val SrcOopPtr = in UInt(GCElementWidth bits)
-  val DestOopPtr = in UInt(GCElementWidth bits)
-  val ScanningInYoung = in Bool()
+  val Kid = in UInt (32 bits)
+  val OopType = in UInt (GCOopTypeWidth bits)
+  val KlassPtr = in UInt (GCElementWidth bits)
+  val SrcOopPtr = in UInt (GCElementWidth bits)
+  val DestOopPtr = in UInt (GCElementWidth bits)
+  val ScanningInYoung = in Bool ()
 
-  val StepIndex = in UInt(32 bits)
-  val StepNCreate = in UInt(32 bits)
-  val ArrayLength = in UInt(32 bits)
-  val PartialArrayStart = in UInt(32 bits)
+  val StepIndex = in UInt (32 bits)
+  val StepNCreate = in UInt (32 bits)
+  val ArrayLength = in UInt (32 bits)
+  val PartialArrayStart = in UInt (32 bits)
 
   override def asMaster(): Unit = {
-    out(Valid, OopType, KlassPtr, SrcOopPtr, DestOopPtr, Kid, ArrayLength, PartialArrayStart, StepIndex, StepNCreate, ScanningInYoung)
+    out(
+      Valid,
+      OopType,
+      KlassPtr,
+      SrcOopPtr,
+      DestOopPtr,
+      Kid,
+      ArrayLength,
+      PartialArrayStart,
+      StepIndex,
+      StepNCreate,
+      ScanningInYoung
+    )
     in(Ready, Done)
   }
 
@@ -494,14 +565,14 @@ class GCToTrace extends Bundle with GCParameters with IMasterSlave {
 }
 
 class GCToCopy extends Bundle with GCParameters with IMasterSlave {
-  val Valid = in Bool()
-  val Ready = out Bool()
-  val Done = out Bool()
+  val Valid = in Bool ()
+  val Ready = out Bool ()
+  val Done = out Bool ()
 
   // some parse module calculate parameters
-  val DestOopPtr = in UInt(GCElementWidth bits)
-  val SrcOopPtr = in UInt(GCElementWidth bits)
-  val Size = in UInt(32 bits)
+  val DestOopPtr = in UInt (GCElementWidth bits)
+  val SrcOopPtr = in UInt (GCElementWidth bits)
+  val Size = in UInt (32 bits)
 
   override def asMaster(): Unit = {
     out(Valid, SrcOopPtr, DestOopPtr, Size)
@@ -521,14 +592,14 @@ class GCToCopy extends Bundle with GCParameters with IMasterSlave {
   }
 }
 
-class GCToAop extends Bundle with GCParameters with IMasterSlave{
-  val Valid = in Bool()
-  val Ready = out Bool()
+class GCToAop extends Bundle with GCParameters with IMasterSlave {
+  val Valid = in Bool ()
+  val Ready = out Bool ()
 
-  val Done = out Bool()
+  val Done = out Bool ()
 
-  val RegionAttr = in UInt(16 bits)
-  val Task = in UInt(GCElementWidth bits)
+  val RegionAttr = in UInt (16 bits)
+  val Task = in UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
     in(Ready, Done)
@@ -547,13 +618,13 @@ class GCToAop extends Bundle with GCParameters with IMasterSlave{
   }
 }
 
-class GCTaskStackConfigIO extends Bundle with GCParameters with IMasterSlave{
-  val TaskQueue_Bottom = in UInt(32 bits)
-  val TaskQueue_ElemsBase = in UInt(GCElementWidth bits)
+class GCTaskStackConfigIO extends Bundle with GCParameters with IMasterSlave {
+  val TaskQueue_Bottom = in UInt (32 bits)
+  val TaskQueue_ElemsBase = in UInt (GCElementWidth bits)
 
-  val TaskValid = in Bool()
-  val TaskReady = out Bool()
-  val Done = out Bool()
+  val TaskValid = in Bool ()
+  val TaskReady = out Bool ()
+  val Done = out Bool ()
 
   override def asMaster(): Unit = {
     out(TaskQueue_Bottom, TaskQueue_ElemsBase, TaskValid)
@@ -561,87 +632,134 @@ class GCTaskStackConfigIO extends Bundle with GCParameters with IMasterSlave{
   }
 }
 
-class GCFetchConfigIO extends Bundle with GCParameters with IMasterSlave{
-  val UseCompressedOop = in Bool()
-  val CompressedOopBase = in UInt(GCElementWidth bits)
-  val CompressedOopShift = in UInt(8 bits)
-  val UseCompressedKlassPointers = in Bool()
+class GCFetchConfigIO extends Bundle with GCParameters with IMasterSlave {
+  val UseCompressedOop = in Bool ()
+  val CompressedOopBase = in UInt (GCElementWidth bits)
+  val CompressedOopShift = in UInt (8 bits)
+  val UseCompressedKlassPointers = in Bool ()
 
   override def asMaster(): Unit = {
-    out(UseCompressedOop, CompressedOopBase, CompressedOopShift, UseCompressedKlassPointers)
+    out(
+      UseCompressedOop,
+      CompressedOopBase,
+      CompressedOopShift,
+      UseCompressedKlassPointers
+    )
     in()
   }
 }
 
-class GCArrayProcessConfigIO extends Bundle with GCParameters with IMasterSlave {
-  val ChunkSize = in UInt(32 bits)
-  val StepperOffset = in UInt(GCElementWidth bits)
-  val HeapRegionShiftBy = in UInt(32 bits)
-  val HeapRegionBiasedBase = in UInt(GCElementWidth bits)
-  val UseCompressedKlassPointers = in Bool()
+class GCArrayProcessConfigIO
+    extends Bundle
+    with GCParameters
+    with IMasterSlave {
+  val ChunkSize = in UInt (32 bits)
+  val StepperOffset = in UInt (GCElementWidth bits)
+  val HeapRegionShiftBy = in UInt (32 bits)
+  val HeapRegionBiasedBase = in UInt (GCElementWidth bits)
+  val UseCompressedKlassPointers = in Bool ()
 
   override def asMaster(): Unit = {
-    out(ChunkSize, StepperOffset, HeapRegionBiasedBase, HeapRegionShiftBy, UseCompressedKlassPointers)
+    out(
+      ChunkSize,
+      StepperOffset,
+      HeapRegionBiasedBase,
+      HeapRegionShiftBy,
+      UseCompressedKlassPointers
+    )
     in()
   }
 }
 
-class GCOopProcessConfigIO extends Bundle with GCParameters with IMasterSlave{
-  val RegionAttrShiftBy = in UInt(32 bits)
-  val RegionAttrBiasedBase = in UInt(GCElementWidth bits)
-  val LogOfHRGrainBytes = in UInt(32 bits)
-  val HeapRegionShiftBy = in UInt(32 bits)
-  val HeapRegionBiasedBase = in UInt(GCElementWidth bits)
-  val UseCompressedOop = in Bool()
-  val CompressedOopBase = in UInt(GCElementWidth bits)
-  val CompressedOopShift = in UInt(8 bits)
+class GCOopProcessConfigIO extends Bundle with GCParameters with IMasterSlave {
+  val RegionAttrShiftBy = in UInt (32 bits)
+  val RegionAttrBiasedBase = in UInt (GCElementWidth bits)
+  val LogOfHRGrainBytes = in UInt (32 bits)
+  val HeapRegionShiftBy = in UInt (32 bits)
+  val HeapRegionBiasedBase = in UInt (GCElementWidth bits)
+  val UseCompressedOop = in Bool ()
+  val CompressedOopBase = in UInt (GCElementWidth bits)
+  val CompressedOopShift = in UInt (8 bits)
 
   override def asMaster(): Unit = {
-    out(RegionAttrBiasedBase, RegionAttrShiftBy, HeapRegionBiasedBase, HeapRegionShiftBy, LogOfHRGrainBytes, UseCompressedOop, CompressedOopBase, CompressedOopShift)
+    out(
+      RegionAttrBiasedBase,
+      RegionAttrShiftBy,
+      HeapRegionBiasedBase,
+      HeapRegionShiftBy,
+      LogOfHRGrainBytes,
+      UseCompressedOop,
+      CompressedOopBase,
+      CompressedOopShift
+    )
     in()
   }
 }
 
-class GCCopy2SurvivorConfigIO extends Bundle with GCParameters with IMasterSlave {
-  val ChunkSize = in UInt(32 bits)
-  val AgeThreshold = in UInt(32 bits)
-  val YoungWordsBase = in UInt(GCElementWidth bits)
-  val PlabAllocatorPtr = in UInt(GCElementWidth bits)
-  val HeapRegionShiftBy = in UInt(32 bits)
-  val HeapRegionBiasedBase = in UInt(GCElementWidth bits)
-  val ParScanThreadStatePtr = in UInt(GCElementWidth bits)
-  val UseCompressedKlassPointer = in Bool()
-  val CompressedKlassPointerBase = in UInt(GCElementWidth bits)
-  val CompressedKlassPointerShift = in UInt(8 bits)
-  val objectKlassObj = in UInt(GCElementWidth bits)
-  val intArrayKlassObj = in UInt(GCElementWidth bits)
+class GCCopy2SurvivorConfigIO
+    extends Bundle
+    with GCParameters
+    with IMasterSlave {
+  val ChunkSize = in UInt (32 bits)
+  val AgeThreshold = in UInt (32 bits)
+  val YoungWordsBase = in UInt (GCElementWidth bits)
+  val PlabAllocatorPtr = in UInt (GCElementWidth bits)
+  val HeapRegionShiftBy = in UInt (32 bits)
+  val HeapRegionBiasedBase = in UInt (GCElementWidth bits)
+  val ParScanThreadStatePtr = in UInt (GCElementWidth bits)
+  val UseCompressedKlassPointer = in Bool ()
+  val CompressedKlassPointerBase = in UInt (GCElementWidth bits)
+  val CompressedKlassPointerShift = in UInt (8 bits)
+  val objectKlassObj = in UInt (GCElementWidth bits)
+  val intArrayKlassObj = in UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
-    out(ParScanThreadStatePtr, PlabAllocatorPtr, AgeThreshold, HeapRegionBiasedBase, HeapRegionShiftBy, ChunkSize, YoungWordsBase, UseCompressedKlassPointer, CompressedKlassPointerBase, CompressedKlassPointerShift, objectKlassObj, intArrayKlassObj)
+    out(
+      ParScanThreadStatePtr,
+      PlabAllocatorPtr,
+      AgeThreshold,
+      HeapRegionBiasedBase,
+      HeapRegionShiftBy,
+      ChunkSize,
+      YoungWordsBase,
+      UseCompressedKlassPointer,
+      CompressedKlassPointerBase,
+      CompressedKlassPointerShift,
+      objectKlassObj,
+      intArrayKlassObj
+    )
     in()
   }
 }
 
-class GCAllocateConfigIO extends Bundle with GCParameters with IMasterSlave{
-  val G1h = in UInt(GCElementWidth bits)
-  val objectKlassObj = in UInt(GCElementWidth bits)
-  val intArrayKlassObj = in UInt(GCElementWidth bits)
-  val PlabAllocatorPtr = in UInt(GCElementWidth bits)
-  val UseCompressedKlassPointers = in Bool()
-  val CompressedKlassPointerBase = in UInt(GCElementWidth bits)
-  val CompressedKlassPointerShift = in UInt(8 bits)
+class GCAllocateConfigIO extends Bundle with GCParameters with IMasterSlave {
+  val G1h = in UInt (GCElementWidth bits)
+  val objectKlassObj = in UInt (GCElementWidth bits)
+  val intArrayKlassObj = in UInt (GCElementWidth bits)
+  val PlabAllocatorPtr = in UInt (GCElementWidth bits)
+  val UseCompressedKlassPointers = in Bool ()
+  val CompressedKlassPointerBase = in UInt (GCElementWidth bits)
+  val CompressedKlassPointerShift = in UInt (8 bits)
 
   override def asMaster(): Unit = {
-    out(G1h, objectKlassObj, intArrayKlassObj, PlabAllocatorPtr, UseCompressedKlassPointers, CompressedKlassPointerBase, CompressedKlassPointerShift)
+    out(
+      G1h,
+      objectKlassObj,
+      intArrayKlassObj,
+      PlabAllocatorPtr,
+      UseCompressedKlassPointers,
+      CompressedKlassPointerBase,
+      CompressedKlassPointerShift
+    )
     in()
   }
 }
 
-class GCParAllocateConfigIO extends Bundle with GCParameters with IMasterSlave{
-  val G1h = in UInt(GCElementWidth bits)
-  val Thread = in UInt(GCElementWidth bits)
-  val LockPtr = in UInt(GCElementWidth bits)
-  val DummyRegion = in UInt(GCElementWidth bits)
+class GCParAllocateConfigIO extends Bundle with GCParameters with IMasterSlave {
+  val G1h = in UInt (GCElementWidth bits)
+  val Thread = in UInt (GCElementWidth bits)
+  val LockPtr = in UInt (GCElementWidth bits)
+  val DummyRegion = in UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
     out(G1h, Thread, LockPtr, DummyRegion)
@@ -649,9 +767,9 @@ class GCParAllocateConfigIO extends Bundle with GCParameters with IMasterSlave{
   }
 }
 
-class GCAttemptAllocConfigIO extends Bundle with GCParameters with IMasterSlave{
-  val G1h = in UInt(GCElementWidth bits)
-  val DummyRegion = in UInt(GCElementWidth bits)
+class GCNewGCAllocConfigIO extends Bundle with GCParameters with IMasterSlave {
+  val G1h = in UInt (GCElementWidth bits)
+  val DummyRegion = in UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
     out(G1h, DummyRegion)
@@ -659,19 +777,12 @@ class GCAttemptAllocConfigIO extends Bundle with GCParameters with IMasterSlave{
   }
 }
 
-class GCNewGCAllocConfigIO extends Bundle with GCParameters with IMasterSlave{
-  val G1h = in UInt(GCElementWidth bits)
-  val DummyRegion = in UInt(GCElementWidth bits)
-
-  override def asMaster(): Unit = {
-    out(G1h, DummyRegion)
-    in()
-  }
-}
-
-class GCAllocFreeRegionConfigIO extends Bundle with GCParameters with IMasterSlave{
-  val G1h = in UInt(GCElementWidth bits)
-  val NumaPtr = in UInt(GCElementWidth bits)
+class GCAllocFreeRegionConfigIO
+    extends Bundle
+    with GCParameters
+    with IMasterSlave {
+  val G1h = in UInt (GCElementWidth bits)
+  val NumaPtr = in UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
     out(G1h, NumaPtr)
@@ -679,30 +790,42 @@ class GCAllocFreeRegionConfigIO extends Bundle with GCParameters with IMasterSla
   }
 }
 
-class GCTraceConfigIO extends Bundle with GCParameters with IMasterSlave{
-  val ChunkSize = in UInt(32 bits)
-  val RegionAttrBase = in UInt(GCElementWidth bits)
-  val RegionAttrShiftBy = in UInt(32 bits)
-  val RegionAttrBiasedBase = in UInt(GCElementWidth bits)
-  val HeapRegionBias = in UInt(32 bits)
-  val HeapRegionShiftBy = in UInt(32 bits)
-  val LogOfHRGrainBytes = in UInt(32 bits)
-  val UseCompressedOops = in Bool()
-  val CompressedOopBase = in UInt(GCElementWidth bits)
-  val CompressedOopShift = in UInt(8 bits)
-  val UseCompressedKlassPointers = in Bool()
-  val HumongousReclaimCandidatesBoolBase = in UInt(GCElementWidth bits)
+class GCTraceConfigIO extends Bundle with GCParameters with IMasterSlave {
+  val ChunkSize = in UInt (32 bits)
+  val RegionAttrBase = in UInt (GCElementWidth bits)
+  val RegionAttrShiftBy = in UInt (32 bits)
+  val RegionAttrBiasedBase = in UInt (GCElementWidth bits)
+  val HeapRegionBias = in UInt (32 bits)
+  val HeapRegionShiftBy = in UInt (32 bits)
+  val LogOfHRGrainBytes = in UInt (32 bits)
+  val UseCompressedOops = in Bool ()
+  val CompressedOopBase = in UInt (GCElementWidth bits)
+  val CompressedOopShift = in UInt (8 bits)
+  val UseCompressedKlassPointers = in Bool ()
+  val HumongousReclaimCandidatesBoolBase = in UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
-    out(ChunkSize, UseCompressedOops, CompressedOopBase, CompressedOopShift, UseCompressedKlassPointers, RegionAttrBase, RegionAttrBiasedBase, RegionAttrShiftBy, HeapRegionBias, HeapRegionShiftBy, HumongousReclaimCandidatesBoolBase, LogOfHRGrainBytes)
+    out(
+      ChunkSize,
+      UseCompressedOops,
+      CompressedOopBase,
+      CompressedOopShift,
+      UseCompressedKlassPointers,
+      RegionAttrBase,
+      RegionAttrBiasedBase,
+      RegionAttrShiftBy,
+      HeapRegionBias,
+      HeapRegionShiftBy,
+      HumongousReclaimCandidatesBoolBase,
+      LogOfHRGrainBytes
+    )
     in()
   }
 }
 
-
-class GCAopConfigIO extends Bundle with GCParameters with IMasterSlave{
-  val CardTablePtr = in UInt(GCElementWidth bits)
-  val ParScanThreadStatePtr = in UInt(GCElementWidth bits)
+class GCAopConfigIO extends Bundle with GCParameters with IMasterSlave {
+  val CardTablePtr = in UInt (GCElementWidth bits)
+  val ParScanThreadStatePtr = in UInt (GCElementWidth bits)
 
   override def asMaster(): Unit = {
     out(CardTablePtr, ParScanThreadStatePtr)
@@ -710,10 +833,9 @@ class GCAopConfigIO extends Bundle with GCParameters with IMasterSlave{
   }
 }
 
-
-class LocalMMUIO extends Bundle with HWParameters with IMasterSlave{
-  //发出的访存请求
-  val Request = master Stream new Bundle{
+class LocalMMUIO extends Bundle with HWParameters with IMasterSlave {
+  // 发出的访存请求
+  val Request = master Stream new Bundle {
     val RequestSourceID = UInt(LLCSourceMaxNumBitSize bits)
     val RequestVirtualAddr = UInt(MMUAddrWidth bits)
     val RequestType_isWrite = Bool()
@@ -724,9 +846,9 @@ class LocalMMUIO extends Bundle with HWParameters with IMasterSlave{
   // add variable to describe the request need or not need split two request
   val RequestSize = master Flow UInt(LineBytesNumBitSize bits)
 
-  val ConherentRequsetSourceID    = slave Flow UInt(LLCSourceMaxNumBitSize bits)
+  val ConherentRequsetSourceID = slave Flow UInt(LLCSourceMaxNumBitSize bits)
 
-  val Response = slave Stream new Bundle{
+  val Response = slave Stream new Bundle {
     val ResponseData = UInt(MMUDataWidth bits)
     val ResponseSourceID = UInt(LLCSourceMaxNumBitSize bits)
   }
@@ -737,14 +859,13 @@ class LocalMMUIO extends Bundle with HWParameters with IMasterSlave{
   }
 }
 
-object WrapInc
-{
+object WrapInc {
   // "n" is the number of increments, so we wrap at n-1.
   def apply(value: UInt, n: Int, Increment: UInt): UInt = {
     if (isPow2(n)) {
-      (value + Increment)(log2Up(n)-1 downto  0)
+      (value + Increment)(log2Up(n) - 1 downto 0)
     } else {
-      val wrap = value === U(n-1)
+      val wrap = value === U(n - 1)
       Mux(wrap, U(0), value + Increment)
     }
   }
@@ -757,15 +878,14 @@ object WrapDec {
   def apply(value: UInt, n: Int, decrement: UInt): UInt = {
     if (isPow2(n)) {
       // 对于 2 的幂，直接做减法并截位即可
-      (value - decrement)(log2Up(n)-1 downto 0)
+      (value - decrement)(log2Up(n) - 1 downto 0)
     } else {
       // 非 2 的幂，用条件判断
       val wrap = value === U(0)
-      Mux(wrap, U(n-1), value - decrement)
+      Mux(wrap, U(n - 1), value - decrement)
     }
   }
 }
-
 
 object LocalMMUTaskType {
   val TaskTypeMax = 18 + 2
@@ -773,45 +893,87 @@ object LocalMMUTaskType {
 }
 
 class Ctrl2Top extends Bundle with GCParameters with IMasterSlave {
-  val ChunkSize = in UInt(32 bits)
-  val AgeThreshold = in UInt(32 bits)
-  val HeapRegionBias = in UInt(32 bits)
-  val RegionAttrShiftBy = in UInt(32 bits)
-  val HeapRegionShiftBy = in UInt(32 bits)
-  val LogOfHRGrainBytes = in UInt(32 bits)
-  val StepperOffset = in UInt(GCElementWidth bits)
-  val YoungWordsBase = in UInt(GCElementWidth bits)
-  val RegionAttrBase = in UInt(GCElementWidth bits)
-  val PlabAllocatorPtr = in UInt(GCElementWidth bits)
-  val RegionAttrBiasedBase = in UInt(GCElementWidth bits)
-  val HeapRegionBiasedBase = in UInt(GCElementWidth bits)
-  val ParScanThreadStatePtr = in UInt(GCElementWidth bits)
-  val TaskQueue_Bottom    = in UInt(32 bits)
-  val TaskQueue_ElemsBase = in UInt(GCElementWidth bits)
-  val HumongousReclaimCandidatesBoolBase = in UInt(GCElementWidth bits)
-  val CardTablePtr = in UInt(GCElementWidth bits)
-  val G1h = in UInt(GCElementWidth bits)
-  val IntArrayKlassObj = in UInt(GCElementWidth bits)
-  val ObjectKlass = in UInt(GCElementWidth bits)
-  val LockPtr = in UInt(GCElementWidth bits)
-  val Thread = in UInt(GCElementWidth bits)
-  val DummyRegion = in UInt(GCElementWidth bits)
-  val NumaPtr = in UInt(GCElementWidth bits)
-  val CompressedOopBase = in UInt(GCElementWidth bits)
-  val CompressedKlassPointerBase = in UInt(GCElementWidth bits)
-  val CompressedFlag = in UInt(32 bits)
+  val ChunkSize = in UInt (32 bits)
+  val AgeThreshold = in UInt (32 bits)
+  val HeapRegionBias = in UInt (32 bits)
+  val RegionAttrShiftBy = in UInt (32 bits)
+  val HeapRegionShiftBy = in UInt (32 bits)
+  val LogOfHRGrainBytes = in UInt (32 bits)
+  val StepperOffset = in UInt (GCElementWidth bits)
+  val YoungWordsBase = in UInt (GCElementWidth bits)
+  val RegionAttrBase = in UInt (GCElementWidth bits)
+  val PlabAllocatorPtr = in UInt (GCElementWidth bits)
+  val RegionAttrBiasedBase = in UInt (GCElementWidth bits)
+  val HeapRegionBiasedBase = in UInt (GCElementWidth bits)
+  val ParScanThreadStatePtr = in UInt (GCElementWidth bits)
+  val TaskQueue_Bottom = in UInt (32 bits)
+  val TaskQueue_ElemsBase = in UInt (GCElementWidth bits)
+  val HumongousReclaimCandidatesBoolBase = in UInt (GCElementWidth bits)
+  val CardTablePtr = in UInt (GCElementWidth bits)
+  val G1h = in UInt (GCElementWidth bits)
+  val IntArrayKlassObj = in UInt (GCElementWidth bits)
+  val ObjectKlass = in UInt (GCElementWidth bits)
+  val LockPtr = in UInt (GCElementWidth bits)
+  val Thread = in UInt (GCElementWidth bits)
+  val DummyRegion = in UInt (GCElementWidth bits)
+  val NumaPtr = in UInt (GCElementWidth bits)
+  val CompressedOopBase = in UInt (GCElementWidth bits)
+  val CompressedKlassPointerBase = in UInt (GCElementWidth bits)
+  val CompressedFlag = in UInt (32 bits)
 
-  val Valid = in Bool()
-  val Ready = out Bool()
-  val Done = out Bool()
+  val Valid = in Bool ()
+  val Ready = out Bool ()
+  val Done = out Bool ()
 
   override def asMaster(): Unit = {
-    out(Valid, ChunkSize, AgeThreshold, HeapRegionBias, RegionAttrShiftBy, HeapRegionShiftBy, LogOfHRGrainBytes, StepperOffset, YoungWordsBase, RegionAttrBase, PlabAllocatorPtr, RegionAttrBiasedBase, HeapRegionBiasedBase, ParScanThreadStatePtr, TaskQueue_Bottom, TaskQueue_ElemsBase, HumongousReclaimCandidatesBoolBase, CardTablePtr, G1h, IntArrayKlassObj, ObjectKlass, LockPtr, Thread, DummyRegion, NumaPtr, CompressedOopBase, CompressedKlassPointerBase, CompressedFlag)
+    out(
+      Valid,
+      ChunkSize,
+      AgeThreshold,
+      HeapRegionBias,
+      RegionAttrShiftBy,
+      HeapRegionShiftBy,
+      LogOfHRGrainBytes,
+      StepperOffset,
+      YoungWordsBase,
+      RegionAttrBase,
+      PlabAllocatorPtr,
+      RegionAttrBiasedBase,
+      HeapRegionBiasedBase,
+      ParScanThreadStatePtr,
+      TaskQueue_Bottom,
+      TaskQueue_ElemsBase,
+      HumongousReclaimCandidatesBoolBase,
+      CardTablePtr,
+      G1h,
+      IntArrayKlassObj,
+      ObjectKlass,
+      LockPtr,
+      Thread,
+      DummyRegion,
+      NumaPtr,
+      CompressedOopBase,
+      CompressedKlassPointerBase,
+      CompressedFlag
+    )
     in(Ready, Done)
   }
 }
 
-class GCTopIO extends Bundle{
+class GCAllocateConfig extends Module with GCParameters {
+  val G1h = in UInt (GCElementWidth bits)
+  val Thread = in UInt (GCElementWidth bits)
+  val LockPtr = in UInt (GCElementWidth bits)
+  val DummyRegion = in UInt (GCElementWidth bits)
+}
+
+class GCAllocateTopIO(count: Int) extends Bundle {
+  val mmu2llc = master(new LocalMMUIO)
+  val toDoAllocates = Vec(slave(new GCToDoAllocate), count)
+  val config = slave(new GCAllocateConfig)
+}
+
+class GCTopIO extends Bundle {
   val mmu2llc = master(new LocalMMUIO)
   val ctrl2top = slave(new Ctrl2Top)
 }
