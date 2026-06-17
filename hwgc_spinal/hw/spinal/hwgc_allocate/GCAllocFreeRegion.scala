@@ -1,17 +1,17 @@
-package hwgc_acc
+package hwgc_allocate
 
+import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO}
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
 
 import scala.language.postfixOps
 
-class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
+class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
   val io = new Bundle {
     val Mreq              = master(new LocalMMUIO)
     val ConfigIO          = slave(new GCAllocFreeRegionConfigIO)
     val ToAllocFreeRegion = slave(new GCToAllocFreeRegion)
-    val DebugTimeStamp    = in UInt (64 bits)
   }
 
   // Default outputs
@@ -23,11 +23,6 @@ class GCAllocFreeRegion extends Module with GCParameters with HWParameters {
   io.Mreq.Response.ready := True
 
   io.ToAllocFreeRegion.clearOut()
-
-  def dbg(msg: Seq[Any]): Unit =
-    if (DebugEnable) {
-      report(Seq("[GCAllocFreeRegion<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
-    }
 
   // Constants
   private def ptrConst(v: Int): UInt = U(v, GCElementWidth bits)

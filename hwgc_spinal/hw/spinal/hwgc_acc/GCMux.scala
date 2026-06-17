@@ -5,7 +5,7 @@ import spinal.lib._
 
 import scala.language.postfixOps
 
-class GCTraceMux extends Module with HWParameters with GCParameters {
+class GCTraceMux extends Module {
   val io = new Bundle {
     val In0 = slave(new GCToTrace)
     val In1 = slave(new GCToTrace)
@@ -60,7 +60,7 @@ class GCTraceMux extends Module with HWParameters with GCParameters {
   }
 }
 
-class GCAopMux extends Module with HWParameters with GCParameters{
+class GCAopMux extends Module {
   val io = new Bundle {
     val In0 = slave(new GCToAop)
     val In1 = slave(new GCToAop)

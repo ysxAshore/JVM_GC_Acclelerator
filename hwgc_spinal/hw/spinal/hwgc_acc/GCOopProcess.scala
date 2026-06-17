@@ -1,12 +1,14 @@
 package hwgc_acc
 
+import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO}
+
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
 
 import scala.language.postfixOps
 
-case class SlotCtx() extends Bundle with GCParameters {
+case class SlotCtx() extends Bundle with GCTopParameters {
   val task                 = UInt(GCElementWidth bits)
   val srcOopPtr            = UInt(GCElementWidth bits)
   val markWord             = UInt(GCElementWidth bits)
@@ -23,7 +25,7 @@ case class SlotCtx() extends Bundle with GCParameters {
   val destRegionAttr       = UInt(16 bits)
 }
 
-class GCOopProcess extends Module with HWParameters with GCParameters {
+class GCOopProcess extends Module with HWParameters with GCTopParameters with GCParameters {
   val io = new Bundle {
     val Mreq0                = master(new LocalMMUIO)
     val Mreq1                = master(new LocalMMUIO)
@@ -74,21 +76,12 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
   val slotCopy2SurvivorTypeArraySeen = Vec.fill(2)(RegInit(False))
   val slotCopy2SurvivorBypassGranted = Vec.fill(2)(RegInit(False))
 
-  // --------------------------------------------------------------------------
-  // allowSecondInFlight = True 表示：
-  //   已经有某个 slot 提前对 Fetch 发过 Done，
-  //   因此允许 Fetch 再送一个任务进入另一个空 slot。
-  // --------------------------------------------------------------------------
+  // allowSecondInFlight = True 表示： 已经有某个 slot 提前对 Fetch 发过 Done， 因此允许 Fetch 再送一个任务进入另一个空 slot。
   val allowSecondInFlight = RegInit(False)
 
-  // --------------------------------------------------------------------------
   // shared small caches
-  //
-  // 两个 slot 共用一份 cache。
-  // cache fill 写口采用固定优先级：slot0 > slot1。
-  // 当 slot0 和 slot1 同周期都 miss 且都要 fill 时，只 fill slot0。
-  // slot1 的当前返回数据已经写入 slotCtx(1)，只是这次不更新 cache。
-  // --------------------------------------------------------------------------
+  // 两个 slot 共用一份 cache。 cache fill 写口采用固定优先级：slot0 > slot1。
+  // 当 slot0 和 slot1 同周期都 miss 且都要 fill 时，只 fill slot0。 slot1 的当前返回数据已经写入 slotCtx(1)，只是这次不更新 cache。
   val regionAttrCacheEntries = 8
   val regionAttrCacheValid   = Vec.fill(regionAttrCacheEntries)(RegInit(False))
   val regionAttrCacheTag     = Vec.fill(regionAttrCacheEntries)(RegInit(U(0, MMUAddrWidth bits)))
@@ -229,9 +222,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
     heapRegionFillData(i)  := False
   }
 
-  // --------------------------------------------------------------------------
   // Process2CopySurvivor done capture
-  // --------------------------------------------------------------------------
   when(io.Process2CopySurvivor.isTypeArray) {
     val isTypeArrayIdx = io.Process2CopySurvivor.DoneOwner
 
@@ -255,31 +246,17 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
     dbg(Seq("Copy2Survivor done for slot", doneOwner))
   }
 
-  // --------------------------------------------------------------------------
   // admission by one global token
-  //
   // pipeline 空：可以直接接收第一个任务。
   // pipeline 非空：必须 allowSecondInFlight=True 才能接收第二个任务。
-  // 接收任务后清掉 allowSecondInFlight。
-  // 如果同周期又有新的 slotReleaseFetch，则重新置位。
-  // --------------------------------------------------------------------------
-  val pipeEmpty =
-    !slotValid(0) && !slotValid(1)
+  // 接收任务后清掉 allowSecondInFlight。 如果同周期又有新的 slotReleaseFetch，则重新置位。
+  val pipeEmpty = !slotValid(0) && !slotValid(1)
+  val hasFreeSlot = !slotValid(0) || !slotValid(1)
+  val fetchReleasePulse = slotReleaseFetch.orR
+  val fetchAccept = io.Fetch2Process.Valid && io.Fetch2Process.Ready
 
-  val hasFreeSlot =
-    !slotValid(0) || !slotValid(1)
-
-  val fetchReleasePulse =
-    slotReleaseFetch.orR
-
-  io.Fetch2Process.Ready :=
-    hasFreeSlot && (pipeEmpty || allowSecondInFlight)
-
-  io.Fetch2Process.Done :=
-    fetchReleasePulse
-
-  val fetchAccept =
-    io.Fetch2Process.Valid && io.Fetch2Process.Ready
+  io.Fetch2Process.Ready := hasFreeSlot && (pipeEmpty || allowSecondInFlight)
+  io.Fetch2Process.Done := fetchReleasePulse
 
   when(fetchAccept) {
     when(!slotValid(0)) {
@@ -296,15 +273,11 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
     allowSecondInFlight := False
   }
 
-  // --------------------------------------------------------------------------
   // slot FSM visibility for shared-output arbitration
-  // --------------------------------------------------------------------------
   val slotIsCopyReq = Vec.fill(2)(Bool())
   val slotIsWaitAop = Vec.fill(2)(Bool())
 
-  // --------------------------------------------------------------------------
   // Per-slot StateMachines
-  // --------------------------------------------------------------------------
   for (i <- 0 until 2) {
     val m = slotMreq(i)
 
@@ -330,14 +303,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
           goto(DECIDE)
 
         } otherwise {
-          issueReq(
-            m,
-            srcRegionAttrAddr(i),
-            False,
-            U(2),
-            U(0),
-            slotIssued(i)
-          ) { rd =>
+          issueReq(m, srcRegionAttrAddr(i), False, U(2), U(0), slotIssued(i)) { rd =>
             slotCtx(i).srcRegionAttr := rd(15 downto 0)
 
             regionAttrFillValid(i) := True
@@ -357,8 +323,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
           finishSlot(i)
 
         } otherwise {
-          val doCopy2Survivor =
-            (slotCtx(i).markWord & U(3, GCElementWidth bits)) =/= U(3, GCElementWidth bits)
+          val doCopy2Survivor = (slotCtx(i).markWord & U(3, GCElementWidth bits)) =/= U(3, GCElementWidth bits)
 
           when(!doCopy2Survivor) {
             slotCtx(i).destOopPtr   := slotCtx(i).markWord & ~U(3, GCElementWidth bits)
@@ -390,14 +355,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
           goto(WAIT_COPY_OR_MARK)
 
         } otherwise {
-          issueReq(
-            m,
-            heapRegionLookupAddr(i),
-            False,
-            U(8),
-            U(0),
-            slotIssued(i)
-          ) { rd =>
+          issueReq(m, heapRegionLookupAddr(i), False, U(8), U(0), slotIssued(i)) { rd =>
             slotCtx(i).heapRegion := rd(GCElementWidth - 1 downto 0)
             goto(READ_HUMONGOUS)
           }
@@ -405,19 +363,10 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
       }
 
       READ_HUMONGOUS.whenIsActive {
-        val humAddr =
-          (slotCtx(i).heapRegion.resize(MMUAddrWidth) + U"xbc").resize(MMUAddrWidth)
+        val humAddr = (slotCtx(i).heapRegion.resize(MMUAddrWidth) + U"xbc").resize(MMUAddrWidth)
 
-        issueReq(
-          m,
-          humAddr,
-          False,
-          U(4),
-          U(0),
-          slotIssued(i)
-        ) { rd =>
-          val hum =
-            (rd(31 downto 0) & U(2, 32 bits)) =/= U(0)
+        issueReq(m, humAddr, False, U(4), U(0), slotIssued(i)) { rd =>
+          val hum = (rd(31 downto 0) & U(2, 32 bits)) =/= U(0)
 
           slotCtx(i).heapRegionHumongous := hum
 
@@ -434,16 +383,14 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
           slotCtx(i).fromMarkWord := False
           goto(WRITE_BACK)
 
-        } elsewhen(slotCopy2SurvivorDone(i)) {
-          slotCopy2SurvivorDone(i) := False
-
-          val needRelease =
-            !slotCopy2SurvivorBypassGranted(i)
+        } elsewhen slotCopy2SurvivorDone(i) {
+          val needRelease = !slotCopy2SurvivorBypassGranted(i)
 
           when(needRelease) {
             slotReleaseFetch(i) := True
           }
 
+          slotCopy2SurvivorDone(i) := False
           slotCopy2SurvivorBypassGranted(i) := False
 
           goto(WRITE_BACK)
@@ -451,23 +398,12 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
       }
 
       WRITE_BACK.whenIsActive {
-        issueReq(
-          m,
-          slotCtx(i).task.resize(MMUAddrWidth),
-          True,
-          writeBackSize(),
-          writeBackObjOf(i),
-          slotIssued(i)
-        ) { _ =>
-          // write response ignored
-        }
+        issueReq(m, slotCtx(i).task.resize(MMUAddrWidth), True, writeBackSize(), writeBackObjOf(i), slotIssued(i)) { _ =>}
 
         when(slotIssued(i)) {
           slotIssued(i) := False
 
-          val sameRegion =
-            ((slotCtx(i).task ^ slotCtx(i).destOopPtr) >> io.ConfigIO.LogOfHRGrainBytes) === U(0)
-
+          val sameRegion = ((slotCtx(i).task ^ slotCtx(i).destOopPtr) >> io.ConfigIO.LogOfHRGrainBytes) === U(0)
           when(sameRegion || slotCtx(i).heapRegionHumongous) {
             finishSlot(i)
 
@@ -479,14 +415,7 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
       }
 
       READ_DEST_ATTR.whenIsActive {
-        issueReq(
-          m,
-          destRegionAttrAddr(i),
-          False,
-          U(2),
-          U(0),
-          slotIssued(i)
-        ) { rd =>
+        issueReq(m, destRegionAttrAddr(i), False, U(2), U(0), slotIssued(i)) { rd =>
           slotCtx(i).accessDestRegionAttr := True
           slotCtx(i).destRegionAttr       := rd(15 downto 0)
 
@@ -515,19 +444,13 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
     slotIsWaitAop(i) := slotFsm.isActive(slotFsm.WAIT_AOP)
   }
 
-  // ==========================================================================
-  // Shared regionAttrCache fill
-  // Fixed priority: slot0 > slot1
-  // ==========================================================================
+  // Shared regionAttrCache fill Fixed priority: slot0 > slot1
   val grantRegionFill0 = regionAttrFillValid(0)
   val grantRegionFill1 = !regionAttrFillValid(0) && regionAttrFillValid(1)
 
   when(grantRegionFill0 || grantRegionFill1) {
-    val fillAddr =
-      Mux(grantRegionFill0, regionAttrFillAddr(0), regionAttrFillAddr(1))
-
-    val fillData =
-      Mux(grantRegionFill0, regionAttrFillData(0), regionAttrFillData(1))
+    val fillAddr = Mux(grantRegionFill0, regionAttrFillAddr(0), regionAttrFillAddr(1))
+    val fillData = Mux(grantRegionFill0, regionAttrFillData(0), regionAttrFillData(1))
 
     regionAttrCacheValid(regionAttrCacheReplacePtr) := True
     regionAttrCacheTag(regionAttrCacheReplacePtr)   := fillAddr
@@ -536,19 +459,13 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
     regionAttrCacheReplacePtr := regionAttrCacheReplacePtr + 1
   }
 
-  // ==========================================================================
-  // Shared heapRegionCache fill
-  // Fixed priority: slot0 > slot1
-  // ==========================================================================
+  // Shared heapRegionCache fill Fixed priority: slot0 > slot1
   val grantHeapFill0 = heapRegionFillValid(0)
   val grantHeapFill1 = !heapRegionFillValid(0) && heapRegionFillValid(1)
 
   when(grantHeapFill0 || grantHeapFill1) {
-    val fillAddr =
-      Mux(grantHeapFill0, heapRegionFillAddr(0), heapRegionFillAddr(1))
-
-    val fillData =
-      Mux(grantHeapFill0, heapRegionFillData(0), heapRegionFillData(1))
+    val fillAddr = Mux(grantHeapFill0, heapRegionFillAddr(0), heapRegionFillAddr(1))
+    val fillData = Mux(grantHeapFill0, heapRegionFillData(0), heapRegionFillData(1))
 
     heapRegionCacheValid(heapRegionCacheReplacePtr) := True
     heapRegionCacheTag(heapRegionCacheReplacePtr)   := fillAddr
@@ -557,21 +474,11 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
     heapRegionCacheReplacePtr := heapRegionCacheReplacePtr + 1
   }
 
-  // ==========================================================================
-  // Centralized Copy2Survivor arbitration
-  // fixed priority: slot0 > slot1
-  // ==========================================================================
+  // Centralized Copy2Survivor arbitration fixed priority: slot0 > slot1
   val slotWantCopySurvivor = Vec.fill(2)(Bool())
 
-  slotWantCopySurvivor(0) :=
-    slotValid(0) &&
-    slotIsCopyReq(0) &&
-    !slotCopy2SurvivorInflight(0)
-
-  slotWantCopySurvivor(1) :=
-    slotValid(1) &&
-    slotIsCopyReq(1) &&
-    !slotCopy2SurvivorInflight(1)
+  slotWantCopySurvivor(0) := slotValid(0) && slotIsCopyReq(0) && !slotCopy2SurvivorInflight(0)
+  slotWantCopySurvivor(1) := slotValid(1) && slotIsCopyReq(1) && !slotCopy2SurvivorInflight(1)
 
   val grantCopy0 = slotWantCopySurvivor(0)
   val grantCopy1 = !slotWantCopySurvivor(0) && slotWantCopySurvivor(1)
@@ -579,28 +486,14 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
   when(grantCopy0 || grantCopy1) {
     io.Process2CopySurvivor.Valid := True
     io.Process2CopySurvivor.Owner := Mux(grantCopy0, U(0, 1 bits), U(1, 1 bits))
-
-    io.Process2CopySurvivor.MarkWord :=
-      Mux(grantCopy0, slotCtx(0).markWord, slotCtx(1).markWord)
-
-    io.Process2CopySurvivor.KlassPtr :=
-      Mux(grantCopy0, slotCtx(0).klassPtr, slotCtx(1).klassPtr)
-
-    io.Process2CopySurvivor.SrcOopPtr :=
-      Mux(grantCopy0, slotCtx(0).srcOopPtr, slotCtx(1).srcOopPtr)
-
-    io.Process2CopySurvivor.SrcLength :=
-      Mux(grantCopy0, slotCtx(0).srcLength, slotCtx(1).srcLength)
-
-    io.Process2CopySurvivor.SrcRegionAttr :=
-      Mux(grantCopy0, slotCtx(0).srcRegionAttr, slotCtx(1).srcRegionAttr)
-
-    io.Process2CopySurvivor.RegionAttrPtr :=
-      Mux(
-        grantCopy0,
+    io.Process2CopySurvivor.MarkWord := Mux(grantCopy0, slotCtx(0).markWord, slotCtx(1).markWord)
+    io.Process2CopySurvivor.KlassPtr := Mux(grantCopy0, slotCtx(0).klassPtr, slotCtx(1).klassPtr)
+    io.Process2CopySurvivor.SrcOopPtr := Mux(grantCopy0, slotCtx(0).srcOopPtr, slotCtx(1).srcOopPtr)
+    io.Process2CopySurvivor.SrcLength := Mux(grantCopy0, slotCtx(0).srcLength, slotCtx(1).srcLength)
+    io.Process2CopySurvivor.SrcRegionAttr := Mux(grantCopy0, slotCtx(0).srcRegionAttr, slotCtx(1).srcRegionAttr)
+    io.Process2CopySurvivor.RegionAttrPtr := Mux(grantCopy0,
         srcRegionAttrAddr(0).resize(GCElementWidth),
-        srcRegionAttrAddr(1).resize(GCElementWidth)
-      )
+        srcRegionAttrAddr(1).resize(GCElementWidth))
 
     when(io.Process2CopySurvivor.Ready) {
       when(grantCopy0) {
@@ -619,33 +512,19 @@ class GCOopProcess extends Module with HWParameters with GCParameters {
     }
   }
 
-  // ==========================================================================
-  // Centralized AOP arbitration
-  // fixed priority: slot0 > slot1
-  // ==========================================================================
+  // Centralized AOP arbitration fixed priority: slot0 > slot1
   val slotWantAop = Vec.fill(2)(Bool())
 
-  slotWantAop(0) :=
-    slotValid(0) &&
-    slotIsWaitAop(0) &&
-    slotCtx(0).accessDestRegionAttr
-
-  slotWantAop(1) :=
-    slotValid(1) &&
-    slotIsWaitAop(1) &&
-    slotCtx(1).accessDestRegionAttr
+  slotWantAop(0) := slotValid(0) && slotIsWaitAop(0) && slotCtx(0).accessDestRegionAttr
+  slotWantAop(1) := slotValid(1) && slotIsWaitAop(1) && slotCtx(1).accessDestRegionAttr
 
   val grantAop0 = slotWantAop(0)
   val grantAop1 = !slotWantAop(0) && slotWantAop(1)
 
   when(grantAop0 || grantAop1) {
     io.Process2Aop.Valid := True
-
-    io.Process2Aop.Task :=
-      Mux(grantAop0, slotCtx(0).task, slotCtx(1).task)
-
-    io.Process2Aop.RegionAttr :=
-      Mux(grantAop0, slotCtx(0).destRegionAttr, slotCtx(1).destRegionAttr)
+    io.Process2Aop.Task := Mux(grantAop0, slotCtx(0).task, slotCtx(1).task)
+    io.Process2Aop.RegionAttr := Mux(grantAop0, slotCtx(0).destRegionAttr, slotCtx(1).destRegionAttr)
 
     when(io.Process2Aop.Ready) {
       when(grantAop0) {

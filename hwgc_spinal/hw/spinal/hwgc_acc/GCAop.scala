@@ -1,11 +1,13 @@
 package hwgc_acc
 
+import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO}
+
 import spinal.core._
 import spinal.lib._
 
 import scala.language.postfixOps
 
-class GCAop extends Module with GCParameters with HWParameters {
+class GCAop extends Module with GCTopParameters with HWParameters {
   val io = new Bundle{
     val Aop = slave (new GCToAop)
     val Mreq = master(new LocalMMUIO)

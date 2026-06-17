@@ -1,12 +1,15 @@
 package hwgc_acc
 
+import hwgc_allocate.GCToDoAllocate
+import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO}
+
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
 
 import scala.language.postfixOps
 
-class GCParAllocate extends Module with GCParameters with HWParameters {
+class GCParAllocate extends Module with GCTopParameters with HWParameters {
   val io = new Bundle{
     val Mreq = master(new LocalMMUIO)
     val ToParAllocate = slave(new GCToParAllocate)

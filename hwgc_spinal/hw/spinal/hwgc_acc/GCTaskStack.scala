@@ -1,5 +1,6 @@
 package hwgc_acc
 
+import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO, WrapDec, WrapInc}
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
@@ -15,7 +16,7 @@ import scala.language.postfixOps
  * Refactored using StateMachine DSL for cleaner state transitions & reduced timing.
  * States: IDLE → WORK → UPDATE_CACHE → IDLE
  */
-class GCTaskStack extends Module with GCParameters with HWParameters {
+class GCTaskStack extends Module with GCTopParameters with GCParameters with HWParameters {
   val io = new Bundle {
     val toFetch = master(new GCToFetch)
     val toStack = slave(new GCToStack)
@@ -36,7 +37,6 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
   io.ConfigIO.Done      := False
   io.ConfigIO.TaskReady := False
 
-  // ============================================================================
   //  HWGC Queue – Sacrificing one space indicates fullness
   //  push/pop operate on stack_top; readBack/spillOut operate on stack_bottom
   // ============================================================================
@@ -119,9 +119,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
     if (DebugEnable) report(Seq("[GCTaskStack<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
   }
 
-  // ============================================================================
   //  Push / Pop handling (called from WORK state)
-  // ============================================================================
   def handlePushAndPop(): Unit = {
     when(io.toFetch.PrePop.fire) {
       prefetched(prefetchIdx) := True
@@ -142,10 +140,8 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
     }
   }
 
-  // ============================================================================
   //  SpillOut Area – write elements from stack_bottom to queue (cache-line aligned)
   //  Max 4 elements per line (LineBytesNum=32B / GCElementWidth=8B = 4 elems/line)
-  // ============================================================================
   val spillOutArea = new Area {
     val issued = RegInit(False)
 
@@ -172,10 +168,8 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
     def clear(): Unit = { issued := False }
   }
 
-  // ============================================================================
   //  ReadBack Area – read elements from queue, write to stack_bottom (cache-line aligned)
   //  Max 4 elements per line (LineBytesNum=32B / GCElementWidth=8B = 4 elems/line)
-  // ============================================================================
   val readBackArea = new Area {
     val issued = RegInit(False)
 
@@ -213,9 +207,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
     def clear(): Unit = { issued := False }
   }
 
-  // ============================================================================
   //  MMU Update Area – 6 sequential write requests (UPDATE_CACHE state)
-  // ============================================================================
   val mmuUpdate = new Area {
     val idx = RegInit(U(0, 3 bits))
 
@@ -257,10 +249,7 @@ class GCTaskStack extends Module with GCParameters with HWParameters {
     def updateFinished: Bool = idx === 6
   }
 
-  // ============================================================================
   //  StateMachine: IDLE → WORK → UPDATE_CACHE → IDLE
-  //  Using spinal.lib.fsm.StateMachine (correct SpinalHDL API)
-  // ============================================================================
   val fsm = new StateMachine {
     val IDLE: State         = new State with EntryPoint
     val WORK: State         = new State

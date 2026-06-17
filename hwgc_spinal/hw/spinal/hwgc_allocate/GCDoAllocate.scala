@@ -1,4 +1,6 @@
-package hwgc_acc
+package hwgc_allocate
+
+import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO}
 
 import spinal.core._
 import spinal.lib._
@@ -6,7 +8,7 @@ import spinal.lib.fsm._
 
 import scala.language.postfixOps
 
-class GCDoAllocate extends Module with GCParameters with HWParameters {
+class GCDoAllocate extends Module with GCTopParameters with HWParameters {
   val io = new Bundle {
     val MreqMainIml = master(new LocalMMUIO)
     val MreqPar = master(new LocalMMUIO)
@@ -14,7 +16,7 @@ class GCDoAllocate extends Module with GCParameters with HWParameters {
 
     val ToDoAllocate = slave(new GCToDoAllocate)
     val ToNewGCAlloc = master(new GCToNewGCAlloc)
-    val ConfigIO = slave(new GCParAllocateConfigIO)
+    val ConfigIO = slave(new GCDoAllocateConfigIO)
   }
 
   def clearMreq(mreq: LocalMMUIO): Unit = {
@@ -45,12 +47,12 @@ class GCDoAllocate extends Module with GCParameters with HWParameters {
   val desiredWordSize = RegInit(U(0, GCElementWidth bits))
 
   val destObjPtr = RegInit(U(0, GCElementWidth bits))
-  val actualWordSize = Reg(UInt(GCElementWidth bits)) init (0)
+  val actualWordSize = RegInit(U(0, GCElementWidth bits))
 
-  val allocRegionLockPtr = Reg(UInt(GCElementWidth bits)) init (0)
-  val freelistLockPtr = Reg(UInt(GCElementWidth bits)) init (0)
+  val allocRegionLockPtr = RegInit(U(0, GCElementWidth bits))
+  val freelistLockPtr = RegInit(U(0, GCElementWidth bits))
 
-  val lockValue = Reg(UInt(32 bits)) init (0)
+  val lockValue = RegInit(U(0, 32 bits))
 
   val firstTryDone = RegInit(False)
   val retryTryDone = RegInit(False)
@@ -379,23 +381,23 @@ class GCDoAllocate extends Module with GCParameters with HWParameters {
     val busy = RegInit(False)
     val done = RegInit(False)
 
-    val region_ptr_r = Reg(UInt(GCElementWidth bits)) init (0)
-    val alloc_region_r = Reg(UInt(GCElementWidth bits)) init (0)
-    val desired_word_size_r = Reg(UInt(GCElementWidth bits)) init (0)
+    val region_ptr_r = RegInit(U(0, GCElementWidth bits))
+    val alloc_region_r = RegInit(U(0, GCElementWidth bits))
+    val desired_word_size_r = RegInit(U(0, GCElementWidth bits))
 
-    val alloc_top = Reg(UInt(GCElementWidth bits)) init (0)
-    val alloc_bottom = Reg(UInt(GCElementWidth bits)) init (0)
+    val alloc_top = RegInit(U(0, GCElementWidth bits))
+    val alloc_bottom = RegInit(U(0, GCElementWidth bits))
 
     val region_ptr_type = RegInit(U(0, 8 bits))
     val region_ptr_off10 = RegInit(U(0, GCElementWidth bits))
     val allocated_bytes = RegInit(U(0, GCElementWidth bits))
 
-    val new_alloc_region_r = Reg(UInt(GCElementWidth bits)) init (0)
+    val new_alloc_region_r = RegInit(U(0, GCElementWidth bits))
 
     val bot_updates_r = RegInit(False)
 
-    val old_set_cnt_r = Reg(UInt(32 bits)) init (0)
-    val survivor_bytes_r = Reg(UInt(GCElementWidth bits)) init (0)
+    val old_set_cnt_r = RegInit(U(0, 32 bits))
+    val survivor_bytes_r = RegInit(U(0, GCElementWidth bits))
 
     val cm_r = Reg(UInt(GCElementWidth bits)) init 0
     val cm_valid = RegInit(False)

@@ -1,12 +1,14 @@
 package hwgc_acc
 
+import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO}
+
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
 
 import scala.language.postfixOps
 
-case class CopySurvivorSlotCtx() extends Bundle with GCParameters {
+case class CopySurvivorSlotCtx() extends Bundle with GCTopParameters {
   val owner = UInt(1 bits)
   val markWord = UInt(GCElementWidth bits)
   val klassPtr = UInt(GCElementWidth bits)
@@ -43,16 +45,14 @@ case class CopySurvivorSlotCtx() extends Bundle with GCParameters {
 
   val forwardPtr = UInt(GCElementWidth bits)
 
-  // --------------------------------------------------------------------------
   // Added for cross-slot PLAB safety.
-  // --------------------------------------------------------------------------
   val afterAllocCache = Bool()
   val usingPlabCacheBuffer = Bool()
   val heldPlabCacheBuffer = UInt(GCElementWidth bits)
   val forwardDecided = Bool()
 }
 
-class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
+class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters with GCParameters {
   val io = new Bundle {
     val Mreq0 = master(new LocalMMUIO)
     val Mreq1 = master(new LocalMMUIO)
@@ -102,7 +102,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
   // slot context
   val slotValid = Vec.fill(2)(RegInit(False))
-  val slotCtx = Vec.fill(2)(Reg(CopySurvivorSlotCtx()) init (CopySurvivorSlotCtx().getZero))
+  val slotCtx = Vec.fill(2)(Reg(CopySurvivorSlotCtx()) init CopySurvivorSlotCtx().getZero)
 
   val mmuIssued = Vec.fill(2)(RegInit(False))
 
@@ -242,15 +242,10 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   def compressedKlassPtrOf(i: Int): UInt =
     (io.ConfigIO.CompressedKlassPointerBase + (slotCtx(i).klassPtr(31 downto 0) << io.ConfigIO.CompressedKlassPointerShift)).resize(GCElementWidth)
 
-  def lookupKlassPtrOf(i: Int): UInt =
-    Mux(io.ConfigIO.UseCompressedKlassPointer, compressedKlassPtrOf(i), slotCtx(i).klassPtr)
+  def lookupKlassPtrOf(i: Int): UInt = Mux(io.ConfigIO.UseCompressedKlassPointer, compressedKlassPtrOf(i), slotCtx(i).klassPtr)
 
   def selectDestAttrOfRegionType(regionType: UInt): UInt =
-    Mux(
-      regionType === U(1),
-      destAttrRegionCache(31 downto 16),
-      destAttrRegionCache(15 downto 0)
-    ).resize(16)
+    Mux(regionType === U(1), destAttrRegionCache(31 downto 16), destAttrRegionCache(15 downto 0)).resize(16)
 
   def gotoPlabSelectHelper(i: Int, markWord: UInt): Unit = {
     val new_age = (markWord >> 3).resize(4).resize(32)
@@ -380,10 +375,9 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   val slotIsPlabSelect = Vec.fill(2)(Bool())
   val slotIsAllocCache = Vec.fill(2)(Bool())
   val slotIsSendWork = Vec.fill(2)(Bool())
-  val slotStateDebug = Vec.fill(2)(UInt(5 bits))
-
   val slotPlabAllocGrant = Vec.fill(2)(Bool())
 
+  val slotStateDebug = Vec.fill(2)(UInt(5 bits))
 
   for (i <- 0 until 2) {
     val m = slotMreq(i)
@@ -449,8 +443,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
           slotCtx(i).lh := lhVal
           slotCtx(i).kid := kidVal
 
-          when(kidVal === U(InstanceMirrorKlassID, 32 bits) &&
-            (lhVal.asSInt === S(0) || (lhVal.asSInt > S(0) && lhVal(0)))) {
+          when(kidVal === U(InstanceMirrorKlassID, 32 bits) && (lhVal.asSInt === S(0) || (lhVal.asSInt > S(0) && lhVal(0)))) {
             goto(SIZE_DEICIDE) // mirror 慢路径仍然读 src+0x20
           } otherwise {
             slotCtx(i).size := calcSize(lhVal, kidVal, slotCtx(i).srcLength)
@@ -472,8 +465,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
             klassFillPtr(i) := newKlassPtr
             klassFillKidLh(i) := rd(63 downto 0)
 
-            when(kidVal === U(InstanceMirrorKlassID, 32 bits) &&
-              (lhVal.asSInt === S(0) || (lhVal.asSInt > S(0) && lhVal(0)))) {
+            when(kidVal === U(InstanceMirrorKlassID, 32 bits) && (lhVal.asSInt === S(0) || (lhVal.asSInt > S(0) && lhVal(0)))) {
               goto(SIZE_DEICIDE) // mirror 慢路径仍然读 src+0x20
             } otherwise {
               slotCtx(i).size := calcSize(lhVal, kidVal, slotCtx(i).srcLength)
@@ -518,17 +510,8 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
         val highSelected = srcType === U(1)
         val destAttrBase = (io.ConfigIO.ParScanThreadStatePtr + U"x178").resize(MMUAddrWidth)
 
-        val cachedDestAttr = Mux(
-          highSelected,
-          destAttrRegionCache(31 downto 16),
-          destAttrRegionCache(15 downto 0)
-        ).resize(16)
-
-        val cachedPlabIdx = Mux(
-          highSelected,
-          destAttrRegionCache(31 downto 24),
-          destAttrRegionCache(15 downto 8)
-        ).resize(1)
+        val cachedDestAttr = Mux(highSelected, destAttrRegionCache(31 downto 16), destAttrRegionCache(15 downto 0)).resize(16)
+        val cachedPlabIdx = Mux(highSelected, destAttrRegionCache(31 downto 24), destAttrRegionCache(15 downto 8)).resize(1)
 
         when(!destAttrRegionValid) {
           issueReq(m, destAttrBase, False, U(4), U(0), mmuIssued(i)) { rd =>
@@ -552,11 +535,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
             gotoPlabSelectHelper(i, slotCtx(i).markWord)
             goto(PLAB_SELECT)
           } otherwise {
-            val addr = Mux(
-              slotCtx(i).markWord(1),
-              slotCtx(i).markWord ^ U"x2".resize(GCElementWidth),
-              slotCtx(i).markWord
-            )
+            val addr = Mux(slotCtx(i).markWord(1), slotCtx(i).markWord ^ U"x2".resize(GCElementWidth), slotCtx(i).markWord)
 
             issueReq(m, addr, False, U(8), U(0), mmuIssued(i)) { rd =>
               gotoPlabSelectHelper(i, rd(GCElementWidth - 1 downto 0))
@@ -575,11 +554,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
             gotoPlabSelectHelper(i, slotCtx(i).markWord)
             goto(PLAB_SELECT)
           }.otherwise {
-            val addr = Mux(
-              slotCtx(i).markWord(1),
-              slotCtx(i).markWord ^ U"x2".resize(GCElementWidth),
-              slotCtx(i).markWord
-            )
+            val addr = Mux(slotCtx(i).markWord(1), slotCtx(i).markWord ^ U"x2".resize(GCElementWidth), slotCtx(i).markWord)
 
             issueReq(m, addr, False, U(8), U(0), mmuIssued(i)) { rd =>
               gotoPlabSelectHelper(i, rd(GCElementWidth - 1 downto 0))
@@ -649,10 +624,10 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
       ALLOC_CACHE.whenIsActive {
         val idx = slotCtx(i).plabTargetIdx
+        val otherIdx =  1 - idx
 
         slotCtx(i).destOopPtr := U(0)
 
-        val otherIdx =  1 - idx
         when(plabCacheValid(otherIdx) && plabCacheBuffer(0) === plabCacheBuffer(1)) {
           plabCacheValid(otherIdx) := False
         }
@@ -660,7 +635,6 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
 
         when(slotCtx(i).allocIssued || slotAllocAccept(i)) {
           slotCtx(i).allocIssued := False
-
           slotCtx(i).afterAllocCache := True
           slotCtx(i).usingPlabCacheBuffer := False
           slotCtx(i).heldPlabCacheBuffer := 0
@@ -675,7 +649,6 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
         when(slotCtx(i).allocDone) {
           when(slotCtx(i).destOopPtr === U(0, GCElementWidth bits)) {
             slotCtx(i).allocDone := False
-
             slotCtx(i).plabTargetIdx := U(1, 1 bits)
             slotCtx(i).plabForceOld := True
 
@@ -727,14 +700,10 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       }
 
       DECIDE_FORWARD_PTR.whenIsActive {
-        val new_mw = Cat(
-          slotCtx(i).destOopPtr(GCElementWidth - 1 downto 2),
-          U(3, 2 bits)
-        ).asUInt.resize(GCElementWidth)
+        val new_mw = Cat(slotCtx(i).destOopPtr(GCElementWidth - 1 downto 2), U(3, 2 bits)).asUInt.resize(GCElementWidth)
 
         // atomic cas @todo change
-        issueReq(m, slotCtx(i).srcOopPtr, True, U(8), new_mw, mmuIssued(i)) { rd =>
-        }
+        issueReq(m, slotCtx(i).srcOopPtr, True, U(8), new_mw, mmuIssued(i)) { _ => }
         when(mmuIssued(i)){
           slotCtx(i).forwardDecided := True
 
@@ -761,12 +730,9 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
           val addr = slotCtx(i).destOopPtr.resize(MMUAddrWidth)
 
           val new_age = Mux(slotCtx(i).age + 1 < 15, slotCtx(i).age + 1, slotCtx(i).age)
-          val writeValue = Mux(
-            slotCtx(i).destRegionAttr(15 downto 8) === 0 && slotCtx(i).markWord(0),
-            (slotCtx(i).markWord & ~(U"x1111" << 3).resize(GCElementWidth)) |
-              (new_age(3 downto 0).resize(8) << 3).resize(GCElementWidth),
-            slotCtx(i).markWord
-          )
+          val writeValue = Mux(slotCtx(i).destRegionAttr(15 downto 8) === 0 && slotCtx(i).markWord(0),
+            (slotCtx(i).markWord & ~(U"x1111" << 3).resize(GCElementWidth)) | (new_age(3 downto 0).resize(8) << 3).resize(GCElementWidth),
+            slotCtx(i).markWord)
 
           issueReq(m, addr, True, U(8), writeValue, mmuIssued(i)) { _ => }
 
@@ -789,11 +755,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       }
 
       GET_MONITOR_MW.whenIsActive {
-        val addr = Mux(
-          slotCtx(i).markWord(1),
-          slotCtx(i).markWord ^ U"x2".resize(GCElementWidth),
-          slotCtx(i).markWord
-        )
+        val addr = Mux(slotCtx(i).markWord(1), slotCtx(i).markWord ^ U"x2".resize(GCElementWidth), slotCtx(i).markWord)
 
         issueReq(m, addr, False, U(8), U(0), mmuIssued(i)) { rd =>
           slotCtx(i).monitor_mw := rd(GCElementWidth - 1 downto 0)
@@ -802,16 +764,10 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       }
 
       WRITE_MONITOR_MW.whenIsActive {
-        val addr = Mux(
-          slotCtx(i).markWord(1),
-          slotCtx(i).markWord ^ U"x2".resize(GCElementWidth),
-          slotCtx(i).markWord
-        )
+        val addr = Mux(slotCtx(i).markWord(1), slotCtx(i).markWord ^ U"x2".resize(GCElementWidth), slotCtx(i).markWord)
 
         val new_age = Mux(slotCtx(i).age + 1 < 15, slotCtx(i).age + 1, slotCtx(i).age)
-        val writeValue =
-          (slotCtx(i).monitor_mw & ~(U"x1111" << 3).resize(GCElementWidth)) |
-            (new_age(3 downto 0).resize(8) << 3).resize(GCElementWidth)
+        val writeValue = (slotCtx(i).monitor_mw & ~(U"x1111" << 3).resize(GCElementWidth)) | (new_age(3 downto 0).resize(8) << 3).resize(GCElementWidth)
 
         issueReq(m, addr, True, U(8), writeValue, mmuIssued(i)) { _ => }
 
@@ -855,34 +811,23 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
           val words = slotCtx(i).size >> 3
           val headSize = Mux(io.ConfigIO.UseCompressedKlassPointer, U(2), U(3))
           val cond = words >= headSize
-
           val temp_klass_ptr = Mux(cond, io.ConfigIO.intArrayKlassObj, io.ConfigIO.objectKlassObj)
 
           val writeOff0 = U(1, 64 bits)
-          val writeOff8 = Mux(
-            io.ConfigIO.UseCompressedKlassPointer,
+
+          val writeOff8 = Mux(io.ConfigIO.UseCompressedKlassPointer,
             ((temp_klass_ptr - io.ConfigIO.CompressedKlassPointerBase) >> io.ConfigIO.CompressedKlassPointerShift).resize(64),
-            temp_klass_ptr
-          )
+            temp_klass_ptr)
 
           val writeOff12_16 = ((words - headSize) * 2).resize(32)
 
-          val writeValue = Mux(
-            io.ConfigIO.UseCompressedKlassPointer,
+          val writeValue = Mux(io.ConfigIO.UseCompressedKlassPointer,
             Cat(writeOff12_16, writeOff8.resize(32), writeOff0).resize(MMUDataWidth),
-            Cat(writeOff12_16, writeOff8, writeOff0).resize(MMUDataWidth)
-          ).asUInt
+            Cat(writeOff12_16, writeOff8, writeOff0).resize(MMUDataWidth)).asUInt
 
-          val writeSize =
-            Mux(
-              io.ConfigIO.UseCompressedKlassPointer && cond,
+          val writeSize = Mux(io.ConfigIO.UseCompressedKlassPointer && cond,
               U(16),
-              Mux(
-                io.ConfigIO.UseCompressedKlassPointer,
-                U(12),
-                Mux(cond, U(20), U(16))
-              )
-            ).resize(LineBytesNumBitSize)
+              Mux(io.ConfigIO.UseCompressedKlassPointer, U(12), Mux(cond, U(20), U(16)))).resize(LineBytesNumBitSize)
 
           issueReq(m, slotCtx(i).destOopPtr, True, writeSize, writeValue, mmuIssued(i)) { _ => }
         }
@@ -909,80 +854,67 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     slotIsAllocCache(i) := slotFsm.isActive(slotFsm.ALLOC_CACHE)
     slotIsSendWork(i) := slotFsm.isActive(slotFsm.SEND_WORK)
 
-    slotStateDebug(i) := U(0)
-    when(slotFsm.isActive(slotFsm.IDLE)) {
+    if(DebugEnable) {
       slotStateDebug(i) := U(0)
-    }.elsewhen(slotFsm.isActive(slotFsm.READ_KLASS)) {
-      slotStateDebug(i) := U(1)
-    }.elsewhen(slotFsm.isActive(slotFsm.SIZE_DEICIDE)) {
-      slotStateDebug(i) := U(2)
-    }.elsewhen(slotFsm.isActive(slotFsm.DEST_ATTR_DECIDE)) {
-      slotStateDebug(i) := U(3)
-    }.elsewhen(slotFsm.isActive(slotFsm.AGE_DECIDE)) {
-      slotStateDebug(i) := U(4)
-    }.elsewhen(slotFsm.isActive(slotFsm.PLAB_SELECT)) {
-      slotStateDebug(i) := U(5)
-    }.elsewhen(slotFsm.isActive(slotFsm.READ_PLAB_PTR)) {
-      slotStateDebug(i) := U(6)
-    }.elsewhen(slotFsm.isActive(slotFsm.READ_PLAB_BUF)) {
-      slotStateDebug(i) := U(7)
-    }.elsewhen(slotFsm.isActive(slotFsm.READ_PLAB_TOPEND)) {
-      slotStateDebug(i) := U(8)
-    }.elsewhen(slotFsm.isActive(slotFsm.ALLOC_CACHE)) {
-      slotStateDebug(i) := U(9)
-    }.elsewhen(slotFsm.isActive(slotFsm.WAIT_ALLOC)) {
-      slotStateDebug(i) := U(10)
-    }.elsewhen(slotFsm.isActive(slotFsm.WRITE_FORCE_OLD)) {
-      slotStateDebug(i) := U(11)
-    }.elsewhen(slotFsm.isActive(slotFsm.DECIDE_FORWARD_PTR)) {
-      slotStateDebug(i) := U(12)
-    }.elsewhen(slotFsm.isActive(slotFsm.SEND_WORK)) {
-      slotStateDebug(i) := U(13)
-    }.elsewhen(slotFsm.isActive(slotFsm.GET_MONITOR_MW)) {
-      slotStateDebug(i) := U(14)
-    }.elsewhen(slotFsm.isActive(slotFsm.WRITE_MONITOR_MW)) {
-      slotStateDebug(i) := U(15)
-    }.elsewhen(slotFsm.isActive(slotFsm.WAIT_COPY_TRACE)) {
-      slotStateDebug(i) := U(16)
-    }.elsewhen(slotFsm.isActive(slotFsm.WRITE_FORWARDPTR_NOT_ZERO)) {
-      slotStateDebug(i) := U(17)
+      when(slotFsm.isActive(slotFsm.IDLE)) {
+        slotStateDebug(i) := U(0)
+      }.elsewhen(slotFsm.isActive(slotFsm.READ_KLASS)) {
+        slotStateDebug(i) := U(1)
+      }.elsewhen(slotFsm.isActive(slotFsm.SIZE_DEICIDE)) {
+        slotStateDebug(i) := U(2)
+      }.elsewhen(slotFsm.isActive(slotFsm.DEST_ATTR_DECIDE)) {
+        slotStateDebug(i) := U(3)
+      }.elsewhen(slotFsm.isActive(slotFsm.AGE_DECIDE)) {
+        slotStateDebug(i) := U(4)
+      }.elsewhen(slotFsm.isActive(slotFsm.PLAB_SELECT)) {
+        slotStateDebug(i) := U(5)
+      }.elsewhen(slotFsm.isActive(slotFsm.READ_PLAB_PTR)) {
+        slotStateDebug(i) := U(6)
+      }.elsewhen(slotFsm.isActive(slotFsm.READ_PLAB_BUF)) {
+        slotStateDebug(i) := U(7)
+      }.elsewhen(slotFsm.isActive(slotFsm.READ_PLAB_TOPEND)) {
+        slotStateDebug(i) := U(8)
+      }.elsewhen(slotFsm.isActive(slotFsm.ALLOC_CACHE)) {
+        slotStateDebug(i) := U(9)
+      }.elsewhen(slotFsm.isActive(slotFsm.WAIT_ALLOC)) {
+        slotStateDebug(i) := U(10)
+      }.elsewhen(slotFsm.isActive(slotFsm.WRITE_FORCE_OLD)) {
+        slotStateDebug(i) := U(11)
+      }.elsewhen(slotFsm.isActive(slotFsm.DECIDE_FORWARD_PTR)) {
+        slotStateDebug(i) := U(12)
+      }.elsewhen(slotFsm.isActive(slotFsm.SEND_WORK)) {
+        slotStateDebug(i) := U(13)
+      }.elsewhen(slotFsm.isActive(slotFsm.GET_MONITOR_MW)) {
+        slotStateDebug(i) := U(14)
+      }.elsewhen(slotFsm.isActive(slotFsm.WRITE_MONITOR_MW)) {
+        slotStateDebug(i) := U(15)
+      }.elsewhen(slotFsm.isActive(slotFsm.WAIT_COPY_TRACE)) {
+        slotStateDebug(i) := U(16)
+      }.elsewhen(slotFsm.isActive(slotFsm.WRITE_FORWARDPTR_NOT_ZERO)) {
+        slotStateDebug(i) := U(17)
+      }
     }
   }
 
-  // ==========================================================================
   // Cross-slot PLAB safety hazard
-  // ==========================================================================
   for (i <- 0 until 2) {
     val other = 1 - i
     val myIdx = slotCtx(i).plabTargetIdx
 
-    val samePlabBuffer =
-      slotValid(other) &&
-        slotCtx(other).usingPlabCacheBuffer &&
-        plabCacheValid(myIdx) &&
-        slotCtx(other).heldPlabCacheBuffer === plabCacheBuffer(myIdx)
+    val samePlabBuffer = slotValid(other) && slotCtx(other).usingPlabCacheBuffer &&
+        plabCacheValid(myIdx) && slotCtx(other).heldPlabCacheBuffer === plabCacheBuffer(myIdx)
 
-    val otherNeedBlock =
-      slotValid(other) &&
-        slotCtx(other).afterAllocCache &&
-        samePlabBuffer &&
-        (
-          !slotCtx(other).forwardDecided ||
-            slotCtx(other).forwardPtr =/= U(0, GCElementWidth bits)
-          )
+    val otherNeedBlock = slotValid(other) && slotCtx(other).afterAllocCache && samePlabBuffer &&
+        (!slotCtx(other).forwardDecided || slotCtx(other).forwardPtr =/= U(0, GCElementWidth bits))
 
     slotAllocCacheHazard(i) := otherNeedBlock
   }
 
-  // ==========================================================================
-  // PLAB cache allocation arbitration
-  // fixed priority: slot0 > slot1
-  // ==========================================================================
+  // PLAB cache allocation arbitration fixed priority: slot0 > slot1
   val plabAllocReq = Vec.fill(2)(Bool())
 
   for (i <- 0 until 2) {
     val idx = slotCtx(i).plabTargetIdx
-
     val enough = ((plabCacheEnd(idx) - plabCacheTop(idx)) / U(8)) >= slotCtx(i).size
 
     plabAllocReq(i) := slotValid(i) && slotIsPlabSelect(i) && plabCacheValid(idx) && enough && !slotAllocCacheHazard(i)
@@ -994,9 +926,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
   slotPlabAllocGrant(0) := grantPlabAlloc0
   slotPlabAllocGrant(1) := grantPlabAlloc1
 
-  // ==========================================================================
   // PLAB refill request generation
-  // ==========================================================================
   val plabRefillReq = Vec.fill(2)(Bool())
 
   for (i <- 0 until 2) {
@@ -1009,9 +939,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
         !plabRefillBusy(idx)
   }
 
-  // ==========================================================================
   // shared cache fill: klass cache
-  // ==========================================================================
   val grantKlassFill0 = klassFillValid(0)
   val grantKlassFill1 = !klassFillValid(0) && klassFillValid(1)
 
@@ -1025,9 +953,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     klassCacheReplacePtr := klassCacheReplacePtr + 1
   }
 
-  // ==========================================================================
   // shared dest attr cache fill
-  // ==========================================================================
   val grantDestAttrFill0 = destAttrFillValid(0)
   val grantDestAttrFill1 = !destAttrFillValid(0) && destAttrFillValid(1)
 
@@ -1038,9 +964,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     destAttrRegionCache := fillData
   }
 
-  // ==========================================================================
   // PLAB refill-start arbitration
-  // ==========================================================================
   val grantPlabRefill0 = plabRefillReq(0)
   val grantPlabRefill1 = !plabRefillReq(0) && plabRefillReq(1)
 
@@ -1050,7 +974,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     plabRefillBusy(idx) := True
     plabRefillOwner(idx) := U(0, 1 bits)
     slotPlabRefillGrant(0) := True
-  } elsewhen(grantPlabRefill1) {
+  } elsewhen grantPlabRefill1 {
     val idx = slotCtx(1).plabTargetIdx
 
     plabRefillBusy(idx) := True
@@ -1058,9 +982,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     slotPlabRefillGrant(1) := True
   }
 
-  // ==========================================================================
   // PLAB pointer fill
-  // ==========================================================================
   for (j <- 0 until 2) {
     when(plabPtrFillValid(0) && plabPtrFillIdx(0) === U(j, 1 bits)) {
       plabCacheBufferPtr(j) := plabPtrFillData(0)
@@ -1069,9 +991,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
   }
 
-  // ==========================================================================
   // PLAB buffer fill
-  // ==========================================================================
   for (j <- 0 until 2) {
     when(plabBufFillValid(0) && plabBufFillIdx(0) === U(j, 1 bits)) {
       plabCacheBuffer(j) := plabBufFillData(0)
@@ -1082,9 +1002,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
   }
 
-  // ==========================================================================
   // PLAB top/end fill
-  // ==========================================================================
   for (j <- 0 until 2) {
     when(plabTopEndFillValid(0) && plabTopEndFillIdx(0) === U(j, 1 bits)) {
       plabCacheTop(j) := plabTopFillData(0)
@@ -1103,9 +1021,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
   }
 
-  // ==========================================================================
   // ToCopySurvivor.isTypeArray pulse arbitration
-  // ==========================================================================
   val grantTypeArray0 = typeArrayPending(0)
   val grantTypeArray1 = !typeArrayPending(0) && typeArrayPending(1)
 
@@ -1120,9 +1036,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
   }
 
-  // ==========================================================================
   // ToCopySurvivor.Done pulse arbitration
-  // ==========================================================================
   val grantDone0 = survivorDonePending(0)
   val grantDone1 = !survivorDonePending(0) && survivorDonePending(1)
 
@@ -1138,9 +1052,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
   }
 
-  // ==========================================================================
   // ToFetch forwarding pulse arbitration
-  // ==========================================================================
   val grantFetch0 = toFetchPending(0)
   val grantFetch1 = !toFetchPending(0) && toFetchPending(1)
 
@@ -1157,16 +1069,11 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
   }
 
-  // ==========================================================================
   // copy arbitration
-  // ==========================================================================
   val wantCopy = Vec.fill(2)(Bool())
 
   for (i <- 0 until 2) {
-    wantCopy(i) :=
-      slotValid(i) &&
-        slotIsSendWork(i) &&
-        !slotCtx(i).copyIssued
+    wantCopy(i) := slotValid(i) && slotIsSendWork(i) && !slotCtx(i).copyIssued
   }
 
   when(!copyBusy) {
@@ -1175,27 +1082,15 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       val compressedSize = Mux(io.ConfigIO.UseCompressedKlassPointer, U(16), U(20))
 
       io.ToCopy.Valid := True
-
-      io.ToCopy.Size :=
-        Mux(
-          slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits),
+      io.ToCopy.Size := Mux(slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits),
           totalSize - compressedSize,
-          totalSize - U(8)
-        )
-
-      io.ToCopy.SrcOopPtr :=
-        Mux(
-          slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits),
+          totalSize - U(8))
+      io.ToCopy.SrcOopPtr := Mux(slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits),
           slotCtx(0).srcOopPtr + compressedSize,
-          slotCtx(0).srcOopPtr + U(8)
-        )
-
-      io.ToCopy.DestOopPtr :=
-        Mux(
-          slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits),
+          slotCtx(0).srcOopPtr + U(8))
+      io.ToCopy.DestOopPtr := Mux(slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits),
           slotCtx(0).destOopPtr + compressedSize,
-          slotCtx(0).destOopPtr + U(8)
-        )
+          slotCtx(0).destOopPtr + U(8))
 
       when(io.ToCopy.Ready) {
         slotCtx(0).copyIssued := True
@@ -1208,27 +1103,15 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       val compressedSize = Mux(io.ConfigIO.UseCompressedKlassPointer, U(16), U(20))
 
       io.ToCopy.Valid := True
-
-      io.ToCopy.Size :=
-        Mux(
-          slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits),
+      io.ToCopy.Size := Mux(slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits),
           totalSize - compressedSize,
-          totalSize - U(8)
-        )
-
-      io.ToCopy.SrcOopPtr :=
-        Mux(
-          slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits),
+          totalSize - U(8))
+      io.ToCopy.SrcOopPtr := Mux(slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits),
           slotCtx(1).srcOopPtr + compressedSize,
-          slotCtx(1).srcOopPtr + U(8)
-        )
-
-      io.ToCopy.DestOopPtr :=
-        Mux(
-          slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits),
+          slotCtx(1).srcOopPtr + U(8))
+      io.ToCopy.DestOopPtr := Mux(slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits),
           slotCtx(1).destOopPtr + compressedSize,
-          slotCtx(1).destOopPtr + U(8)
-        )
+          slotCtx(1).destOopPtr + U(8))
 
       when(io.ToCopy.Ready) {
         slotCtx(1).copyIssued := True
@@ -1239,17 +1122,12 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
   }
 
-  // ==========================================================================
   // trace arbitration
-  // ==========================================================================
   val wantTrace = Vec.fill(2)(Bool())
 
   for (i <- 0 until 2) {
-    wantTrace(i) :=
-      slotValid(i) &&
-        slotIsSendWork(i) &&
-        !slotCtx(i).traceIssued &&
-        slotCtx(i).kid =/= U(TypeArrayKlassID, 32 bits)
+    wantTrace(i) := slotValid(i) && slotIsSendWork(i) &&
+        !slotCtx(i).traceIssued && slotCtx(i).kid =/= U(TypeArrayKlassID, 32 bits)
   }
 
   when(!traceBusy) {
@@ -1264,12 +1142,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       io.ToTrace.ArrayLength := slotCtx(0).srcLength
       io.ToTrace.PartialArrayStart := U(0)
       io.ToTrace.StepIndex := (slotCtx(0).srcLength % io.ConfigIO.ChunkSize).resize(32)
-      io.ToTrace.StepNCreate :=
-        Mux(
-          slotCtx(0).srcLength > (slotCtx(0).srcLength % io.ConfigIO.ChunkSize),
-          U(1),
-          U(0)
-        ).resize(32)
+      io.ToTrace.StepNCreate := Mux(slotCtx(0).srcLength > (slotCtx(0).srcLength % io.ConfigIO.ChunkSize), U(1), U(0)).resize(32)
 
       when(io.ToTrace.Ready) {
         slotCtx(0).traceIssued := True
@@ -1288,12 +1161,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
       io.ToTrace.ArrayLength := slotCtx(1).srcLength
       io.ToTrace.PartialArrayStart := U(0)
       io.ToTrace.StepIndex := (slotCtx(1).srcLength % io.ConfigIO.ChunkSize).resize(32)
-      io.ToTrace.StepNCreate :=
-        Mux(
-          slotCtx(1).srcLength > (slotCtx(1).srcLength % io.ConfigIO.ChunkSize),
-          U(1),
-          U(0)
-        ).resize(32)
+      io.ToTrace.StepNCreate := Mux(slotCtx(1).srcLength > (slotCtx(1).srcLength % io.ConfigIO.ChunkSize), U(1), U(0)).resize(32)
 
       when(io.ToTrace.Ready) {
         slotCtx(1).traceIssued := True
@@ -1304,14 +1172,10 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     }
   }
 
-  // ==========================================================================
   // allocate arbitration
-  // ==========================================================================
   val wantAlloc = Vec.fill(2)(Bool())
 
   for (i <- 0 until 2) {
-    val idx = slotCtx(i).plabTargetIdx
-
     wantAlloc(i) := slotValid(i) && slotIsAllocCache(i) && !slotCtx(i).allocIssued && !slotAllocCacheHazard(i)
   }
 
@@ -1319,12 +1183,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
     when(wantAlloc(0)) {
       io.ToAllocate.Valid := True
       io.ToAllocate.Size := slotCtx(0).size
-      io.ToAllocate.DestAttrType :=
-        Mux(
-          slotCtx(0).plabForceOld,
-          U(1, 8 bits),
-          slotCtx(0).destRegionAttr(15 downto 8)
-        )
+      io.ToAllocate.DestAttrType := Mux(slotCtx(0).plabForceOld, U(1, 8 bits), slotCtx(0).destRegionAttr(15 downto 8))
 
       when(io.ToAllocate.Ready) {
         slotCtx(0).allocIssued := True
@@ -1332,15 +1191,10 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCParameters {
         allocBusy := True
         allocOwner := U(0, 1 bits)
       }
-    } elsewhen(wantAlloc(1)) {
+    } elsewhen wantAlloc(1) {
       io.ToAllocate.Valid := True
       io.ToAllocate.Size := slotCtx(1).size
-      io.ToAllocate.DestAttrType :=
-        Mux(
-          slotCtx(1).plabForceOld,
-          U(1, 8 bits),
-          slotCtx(1).destRegionAttr(15 downto 8)
-        )
+      io.ToAllocate.DestAttrType := Mux(slotCtx(1).plabForceOld, U(1, 8 bits), slotCtx(1).destRegionAttr(15 downto 8))
 
       when(io.ToAllocate.Ready) {
         slotCtx(1).allocIssued := True

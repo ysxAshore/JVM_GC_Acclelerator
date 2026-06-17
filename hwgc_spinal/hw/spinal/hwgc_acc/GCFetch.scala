@@ -1,5 +1,7 @@
 package hwgc_acc
 
+import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO, WrapDec}
+
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
@@ -7,7 +9,7 @@ import spinal.lib.fsm._
 import scala.language.postfixOps
 
 // Data bundle for a single fetch task
-case class GcFetchData() extends Bundle with GCParameters {
+case class GcFetchData() extends Bundle with GCTopParameters with GCParameters {
   val task      = UInt(GCElementWidth bits)
   val oopType   = UInt(GCOopTypeWidth bits)
   val fromObj   = UInt(GCElementWidth bits)
@@ -27,7 +29,7 @@ case class GcFetchData() extends Bundle with GCParameters {
 //
 // No MMU arbitration inside GCFetch.
 // ============================================================================
-class GCFetch extends Module with HWParameters with GCParameters {
+class GCFetch extends Module with HWParameters with GCTopParameters with GCParameters {
   val io = new Bundle {
     val MainMreq           = master(new LocalMMUIO)
     val PushMreq           = master(new LocalMMUIO)
@@ -44,9 +46,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
     val DebugTimeStamp     = in UInt(64 bits)
   }
 
-  // ------------------------------------------------------------------------
   // Helpers for MMU ports
-  // ------------------------------------------------------------------------
   def clearMreq(m: LocalMMUIO): Unit = {
     m.Request.valid     := False
     m.Request.payload.clearAll()
@@ -91,18 +91,15 @@ class GCFetch extends Module with HWParameters with GCParameters {
   }
 
   def decodeReadOopResp(rd: UInt): UInt =
-    Mux(
-      io.ConfigIO.UseCompressedOop,
+    Mux(io.ConfigIO.UseCompressedOop,
       (io.ConfigIO.CompressedOopBase + (rd(31 downto 0) << io.ConfigIO.CompressedOopShift)).resize(GCElementWidth),
-      rd(GCElementWidth - 1 downto 0)
-    )
+      rd(GCElementWidth - 1 downto 0))
 
   def fillMwKlassLen(rd: UInt, data: GcFetchData): Unit = {
     data.markWord := rd(GCElementWidth - 1 downto 0)
     data.klassPtr := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
 
-    data.srcLength := Mux(
-      io.ConfigIO.UseCompressedKlassPointers,
+    data.srcLength := Mux(io.ConfigIO.UseCompressedKlassPointers,
       rd(GCElementWidth * 2 - 1 downto GCElementWidth + 32),
       rd(GCElementWidth * 2 + 31 downto GCElementWidth * 2)
     )
@@ -163,8 +160,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
   mainGotoSend    := False
 
   // Cross-pipeline signals
-  val targetDone = Mux(
-    main_data.oopType === U(NotArrayOop),
+  val targetDone = Mux(main_data.oopType === U(NotArrayOop),
     io.Fetch2OopProcess.Done,
     io.Fetch2ArrayProcess.Done
   )
@@ -210,15 +206,10 @@ class GCFetch extends Module with HWParameters with GCParameters {
     val WAIT_DONE     = new State
 
     IDLE.whenIsActive {
-      io.toFetch.Pop.ready := pushIsIdle &&
-                              !io.Trace2Fetch.valid &&
-                              !waitForPrefetch &&
-                              pushFollowRem === U(0)
+      io.toFetch.Pop.ready := pushIsIdle && !io.Trace2Fetch.valid && !waitForPrefetch && pushFollowRem === U(0)
 
       when(io.toFetch.Pop.fire) {
-        val popBase =
-          io.toFetch.Pop.payload -
-          io.toFetch.Pop.payload(GCOopTagWidth - 1 downto 0)
+        val popBase = io.toFetch.Pop.payload - io.toFetch.Pop.payload(GCOopTagWidth - 1 downto 0)
 
         when(preBuf(buf_bottom).task === popBase && preBufDone(buf_bottom)) {
           buf_count  := buf_count - 1
@@ -298,12 +289,8 @@ class GCFetch extends Module with HWParameters with GCParameters {
       when(unitValid && unitReady) {
         goto(WAIT_DONE)
 
-        dbg(Seq(
-          "Dispatch Task=", main_data.task,
-          " OopType=", main_data.oopType,
-          " SrcOopPtr=", main_data.fromObj,
-          " MarkWord=", main_data.markWord,
-          " KlassPtr=", main_data.klassPtr,
+        dbg(Seq("Dispatch Task=", main_data.task, " OopType=", main_data.oopType, " SrcOopPtr=", main_data.fromObj,
+          " MarkWord=", main_data.markWord, " KlassPtr=", main_data.klassPtr,
           " success!"
         ))
       }
@@ -337,8 +324,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
     val READ_MW_RESP  = new State
     val SEND          = new State
 
-    def pushYieldOk: Bool =
-      main_data.oopType === U(PartialArrayOop) || io.CopyDone || copyDoneSeen
+    def pushYieldOk: Bool = main_data.oopType === U(PartialArrayOop) || io.CopyDone || copyDoneSeen
 
     IDLE.whenIsActive {
       io.Trace2Fetch.ready := True
@@ -469,8 +455,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
             goto(READ_OOP_REQ)
 
           }.otherwise {
-            val pushCount = Mux(
-              io.toFetch.PushCount > PreFetchBufferNum,
+            val pushCount = Mux(io.toFetch.PushCount > PreFetchBufferNum,
               U(PreFetchBufferNum),
               io.toFetch.PushCount
             )
@@ -542,14 +527,9 @@ class GCFetch extends Module with HWParameters with GCParameters {
 
       when(io.PreMreq.Response.fire) {
         val rd = io.PreMreq.Response.payload.ResponseData
-
         val currentFromObj = preBuf(buf_work).fromObj
-
-        val hitFwdNow =
-          (io.gcWriteSrcOopPtr.valid &&
-           currentFromObj === io.gcWriteSrcOopPtr.srcOopPtr) ||
-          (fwdValid &&
-           currentFromObj === fwdObj)
+        val hitFwdNow = (io.gcWriteSrcOopPtr.valid && currentFromObj === io.gcWriteSrcOopPtr.srcOopPtr) ||
+          (fwdValid && currentFromObj === fwdObj)
 
         val finalMw = UInt(GCElementWidth bits)
         finalMw := rd(GCElementWidth - 1 downto 0)
@@ -574,8 +554,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
           main_data.markWord := finalMw
           main_data.klassPtr := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
 
-          main_data.srcLength := Mux(
-            io.ConfigIO.UseCompressedKlassPointers,
+          main_data.srcLength := Mux(io.ConfigIO.UseCompressedKlassPointers,
             rd(GCElementWidth * 2 - 1 downto GCElementWidth + 32),
             rd(GCElementWidth * 2 + 31 downto GCElementWidth * 2)
           )
@@ -588,8 +567,7 @@ class GCFetch extends Module with HWParameters with GCParameters {
           preBuf(buf_work).markWord := finalMw
           preBuf(buf_work).klassPtr := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
 
-          preBuf(buf_work).srcLength := Mux(
-            io.ConfigIO.UseCompressedKlassPointers,
+          preBuf(buf_work).srcLength := Mux(io.ConfigIO.UseCompressedKlassPointers,
             rd(GCElementWidth * 2 - 1 downto GCElementWidth + 32),
             rd(GCElementWidth * 2 + 31 downto GCElementWidth * 2)
           )

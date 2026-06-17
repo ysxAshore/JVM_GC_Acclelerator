@@ -1,17 +1,19 @@
-package hwgc_acc
+package hwgc_allocate
+
+import hwgc_acc.{GCLocalMMU, GCUnalignedMMUAdapter}
 
 import spinal.core._
 import spinal.lib._
 
-class GCAllocateTop(count: Int) extends Module with GCParameters {
+class GCAllocateTop(count: Int) extends Module {
   val io = new GCAllocateTopIO(count)
 
   val gcAllocateArb = new GCAllocateArb(count)
   val gcDoAllocate = new GCDoAllocate
-  val gcNewGCAllocate = new GCNewGCAlloc
+  val gcNewGCAlloc = new GCNewGCAlloc
   val gcAllocFreeRegion = new GCAllocFreeRegion
 
-  val gcLocalMMU = new GCLocalMMU
+  val gcLocalMMU = new GCLocalMMU(5)
   val gcUnalignedMMUAdapter = Array.fill(5)(new GCUnalignedMMUAdapter)
 
   for (i <- 0 until 5) {
@@ -19,12 +21,12 @@ class GCAllocateTop(count: Int) extends Module with GCParameters {
   }
 
   gcAllocateArb.io.ToDoAllocates <> io.toDoAllocates
-  gcAllocateArb.io.ToDoAllocate <> gcDoAllocate.ToDoAllocate
+  gcAllocateArb.io.ToDoAllocate <> gcDoAllocate.io.ToDoAllocate
 
   gcDoAllocate.io.MreqMainIml <> gcUnalignedMMUAdapter(0).io.in
   gcDoAllocate.io.MreqPar <> gcUnalignedMMUAdapter(1).io.in
   gcDoAllocate.io.MreqAttempt <> gcUnalignedMMUAdapter(2).io.in
-  gcDoAllocate.io.ToNewGCAlloc <> gcNewGCAllocate.ToNewGCAlloc
+  gcDoAllocate.io.ToNewGCAlloc <> gcNewGCAlloc.io.ToNewGCAlloc
   gcDoAllocate.io.ConfigIO.G1h := io.config.G1h
   gcDoAllocate.io.ConfigIO.Thread := io.config.Thread
   gcDoAllocate.io.ConfigIO.LockPtr := io.config.LockPtr
@@ -37,4 +39,6 @@ class GCAllocateTop(count: Int) extends Module with GCParameters {
 
   gcAllocFreeRegion.io.Mreq <> gcUnalignedMMUAdapter(4).io.in
   gcAllocFreeRegion.io.ConfigIO.G1h := io.config.G1h
+
+  io.mmu2llc <> gcLocalMMU.io.LastLevelCacheTLIO
 }

@@ -1,11 +1,13 @@
 package hwgc_acc
 
+import hwgc_top.{Config, HWParameters, LocalMMUIO}
+
 import spinal.core._
 import spinal.lib._
 
 import scala.language.postfixOps
 
-class GCUnalignedMMUAdapter extends Component with HWParameters with GCParameters {
+class GCUnalignedMMUAdapter extends Component with HWParameters  {
   val io = new Bundle {
     val in  = slave(new LocalMMUIO)
     val out = master(new LocalMMUIO)
@@ -131,12 +133,10 @@ class GCUnalignedMMUAdapter extends Component with HWParameters with GCParameter
     }
   }
 
-  // --------------------------------------------------------------------------
   // response bypass path
   // finalRespNow:
   //   - non-split: first response is already final
   //   - split:     only second response is final (gotOneResp already set)
-  // --------------------------------------------------------------------------
   val finalRespArrive = io.out.Response.fire && (!splitReq || gotOneResp)
   val needUpResp = !isWrite
   val finalRespNow = finalRespArrive && needUpResp

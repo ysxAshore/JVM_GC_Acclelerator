@@ -1,12 +1,14 @@
 package hwgc_acc
 
+import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO}
+
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
 
 import scala.language.postfixOps
 
-class GCTrace extends Module with GCParameters with HWParameters {
+class GCTrace extends Module with GCTopParameters with GCParameters with HWParameters {
   val io = new Bundle {
     val Mreq           = master(new LocalMMUIO)
     val ToAop          = master(new GCToAop)
@@ -269,7 +271,7 @@ class GCTrace extends Module with GCParameters with HWParameters {
         enqueueTask(task) {
           resumeTraversal()
         }
-      } elsewhen (crossesRegion) {
+      } elsewhen crossesRegion {
         when(attrType === S(-2, 8 bits)) {
           goto(CHECK_HUMONGOUS)
         } otherwise {
@@ -341,8 +343,7 @@ class GCTrace extends Module with GCParameters with HWParameters {
         val address = DestOopPtr + U(8)
         val writeValue = Mux(io.ConfigIO.UseCompressedKlassPointers,
             Cat(StepIndex, KlassPtr(31 downto 0)).resize(96),
-            Cat(StepIndex, KlassPtr).resize(96)
-          ).asUInt
+            Cat(StepIndex, KlassPtr).resize(96)).asUInt
 
         issueReq(io.Mreq, address, True, objArrayMarkKlassLenSize, writeValue, issued) { _ =>}
         when(issued) {
@@ -454,16 +455,13 @@ class GCTrace extends Module with GCParameters with HWParameters {
           goto(SCAN_FORWARD)
         }
       } elsewhen (Kid === U(InstanceRefKlassID)) {
-         // index 0 -> discovered
-         // index 1 -> referent
-         // index 2 -> discovered
+         // index 0 -> discovered index 1 -> referent index 2 -> discovered
         when(refFieldIndex === U(2)) {
           goto(FINISH)
         } otherwise {
           val discoveredOffset = Mux(io.ConfigIO.UseCompressedOops && io.ConfigIO.UseCompressedKlassPointers,
               U"x18",
-              Mux(io.ConfigIO.UseCompressedOops, U"x1c", U"x28")
-            )
+              Mux(io.ConfigIO.UseCompressedOops, U"x1c", U"x28"))
 
           val referentOffset = Mux(io.ConfigIO.UseCompressedOops && io.ConfigIO.UseCompressedKlassPointers, U"xc", U"x10")
           val fieldOffset = Mux(refFieldIndex === U(0), discoveredOffset, referentOffset)
@@ -472,10 +470,8 @@ class GCTrace extends Module with GCParameters with HWParameters {
           dest := DestOopPtr + fieldOffset
           refFieldIndex := refFieldIndex + 1
 
-          /*
-           * A Reference special field is exactly one element. This guarantees
-           * that READ_OOP selects the scalar-read path.
-           */
+          // A Reference special field is exactly one element. This guarantees
+          // that READ_OOP selects the scalar-read path.
           remainCount := 1
           resumePoint := ResumePoint.ReferenceFields
 

@@ -1,12 +1,14 @@
 package hwgc_acc
 
+import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO}
+
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
 
 import scala.language.postfixOps
 
-class GCArrayProcess extends Module with HWParameters with GCParameters {
+class GCArrayProcess extends Module with HWParameters with GCTopParameters with GCParameters {
   val io = new Bundle {
     val Mreq          = master(new LocalMMUIO)
     val Fetch2Process = slave(new GCToProcessUnit)
