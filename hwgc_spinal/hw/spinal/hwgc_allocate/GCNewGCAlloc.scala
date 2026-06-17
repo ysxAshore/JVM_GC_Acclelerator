@@ -20,9 +20,6 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
 
-  io.Mreq.RequestSize.valid := False
-  io.Mreq.RequestSize.payload.clearAll()
-
   io.Mreq.Response.ready := True
 
   io.ToNewGCAlloc.clearOut()
@@ -128,7 +125,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
     }
 
     def writeReqIssuedGo(addr: UInt, size: UInt, data: UInt, next: State): Unit = {
-      issueReq(io.Mreq, addr, True, size, data, issued) { _ => }
+      issueReq(io.Mreq, addr, True, size, data, False, False, issued) { _ => }
 
       when(issued) {
         issued := False
@@ -159,7 +156,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
     READ_NODE_INDEX.whenIsActive {
       val addr = regionPtr + OFF_NODE_INDEX
 
-      issueReq(io.Mreq, addr, False, SZ_4, U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, SZ_4, U(0), True, False, issued) { rd =>
         nodeIndex := rd(31 downto 0)
         goto(CALL_ALLOC_FREE)
       }
@@ -191,7 +188,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
 
       when(isYoungRegion && !growArrayPtrValid) {
         val addr = io.ConfigIO.G1h + OFF_GROW_ARRAY_PTR
-        issueReq(io.Mreq, addr, False, SZ_8, U(0), issued) { rd =>
+        issueReq(io.Mreq, addr, False, SZ_8, U(0), True, False, issued) { rd =>
           growArrayPtr      := rd(GCElementWidth - 1 downto 0)
           growArrayPtrValid := True
           goto(WAIT_ALLOC_AND_CONFIG)
@@ -199,7 +196,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
 
       } elsewhen(!regionAttrBaseValid) {
         val addr = io.ConfigIO.G1h + OFF_REGION_ATTR_BASE
-        issueReq(io.Mreq, addr, False, SZ_8, U(0), issued) { rd =>
+        issueReq(io.Mreq, addr, False, SZ_8, U(0), True, False, issued) { rd =>
           regionAttrBase      := rd(GCElementWidth - 1 downto 0)
           regionAttrBaseValid := True
           goto(WAIT_ALLOC_AND_CONFIG)
@@ -214,7 +211,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
         }.elsewhen(allocResult === zeroPtr) {
           when(!expandFailureValid) {
             val addr = io.ConfigIO.G1h + OFF_EXPAND_FAILURE
-            issueReq(io.Mreq, addr, False, SZ_1, U(0), issued) { rd =>
+            issueReq(io.Mreq, addr, False, SZ_1, U(0), True, False, issued) { rd =>
               expandFailureValid := True
               expandFailureCache := rd(0)
 
@@ -235,7 +232,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
       }
     }
 
-    // @todo
+    // @todo wait irq res
     WAIT_IRQ.whenIsActive {
      // when(irq.res){
      //   goto(CALL_ALLOC_FREE)
@@ -247,7 +244,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
 
     WRITE_REGION_TYPE.whenIsActive {
       val addr = newAllocRegion + OFF_REGION_TYPE
-      issueReq(io.Mreq, addr, True, SZ_4, heapRegionType.resize(GCElementWidth), issued) { _ => }
+      issueReq(io.Mreq, addr, True, SZ_4, heapRegionType.resize(GCElementWidth), False, False, issued) { _ => }
 
       when(issued) {
         issued := False
@@ -261,7 +258,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
     }
 
     READ_GROW_ARRAY.whenIsActive {
-      issueReq(io.Mreq, growArrayPtr, False, SZ_16, U(0), issued) { rd =>
+      issueReq(io.Mreq, growArrayPtr, False, SZ_16, U(0), True, False, issued) { rd =>
         arrayLen := rd(31 downto 0)
         arrayMax := rd(63 downto 32)
         dataPtr  := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
@@ -292,7 +289,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
     READ_REGION_INFO.whenIsActive {
       val addr = newAllocRegion + OFF_REGION_REMSET
 
-      issueReq(io.Mreq, addr, False, SZ_12, U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, SZ_12, U(0), True, False, issued) { rd =>
         remsetPtr := rd(GCElementWidth - 1 downto 0)
         hrmIndex  := rd(GCElementWidth + 31 downto GCElementWidth)
         remsetStateWritten := False
@@ -306,7 +303,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
 
       when(shouldWriteRemsetState && !remsetStateWritten) {
         val addr = remsetPtr + OFF_REMSET_STATE
-        issueReq(io.Mreq, addr, True, SZ_4, remsetStateValue, issued) { _ => }
+        issueReq(io.Mreq, addr, True, SZ_4, remsetStateValue, False, False, issued) { _ => }
 
         when(issued) {
           issued := False
@@ -315,7 +312,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
 
       } otherwise {
         val writeValue = needsRemsetUpdate.asUInt.resize(GCElementWidth)
-        issueReq(io.Mreq, regionAttrAddr, True, SZ_1, writeValue, issued) { _ => }
+        issueReq(io.Mreq, regionAttrAddr, True, SZ_1, writeValue, False, False, issued) { _ => }
 
         when(issued) {
           finish(newAllocRegion)

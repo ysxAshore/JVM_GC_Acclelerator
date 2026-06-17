@@ -19,8 +19,6 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
 
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
-  io.Mreq.RequestSize.valid := False
-  io.Mreq.RequestSize.payload.clearAll()
   io.Mreq.Response.ready := True
 
   io.ToParAllocate.clearOut()
@@ -74,7 +72,7 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       when(!region_ptr_valid(destAttrIdx)){
         when(destAttrIdx === 0){
           val addr = allocatorPtr + U"x28"
-          issueReq(io.Mreq, addr, False, U(0), U(0), issued){ rd =>
+          issueReq(io.Mreq, addr, False, U(0), U(0), True, False, issued){ rd =>
             region_ptr_valid(destAttrIdx) := True
             region_ptr_cache(destAttrIdx) := rd(GCElementWidth - 1 downto 0)
             goto(s2)
@@ -92,7 +90,7 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
     s2.whenIsActive {
       when(!alloc_region_valid(destAttrIdx)){
         val addr = region_ptr_cache(destAttrIdx) + U"x8"
-        issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
+        issueReq(io.Mreq, addr, False, U(8), U(0), True, False, issued) { rd =>
           alloc_region_valid(destAttrIdx) := True
           alloc_region_cache(destAttrIdx) := rd(GCElementWidth - 1 downto 0)
           goto(s3)

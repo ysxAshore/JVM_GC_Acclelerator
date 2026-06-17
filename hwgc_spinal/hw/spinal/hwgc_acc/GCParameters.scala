@@ -512,5 +512,3 @@ class GCAccTopIO extends Bundle {
   val config = slave(new GCAccCtrl2Top)
   val toDoAllocate = master(new GCToDoAllocate)
 }
-
-

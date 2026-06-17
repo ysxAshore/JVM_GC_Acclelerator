@@ -18,7 +18,6 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
   io.in.ConherentRequsetSourceID.payload.clearAll()
 
   io.out.Request.payload.clearAll()
-  io.out.RequestSize.payload.clearAll()
 
   io.in.Response.valid := False
   io.in.Response.payload.clearAll()
@@ -30,10 +29,12 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
   val sendBeat1Pending = RegInit(False)
   val gotOneResp       = RegInit(False)
 
-  val size    = RegInit(U(0, LineBytesNumBitSize bits))
-  val addr    = RegInit(U(0, MMUAddrWidth bits))
-  val isWrite = RegInit(False)
-  val reqData = RegInit(U(0, MMUDataWidth bits))
+  val size          = RegInit(U(0, LineBytesNumBitSize bits))
+  val addr          = RegInit(U(0, MMUAddrWidth bits))
+  val reqData       = RegInit(U(0, MMUDataWidth bits))
+  val isWrite       = RegInit(False)
+  val needResponse  = RegInit(False)
+  val needDoCmpXchg = RegInit(False)
 
   val firstSourceID  = RegInit(U(0, LLCSourceMaxNumBitSize bits))
   val secondSourceID = RegInit(U(0, LLCSourceMaxNumBitSize bits))
@@ -55,7 +56,7 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
   val secondBytes = size - firstBytes
 
   val inOffsetNow        = io.in.Request.payload.RequestVirtualAddr(log2Up(LineBytesNum) - 1 downto 0)
-  val inCrossBeatNow     = inOffsetNow + io.in.RequestSize.payload > LineBytesNum
+  val inCrossBeatNow     = inOffsetNow + io.in.Request.payload.RequestSize > LineBytesNum
   val alignedAccessNow   = inOffsetNow === 0 && !inCrossBeatNow
   val directAlignedReqNow = !busy && !respBufValid && io.in.Request.valid && alignedAccessNow
 
@@ -68,10 +69,12 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
   io.in.Request.ready := (!busy && !respBufValid) && (!alignedAccessNow || io.out.Request.ready)
 
   when(io.in.Request.fire) {
-    size    := io.in.RequestSize.payload
-    addr    := io.in.Request.payload.RequestVirtualAddr
-    reqData := io.in.Request.payload.RequestData
-    isWrite := io.in.Request.payload.RequestType_isWrite
+    size          := io.in.Request.payload.RequestSize
+    addr          := io.in.Request.payload.RequestVirtualAddr
+    reqData       := io.in.Request.payload.RequestData
+    isWrite       := io.in.Request.payload.RequestType_isWrite
+    needResponse  := io.in.Request.payload.NeedResponse
+    needDoCmpXchg := io.in.Request.payload.NeedDoCmpxChg
 
     splitReq := inCrossBeatNow && !alignedAccessNow
     when(alignedAccessNow) {
@@ -90,7 +93,6 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
   val issueBeat1 = busy && !sendBeat0Pending && sendBeat1Pending
 
   io.out.Request.valid := issueBeat0 || issueBeat1 || directAlignedReqNow
-  io.out.RequestSize.valid := directAlignedReqNow
 
   when(directAlignedReqNow) {
     io.out.Request.payload.RequestVirtualAddr := io.in.Request.payload.RequestVirtualAddr
@@ -98,12 +100,16 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
     io.out.Request.payload.RequestData := io.in.Request.payload.RequestData
     io.out.Request.payload.RequestWStrb := io.in.Request.payload.RequestWStrb
     io.out.Request.payload.RequestType_isWrite := io.in.Request.payload.RequestType_isWrite
-    io.out.RequestSize.payload := io.in.RequestSize.payload
+    io.out.Request.payload.RequestSize := io.in.Request.payload.RequestSize
+    io.out.Request.payload.NeedResponse := io.in.Request.payload.NeedResponse
+    io.out.Request.payload.NeedDoCmpxChg := io.in.Request.payload.NeedDoCmpxChg
   }
 
   when(issueBeat0) {
     io.out.Request.payload.RequestVirtualAddr := alignedAddr
     io.out.Request.payload.RequestSourceID := io.out.ConherentRequsetSourceID.payload
+    io.out.Request.payload.NeedDoCmpxChg := needDoCmpXchg
+    io.out.Request.payload.NeedResponse := needResponse
     when(isWrite) {
       io.out.Request.payload.RequestData := writeData0
       io.out.Request.payload.RequestWStrb := mask0
@@ -114,6 +120,8 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
   when(issueBeat1) {
     io.out.Request.payload.RequestVirtualAddr := alignedAddr + LineBytesNum
     io.out.Request.payload.RequestSourceID := io.out.ConherentRequsetSourceID.payload
+    io.out.Request.payload.NeedDoCmpxChg := needDoCmpXchg
+    io.out.Request.payload.NeedResponse := needResponse
     when(isWrite) {
       io.out.Request.payload.RequestData := writeData1
       io.out.Request.payload.RequestWStrb := mask1
@@ -138,7 +146,7 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
   //   - non-split: first response is already final
   //   - split:     only second response is final (gotOneResp already set)
   val finalRespArrive = io.out.Response.fire && (!splitReq || gotOneResp)
-  val needUpResp = !isWrite
+  val needUpResp = needResponse
   val finalRespNow = finalRespArrive && needUpResp
 
   val bypassRespPayload = cloneOf(io.in.Response.payload)
@@ -186,7 +194,6 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
   io.out.Response.ready := busy && (firstSplitRespCanArrive || finalRespCanArrive)
 
   // response state update
-
   // 1) buffered final response consumed by upstream
   when(respBufValid && io.in.Response.ready) {
     respBufValid := False

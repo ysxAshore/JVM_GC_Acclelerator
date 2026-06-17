@@ -30,8 +30,6 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   // --- MMU port defaults ---
   io.Mreq.Request.valid         := False
   io.Mreq.Request.payload.clearAll()
-  io.Mreq.RequestSize.valid     := False
-  io.Mreq.RequestSize.payload.clearAll()
   io.Mreq.Response.ready        := True
 
   io.ConfigIO.Done      := False
@@ -157,7 +155,10 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       val spillData = Vec((0 until 4).map(i => stack_data.readAsync(spillPtrs(i))))
       val packData  = Cat(spillData.reverse).asUInt
 
-      issueReq(io.Mreq, addr, True, reqNum * U(8), packData, issued) { _ =>
+      issueReq(io.Mreq, addr, True, reqNum * U(8), packData, False, False, issued) { _ => }
+      when(issued){
+        issued := False
+
         val newQueueBottom = queInc(queue_bottom, reqNum)
         stack_bottom := stkInc(stack_bottom, reqNum)
         queue_bottom := newQueueBottom
@@ -186,7 +187,7 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       val readIndex       = queDec(queue_bottom, reqNum)
       val readAddr        = elemAddr(readIndex)
 
-      issueReq(io.Mreq, readAddr, False, reqNum * U(8), U(0), issued) { rd =>
+      issueReq(io.Mreq, readAddr, False, reqNum * U(8), U(0), True, False, issued) { rd =>
         val elems = rd.subdivideIn(GCElementWidth bits)
         val newQueueBottom = queDec(queue_bottom, canReceive)
 
@@ -234,10 +235,11 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       io.Mreq.Request.payload.RequestType_isWrite := True
       io.Mreq.Request.payload.RequestVirtualAddr := addr
       io.Mreq.Request.payload.RequestSourceID := io.Mreq.ConherentRequsetSourceID.payload
+      io.Mreq.Request.payload.NeedDoCmpxChg := False
       io.Mreq.Request.payload.RequestWStrb := getWstrb(size.resize(LineBytesNumBitSize))
+      io.Mreq.Request.payload.NeedResponse := False
       io.Mreq.Request.payload.RequestData := data
-      io.Mreq.RequestSize.valid := valid
-      io.Mreq.RequestSize.payload := size
+      io.Mreq.Request.payload.RequestSize := size.resize(LineBytesNumBitSize)
       io.Mreq.Response.ready := True
 
       when(io.Mreq.Request.fire || !valid) {

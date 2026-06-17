@@ -17,8 +17,6 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
   // Default outputs
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
-  io.Mreq.RequestSize.valid := False
-  io.Mreq.RequestSize.payload.clearAll()
 
   io.Mreq.Response.ready := True
 
@@ -85,14 +83,14 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
     }
 
     def readReqGo(addr: UInt, size: UInt, next: State)(body: UInt => Unit): Unit = {
-      issueReq(io.Mreq, addr, False, size, U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, size, U(0), True, False, issued) { rd =>
         body(rd)
         goto(next)
       }
     }
 
     def writeReqIssuedGo(addr: UInt, size: UInt, data: UInt, next: State): Unit = {
-      issueReq(io.Mreq, addr, True, size, data, issued) { _ => }
+      issueReq(io.Mreq, addr, True, size, data, False, False, issued) { _ => }
 
       when(issued) {
         issued := False
@@ -133,7 +131,7 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
       val addr     = listBaseAddr + Mux(listBaseAligned, OFF_FULL_LINE, OFF_HALF_LINE)
       val readSize = Mux(listBaseAligned, SZ_16, SZ_32)
 
-      issueReq(io.Mreq, addr, False, readSize, U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, readSize, U(0), True, False, issued) { rd =>
         when(listBaseAligned) {
           listTailPtr := rd(GCElementWidth - 1 downto 0)
           listLastPtr := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
@@ -160,7 +158,7 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
       } otherwise {
         val addr = candidate + selectedLinkOffset
 
-        issueReq(io.Mreq, addr, False, SZ_8, U(0), issued) { rd =>
+        issueReq(io.Mreq, addr, False, SZ_8, U(0), True, False, issued) { rd =>
           newAllocRegion := candidate
           neighborPtr := rd(GCElementWidth - 1 downto 0)
 
@@ -217,7 +215,7 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
     WRITE_LIST_LENGTH.whenIsActive {
       val addr = freeListPtr + OFF_LIST_BASE
 
-      issueReq(io.Mreq, addr, True, SZ_8, listLength, issued) { _ => }
+      issueReq(io.Mreq, addr, True, SZ_8, listLength, False, False, issued) { _ => }
 
       when(issued) {
         finish(newAllocRegion)

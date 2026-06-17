@@ -20,8 +20,6 @@ class GCAllocate extends Module with GCTopParameters with HWParameters {
   // Default IO
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
-  io.Mreq.RequestSize.valid := False
-  io.Mreq.RequestSize.payload.clearAll()
   io.Mreq.Response.ready := True
 
   io.ToAllocate.clearOut()
@@ -163,14 +161,14 @@ class GCAllocate extends Module with GCTopParameters with HWParameters {
     }
 
     def issueLatchedRead(nextState: State)(onRead: Bits => Unit): Unit = {
-      issueReq(io.Mreq, memReqAddr, False, memReqSize, U(0), issued) { rd =>
+      issueReq(io.Mreq, memReqAddr, False, memReqSize, U(0), True, False, issued) { rd =>
         onRead(rd.asBits)
         goto(nextState)
       }
     }
 
-    def issueLatchedWrite(nextState: State)(onAccepted: => Unit = {}): Unit = {
-      issueReq(io.Mreq, memReqAddr, True, memReqSize, memReqData, issued) { _ => }
+    def issueLatchedWriteWithoutResp(nextState: State)(onAccepted: => Unit = {}): Unit = {
+      issueReq(io.Mreq, memReqAddr, True, memReqSize, memReqData, False, False, issued) { _ => }
 
       when(issued) {
         issued := False
@@ -335,7 +333,7 @@ class GCAllocate extends Module with GCTopParameters with HWParameters {
 
     val sWriteOldPlabHeader: State = new State {
       whenIsActive {
-        issueLatchedWrite(sWaitParAllocate)()
+        issueLatchedWriteWithoutResp(sWaitParAllocate)()
       }
     }
 
@@ -373,7 +371,7 @@ class GCAllocate extends Module with GCTopParameters with HWParameters {
 
     val sWriteRefillLow32B: State = new State {
       whenIsActive {
-        issueLatchedWrite(sWriteRefillHigh32B) {
+        issueLatchedWriteWithoutResp(sWriteRefillHigh32B) {
           setMemWrite(refillHiAddr, U(16), refillHiData)
         }
       }
@@ -381,7 +379,7 @@ class GCAllocate extends Module with GCTopParameters with HWParameters {
 
     val sWriteRefillHigh32B: State = new State {
       whenIsActive {
-        issueLatchedWrite(sIdle) {
+        issueLatchedWriteWithoutResp(sIdle) {
           io.ToAllocate.Done := True
           io.ToAllocate.DestObjPtr := destObjPtr
           io.ToAllocate.PlabRefillFailed := False
@@ -393,7 +391,7 @@ class GCAllocate extends Module with GCTopParameters with HWParameters {
 
     val sWriteCollapseBuffer: State = new State {
       whenIsActive {
-        issueLatchedWrite(sSendDirectRetry) {
+        issueLatchedWriteWithoutResp(sSendDirectRetry) {
           par_allocate_return := True
           plab_refill_failed := True
         }

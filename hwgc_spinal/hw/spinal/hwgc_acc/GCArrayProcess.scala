@@ -21,9 +21,6 @@ class GCArrayProcess extends Module with HWParameters with GCTopParameters with 
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
 
-  io.Mreq.RequestSize.valid := False
-  io.Mreq.RequestSize.payload.clearAll()
-
   io.Mreq.Response.ready := True
 
   io.Fetch2Process.clearOut()
@@ -101,7 +98,7 @@ class GCArrayProcess extends Module with HWParameters with GCTopParameters with 
     READ_DEST_LEN.whenIsActive {
       val addr = destOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U(12), U(16))
 
-      issueReq(io.Mreq, addr.resize(MMUAddrWidth), False, U(4), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr.resize(MMUAddrWidth), False, U(4), U(0), True, False, issued) { rd =>
         dest_length := rd(31 downto 0)
         goto(CALC_STEP)
       }
@@ -123,7 +120,7 @@ class GCArrayProcess extends Module with HWParameters with GCTopParameters with 
         goto(SEND_TRACE)
 
       } otherwise {
-        issueReq(io.Mreq, heapRegionAddrLookup, False, U(8), U(0), issued) { rd =>
+        issueReq(io.Mreq, heapRegionAddrLookup, False, U(8), U(0), True, False, issued) { rd =>
           heap_region := rd(GCElementWidth - 1 downto 0)
           goto(READ_HUMONGOUS)
         }
@@ -133,7 +130,7 @@ class GCArrayProcess extends Module with HWParameters with GCTopParameters with 
     READ_HUMONGOUS.whenIsActive {
       val addr = (heap_region.resize(MMUAddrWidth) + U"xbc").resize(MMUAddrWidth)
 
-      issueReq(io.Mreq, addr, False, U(4), U(0),issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(4), U(0), True, False, issued) { rd =>
         heapRegionCacheValid(heapRegionCacheReplacePtr) := True
         heapRegionCacheTag(heapRegionCacheReplacePtr)   := heapRegionAddrLookup
         heapRegionCache(heapRegionCacheReplacePtr)      := (rd(31 downto 0) & U(2, 32 bits)) =/= U(0)

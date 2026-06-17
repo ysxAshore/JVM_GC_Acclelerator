@@ -148,9 +148,9 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   io.readMReq.Request.payload.RequestType_isWrite := False
   io.readMReq.Request.payload.RequestWStrb := 0
   io.readMReq.Request.payload.RequestData := 0
-
-  io.readMReq.RequestSize.valid := readReqValid
-  io.readMReq.RequestSize.payload := U(BeatBytes, LineBytesNumBitSize bits)
+  io.readMReq.Request.payload.RequestSize := U(BeatBytes, LineBytesNumBitSize bits)
+  io.readMReq.Request.payload.NeedResponse := True
+  io.readMReq.Request.payload.NeedDoCmpxChg := False
 
   val readReqFire = io.readMReq.Request.fire
 
@@ -196,9 +196,9 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   io.writeMReq.Request.payload.RequestType_isWrite := True
   io.writeMReq.Request.payload.RequestWStrb := genMask(thisBeatWriteLen, curDstOff)
   io.writeMReq.Request.payload.RequestData := (repackLowBeat |<< (curDstOff << 3)).resized
-
-  io.writeMReq.RequestSize.valid := writeReqValid
-  io.writeMReq.RequestSize.payload := thisBeatWriteLen.resize(LineBytesNumBitSize)
+  io.writeMReq.Request.payload.RequestSize := thisBeatWriteLen.resize(LineBytesNumBitSize)
+  io.writeMReq.Request.payload.NeedResponse := False
+  io.writeMReq.Request.payload.NeedDoCmpxChg := False
 
   val writeFire = io.writeMReq.Request.fire
 

@@ -50,22 +50,20 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
   def clearMreq(m: LocalMMUIO): Unit = {
     m.Request.valid     := False
     m.Request.payload.clearAll()
-    m.RequestSize.valid := False
-    m.RequestSize.payload.clearAll()
     m.Response.ready    := False
   }
 
   def driveReadReq(m: LocalMMUIO, addr: UInt, sizeBytes: UInt): Unit = {
     m.Request.valid     := True
-    m.RequestSize.valid := True
 
+    m.Request.payload.NeedResponse         := True
+    m.Request.payload.NeedDoCmpxChg        := False
+    m.Request.payload.RequestSize          := sizeBytes.resize(LineBytesNumBitSize)
     m.Request.payload.RequestWStrb         := U(0)
     m.Request.payload.RequestData          := U(0)
     m.Request.payload.RequestType_isWrite  := False
     m.Request.payload.RequestSourceID      := m.ConherentRequsetSourceID.payload
     m.Request.payload.RequestVirtualAddr   := addr
-
-    m.RequestSize.payload := sizeBytes.resize(LineBytesNumBitSize)
   }
 
   clearMreq(io.MainMreq)

@@ -21,8 +21,6 @@ class GCAop extends Module with GCTopParameters with HWParameters {
 
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
-  io.Mreq.RequestSize.valid := False
-  io.Mreq.RequestSize.payload.clearAll()
   io.Mreq.Response.ready := True
 
   object overall_state extends SpinalEnum {
@@ -103,7 +101,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
         }.otherwise{
           when(!byte_about_valid){
             val addr = io.ConfigIO.CardTablePtr + U"x38"
-            issueReq(io.Mreq, addr, False, U(16), U(0), issued) { rd =>
+            issueReq(io.Mreq, addr, False, U(16), U(0), True, False, issued) { rd =>
               byte_about_valid := True
               byte_map_cache := rd(GCElementWidth -1 downto 0)
               byte_map_base_cache := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
@@ -122,7 +120,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
       card_index := byte_map_entry - byte_map_cache
       when(!last_index_valid) {
         val addr = io.ConfigIO.ParScanThreadStatePtr + U"x1b0"
-        issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
+        issueReq(io.Mreq, addr, False, U(8), U(0), True, False, issued) { rd =>
           last_index_valid := True
           last_index_cache := rd(GCElementWidth - 1 downto 0)
           state := overall_state.states(2)
@@ -139,7 +137,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
       }.otherwise{
         when(!parScanOff40_valid) {
           val addr = io.ConfigIO.ParScanThreadStatePtr + U"x40"
-          issueReq(io.Mreq, addr, False, U(32), U(0), issued) { rd =>
+          issueReq(io.Mreq, addr, False, U(32), U(0), True, False, issued) { rd =>
             offset40_cache := rd(GCElementWidth - 1 downto 0)
             index_cache := (rd(GCElementWidth * 2 - 1 downto GCElementWidth) / U(8)).resize(GCElementWidth)
             buffer_cache := rd(GCElementWidth * 4 - 1 downto GCElementWidth * 3)
@@ -157,7 +155,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
         old_node := U(0)
         when(!parScanOff20_valid){
           val addr = io.ConfigIO.ParScanThreadStatePtr + U"x20"
-          issueReq(io.Mreq, addr, False, U(32), U(0), issued) { rd =>
+          issueReq(io.Mreq, addr, False, U(32), U(0), True, False, issued) { rd =>
             node_allocator_ptr_cache := rd(GCElementWidth - 1 downto 0)
             offset30_cache := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
             offset38_cache := rd(GCElementWidth * 4 - 1 downto GCElementWidth * 3)
@@ -188,8 +186,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
     is(overall_state.states(5)){
       val addr = old_node
       val writeValue = Cat(offset30_cache, U(0, GCElementWidth bits)).asUInt
-      issueReq(io.Mreq, addr, True, U(16), writeValue, issued){ _ =>
-      }
+      issueReq(io.Mreq, addr, True, U(16), writeValue, False, False, issued){ _ => }
       when(issued){
         issued := False
         offset30_cache := old_node
@@ -200,7 +197,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
     is(overall_state.states(6)){
       new_top := U(0)
       val addr = node_allocator_ptr_cache + U"x80"
-      issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
+      issueReq(io.Mreq, addr, False, U(8), U(0), True, False, issued) { rd =>
         node := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(7)
       }
@@ -209,7 +206,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
     is(overall_state.states(7)){
       when(node =/= U(0)){
         val addr = node + U(8)
-        issueReq(io.Mreq, addr, False, U(8), U(0), issued) { rd =>
+        issueReq(io.Mreq, addr, False, U(8), U(0), True, False, issued) { rd =>
           new_top := rd(GCElementWidth - 1 downto 0)
           state := overall_state.states(8)
         }
@@ -220,8 +217,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
 
     is(overall_state.states(8)){
       val addr = node + U(8)
-      issueReq(io.Mreq, addr, True, U(8), U(0), issued) { _ =>
-      }
+      issueReq(io.Mreq, addr, True, U(8), U(0), False, False, issued) { _ => }
       when(issued){
         issued := False
         state := overall_state.states(9)
@@ -230,8 +226,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
 
     is(overall_state.states(9)){
       val addr = node_allocator_ptr_cache + U"x80"
-      issueReq(io.Mreq, addr, True, U(8), new_top, issued) { _ =>
-      }
+      issueReq(io.Mreq, addr, True, U(8), new_top, False, False, issued) { _ => }
       when(issued){
         issued := False
         state := Mux(node === U(0), overall_state.states(10), overall_state.states(11))
@@ -251,7 +246,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
       }.otherwise {
         buffer_cache := node + U"x10"
       }
-      issueReq(io.Mreq, node_allocator_ptr_cache, False, U(8), U(0), issued) { rd =>
+      issueReq(io.Mreq, node_allocator_ptr_cache, False, U(8), U(0), True, False, issued) { rd =>
         index_cache := rd(GCElementWidth - 1 downto 0)
         state := overall_state.states(12)
       }
@@ -272,8 +267,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
       val writeSize      = nextWrcnt * 8
 
       when(shouldFlush){
-        issueReq(io.Mreq, addr, True, writeSize, nextWriteValue, issued) { _ =>
-        }
+        issueReq(io.Mreq, addr, True, writeSize, nextWriteValue, False, False, issued) { _ => }
         when(issued){
           issued           := False
           index_cache      := index

@@ -15,10 +15,6 @@ class GCTopMMUArb extends Module with HWParameters with GCTopParameters {
 
   // defaults
   io.LastLevelCacheTLIO.Request.payload.clearAll()
-
-  io.LastLevelCacheTLIO.RequestSize.valid := False
-  io.LastLevelCacheTLIO.RequestSize.payload.clearAll()
-
   io.LastLevelCacheTLIO.Response.ready := False
 
   for (i <- 0 until 2) {
@@ -58,14 +54,9 @@ class GCTopMMUArb extends Module with HWParameters with GCTopParameters {
   when(hasRequest) {
     when(choose1) {
       io.LastLevelCacheTLIO.Request.payload.assignAllByName(io.localMMUIOs(1).Request.payload)
-      io.LastLevelCacheTLIO.RequestSize.payload := io.localMMUIOs(1).RequestSize.payload
     } otherwise {
       io.LastLevelCacheTLIO.Request.payload.assignAllByName(io.localMMUIOs(0).Request.payload)
-      io.LastLevelCacheTLIO.RequestSize.payload := io.localMMUIOs(0).RequestSize.payload
     }
-
-    // 你的 Request 和 RequestSize 是绑定的，所以这里跟 Request.valid 同步
-    io.LastLevelCacheTLIO.RequestSize.valid := True
   }
 
   val reqFire = io.LastLevelCacheTLIO.Request.valid && io.LastLevelCacheTLIO.Request.ready

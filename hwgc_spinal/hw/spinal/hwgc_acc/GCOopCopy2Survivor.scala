@@ -74,12 +74,8 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
     m.Request.valid := False
     m.Request.payload.clearAll()
 
-    m.RequestSize.valid := False
-    m.RequestSize.payload.clearAll()
-
     m.Response.ready := True
   }
-
   clearMreq(io.Mreq0)
   clearMreq(io.Mreq1)
 
@@ -420,7 +416,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
           plabCacheTop(otherIdx) := newTop
         }
 
-        issueReq(m, (plabCacheBuffer(idx) + U"x30").resize(MMUAddrWidth), True, U(8), newTop, mmuIssued(i)) { _ => }
+        issueReq(m, (plabCacheBuffer(idx) + U"x30").resize(MMUAddrWidth), True, U(8), newTop, False, False, mmuIssued(i)) { _ => }
 
         when(mmuIssued(i)) {
           plabCacheTop(idx) := newTop
@@ -453,7 +449,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
           val newKlassPtr = klassLookupPtr(i)
           val addr = (newKlassPtr + U(8)).resize(MMUAddrWidth)
 
-          issueReq(m, addr, False, U(8), U(0), mmuIssued(i)) { rd =>
+          issueReq(m, addr, False, U(8), U(0), True, False, mmuIssued(i)) { rd =>
             val lhVal = rd(31 downto 0)
             val kidVal = rd(63 downto 32)
 
@@ -486,7 +482,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
           when(slotCtx(i).kid =/= U(InstanceMirrorKlassID, 32 bits)) {
             slotCtx(i).size := (slotCtx(i).lh >> U(3)).resize(32)
           }.otherwise {
-            issueReq(m, slotCtx(i).srcOopPtr + U"x20", False, U(8), U(0), mmuIssued(i)) { rd =>
+            issueReq(m, slotCtx(i).srcOopPtr + U"x20", False, U(8), U(0), True, False, mmuIssued(i)) { rd =>
               slotCtx(i).size := rd(31 downto 0)
               goto(DEST_ATTR_DECIDE)
             }
@@ -514,7 +510,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
         val cachedPlabIdx = Mux(highSelected, destAttrRegionCache(31 downto 24), destAttrRegionCache(15 downto 8)).resize(1)
 
         when(!destAttrRegionValid) {
-          issueReq(m, destAttrBase, False, U(4), U(0), mmuIssued(i)) { rd =>
+          issueReq(m, destAttrBase, False, U(4), U(0), True, False, mmuIssued(i)) { rd =>
             slotCtx(i).destAttrPtr := destAttrBase + Mux(highSelected, U(2), U(0))
             slotCtx(i).destRegionAttr := Mux(highSelected, rd(31 downto 16), rd(15 downto 0))
             slotCtx(i).plabTargetIdx := Mux(highSelected, rd(31 downto 24), rd(15 downto 8)).resize(1)
@@ -537,7 +533,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
           } otherwise {
             val addr = Mux(slotCtx(i).markWord(1), slotCtx(i).markWord ^ U"x2".resize(GCElementWidth), slotCtx(i).markWord)
 
-            issueReq(m, addr, False, U(8), U(0), mmuIssued(i)) { rd =>
+            issueReq(m, addr, False, U(8), U(0), True, False, mmuIssued(i)) { rd =>
               gotoPlabSelectHelper(i, rd(GCElementWidth - 1 downto 0))
               goto(PLAB_SELECT)
             }
@@ -556,7 +552,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
           }.otherwise {
             val addr = Mux(slotCtx(i).markWord(1), slotCtx(i).markWord ^ U"x2".resize(GCElementWidth), slotCtx(i).markWord)
 
-            issueReq(m, addr, False, U(8), U(0), mmuIssued(i)) { rd =>
+            issueReq(m, addr, False, U(8), U(0), True, False, mmuIssued(i)) { rd =>
               gotoPlabSelectHelper(i, rd(GCElementWidth - 1 downto 0))
               goto(PLAB_SELECT)
             }
@@ -586,7 +582,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
 
       READ_PLAB_PTR.whenIsActive {
         val addr = (io.ConfigIO.PlabAllocatorPtr + U"x10" + slotCtx(i).plabTargetIdx * U(8)).resize(MMUAddrWidth)
-        issueReq(m, addr, False, U(8), U(0), mmuIssued(i)) { rd =>
+        issueReq(m, addr, False, U(8), U(0), True, False, mmuIssued(i)) { rd =>
           plabPtrFillValid(i) := True
           plabPtrFillIdx(i) := slotCtx(i).plabTargetIdx
           plabPtrFillData(i) := rd(GCElementWidth - 1 downto 0)
@@ -597,7 +593,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
 
       READ_PLAB_BUF.whenIsActive {
         val idx = slotCtx(i).plabTargetIdx
-        issueReq(m, plabCacheBufferPtr(idx).resize(MMUAddrWidth), False, U(8), U(0), mmuIssued(i)) { rd =>
+        issueReq(m, plabCacheBufferPtr(idx).resize(MMUAddrWidth), False, U(8), U(0), True, False, mmuIssued(i)) { rd =>
           plabBufFillValid(i) := True
           plabBufFillIdx(i) := idx
           plabBufFillData(i) := rd(GCElementWidth - 1 downto 0)
@@ -610,7 +606,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
         val idx = slotCtx(i).plabTargetIdx
         val addr = (plabCacheBuffer(idx) + U"x28").resize(MMUAddrWidth)
 
-        issueReq(m, addr, False, U(32), U(0), mmuIssued(i)) { rd =>
+        issueReq(m, addr, False, U(32), U(0), True, False, mmuIssued(i)) { rd =>
           plabTopEndFillValid(i) := True
           plabTopEndFillIdx(i) := idx
           plabBottomFillData(i) := rd(GCElementWidth - 1 downto 0)
@@ -662,7 +658,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
 
             when(slotCtx(i).plabForceOld) {
               when(slotCtx(i).plab_refill_failed) {
-                issueReq(m, io.ConfigIO.ParScanThreadStatePtr + U"x17c", True, U(4), U(1), mmuIssued(i)) { _ => }
+                issueReq(m, io.ConfigIO.ParScanThreadStatePtr + U"x17c", True, U(4), U(1), False, False, mmuIssued(i)) { _ => }
               }
 
               when(mmuIssued(i) || !slotCtx(i).plab_refill_failed) {
@@ -681,7 +677,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
 
       WRITE_FORCE_OLD.whenIsActive {
         val addr = (slotCtx(i).destAttrPtr + U(1)).resize(MMUAddrWidth)
-        issueReq(m, addr, True, U(1), U(1), mmuIssued(i)) { _ => }
+        issueReq(m, addr, True, U(1), U(1), False, False, mmuIssued(i)) { _ => }
 
         when(mmuIssued(i)) {
           mmuIssued(i) := False
@@ -702,9 +698,8 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
       DECIDE_FORWARD_PTR.whenIsActive {
         val new_mw = Cat(slotCtx(i).destOopPtr(GCElementWidth - 1 downto 2), U(3, 2 bits)).asUInt.resize(GCElementWidth)
 
-        // atomic cas @todo change
-        issueReq(m, slotCtx(i).srcOopPtr, True, U(8), new_mw, mmuIssued(i)) { _ => }
-        when(mmuIssued(i)){
+        // @todo atomic cmpxchg
+        issueReq(m, slotCtx(i).srcOopPtr, True, U(8), new_mw, True, True, mmuIssued(i)) { rd =>
           slotCtx(i).forwardDecided := True
 
           when(slotCtx(i).markWord === slotCtx(i).markWord) {
@@ -734,7 +729,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
             (slotCtx(i).markWord & ~(U"x1111" << 3).resize(GCElementWidth)) | (new_age(3 downto 0).resize(8) << 3).resize(GCElementWidth),
             slotCtx(i).markWord)
 
-          issueReq(m, addr, True, U(8), writeValue, mmuIssued(i)) { _ => }
+          issueReq(m, addr, True, U(8), writeValue, False, False, mmuIssued(i)) { _ => }
 
           when(mmuIssued(i)) {
             mmuIssued(i) := False
@@ -757,7 +752,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
       GET_MONITOR_MW.whenIsActive {
         val addr = Mux(slotCtx(i).markWord(1), slotCtx(i).markWord ^ U"x2".resize(GCElementWidth), slotCtx(i).markWord)
 
-        issueReq(m, addr, False, U(8), U(0), mmuIssued(i)) { rd =>
+        issueReq(m, addr, False, U(8), U(0), True, False, mmuIssued(i)) { rd =>
           slotCtx(i).monitor_mw := rd(GCElementWidth - 1 downto 0)
           goto(WRITE_MONITOR_MW)
         }
@@ -769,7 +764,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
         val new_age = Mux(slotCtx(i).age + 1 < 15, slotCtx(i).age + 1, slotCtx(i).age)
         val writeValue = (slotCtx(i).monitor_mw & ~(U"x1111" << 3).resize(GCElementWidth)) | (new_age(3 downto 0).resize(8) << 3).resize(GCElementWidth)
 
-        issueReq(m, addr, True, U(8), writeValue, mmuIssued(i)) { _ => }
+        issueReq(m, addr, True, U(8), writeValue, False, False, mmuIssued(i)) { _ => }
 
         when(mmuIssued(i)) {
           mmuIssued(i) := False
@@ -806,7 +801,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
             plabCacheTop(otherIdx) := slotCtx(i).destOopPtr
           }
 
-          issueReq(m, plabCacheBuffer(idx) + U"x30", True, U(8), slotCtx(i).destOopPtr, mmuIssued(i)) { _ => }
+          issueReq(m, plabCacheBuffer(idx) + U"x30", True, U(8), slotCtx(i).destOopPtr, False, False, mmuIssued(i)) { _ => }
         }.otherwise {
           val words = slotCtx(i).size >> 3
           val headSize = Mux(io.ConfigIO.UseCompressedKlassPointer, U(2), U(3))
@@ -829,7 +824,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
               U(16),
               Mux(io.ConfigIO.UseCompressedKlassPointer, U(12), Mux(cond, U(20), U(16)))).resize(LineBytesNumBitSize)
 
-          issueReq(m, slotCtx(i).destOopPtr, True, writeSize, writeValue, mmuIssued(i)) { _ => }
+          issueReq(m, slotCtx(i).destOopPtr, True, writeSize, writeValue, False, False, mmuIssued(i)) { _ => }
         }
 
         when(mmuIssued(i)) {

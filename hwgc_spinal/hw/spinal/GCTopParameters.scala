@@ -79,20 +79,20 @@ trait HWParameters {
   val LLCSourceMaxNumBitSize = log2Up(LLCSourceMaxNum) + 1
 
   // helper: issueReq
-  def issueReq(port: LocalMMUIO, addr: UInt, Write: Bool, Size: UInt, WriteData: UInt, reqIssued: Bool)(onResp: UInt => Unit): Unit = {
+  def issueReq(port: LocalMMUIO, addr: UInt, write: Bool, size: UInt, writeData: UInt, needResponse: Bool, needDoCmpXchg: Bool, reqIssued: Bool)(onResp: UInt => Unit): Unit = {
 
     // ensure default safe values (caller may have already set globals; safe to reassign)
     port.Request.valid := !reqIssued
 
     when(!reqIssued) {
-      port.RequestSize.valid := True
-      port.RequestSize.payload := Size.resize(LineBytesNumBitSize)
-
       port.Request.payload.RequestVirtualAddr := addr
       port.Request.payload.RequestSourceID := port.ConherentRequsetSourceID.payload
-      port.Request.payload.RequestType_isWrite := Write
-      port.Request.payload.RequestWStrb := getWstrb(Size.resize(LineBytesNumBitSize))
-      port.Request.payload.RequestData := WriteData.resize(MMUDataWidth)
+      port.Request.payload.RequestType_isWrite := write
+      port.Request.payload.RequestWStrb := getWstrb(size.resize(LineBytesNumBitSize))
+      port.Request.payload.RequestData := writeData.resize(MMUDataWidth)
+      port.Request.payload.RequestSize := size.resize(LineBytesNumBitSize)
+      port.Request.payload.NeedResponse := needResponse
+      port.Request.payload.NeedDoCmpxChg := needDoCmpXchg
     }
 
     when(port.Request.fire) {
@@ -108,19 +108,16 @@ trait HWParameters {
 
   def getWstrb(bytes: UInt): UInt = {
     val mask = Bits(LineBytesNum bits)
-    mask := Mux(
-      bytes >= U(LineBytesNum),
+    mask := Mux(bytes >= U(LineBytesNum),
       B(LineBytesNum bits, default -> true),
-      ((U(1) << bytes.resize(LineBytesNumBitSize)) - U(1)).asBits
-        .resize(LineBytesNum)
+      ((U(1) << bytes.resize(LineBytesNumBitSize)) - U(1)).asBits.resize(LineBytesNum)
     )
     mask.asUInt
   }
 }
 
 trait GCTopParameters {
-  // 和MMUAddrWidth一样
-  val GCElementWidth = 64
+  val GCElementWidth = 64 // 和MMUAddrWidth一样
 }
 
 class LocalMMUIO extends Bundle with HWParameters with IMasterSlave {
@@ -131,10 +128,10 @@ class LocalMMUIO extends Bundle with HWParameters with IMasterSlave {
     val RequestType_isWrite = Bool()
     val RequestData = UInt(MMUDataWidth bits)
     val RequestWStrb = UInt(LineBytesNum bits)
+    val RequestSize = UInt(LineBytesNumBitSize bits)
+    val NeedResponse = Bool()
+    val NeedDoCmpxChg = Bool()
   }
-
-  // add variable to describe the request need or not need split two request
-  val RequestSize = master Flow UInt(LineBytesNumBitSize bits)
 
   val ConherentRequsetSourceID = slave Flow UInt(LLCSourceMaxNumBitSize bits)
 
@@ -144,7 +141,7 @@ class LocalMMUIO extends Bundle with HWParameters with IMasterSlave {
   }
 
   override def asMaster(): Unit = {
-    master(Request, RequestSize)
+    master(Request)
     slave(Response, ConherentRequsetSourceID)
   }
 }

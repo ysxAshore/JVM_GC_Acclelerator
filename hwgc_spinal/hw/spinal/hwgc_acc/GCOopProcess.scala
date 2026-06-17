@@ -43,9 +43,6 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     m.Request.valid := False
     m.Request.payload.clearAll()
 
-    m.RequestSize.valid := False
-    m.RequestSize.payload.clearAll()
-
     m.Response.ready := True
   }
 
@@ -303,7 +300,7 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
           goto(DECIDE)
 
         } otherwise {
-          issueReq(m, srcRegionAttrAddr(i), False, U(2), U(0), slotIssued(i)) { rd =>
+          issueReq(m, srcRegionAttrAddr(i), False, U(2), U(0), True, False, slotIssued(i)) { rd =>
             slotCtx(i).srcRegionAttr := rd(15 downto 0)
 
             regionAttrFillValid(i) := True
@@ -355,7 +352,7 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
           goto(WAIT_COPY_OR_MARK)
 
         } otherwise {
-          issueReq(m, heapRegionLookupAddr(i), False, U(8), U(0), slotIssued(i)) { rd =>
+          issueReq(m, heapRegionLookupAddr(i), False, U(8), U(0), True, False, slotIssued(i)) { rd =>
             slotCtx(i).heapRegion := rd(GCElementWidth - 1 downto 0)
             goto(READ_HUMONGOUS)
           }
@@ -365,7 +362,7 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
       READ_HUMONGOUS.whenIsActive {
         val humAddr = (slotCtx(i).heapRegion.resize(MMUAddrWidth) + U"xbc").resize(MMUAddrWidth)
 
-        issueReq(m, humAddr, False, U(4), U(0), slotIssued(i)) { rd =>
+        issueReq(m, humAddr, False, U(4), U(0), True, False, slotIssued(i)) { rd =>
           val hum = (rd(31 downto 0) & U(2, 32 bits)) =/= U(0)
 
           slotCtx(i).heapRegionHumongous := hum
@@ -398,7 +395,7 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
       }
 
       WRITE_BACK.whenIsActive {
-        issueReq(m, slotCtx(i).task.resize(MMUAddrWidth), True, writeBackSize(), writeBackObjOf(i), slotIssued(i)) { _ =>}
+        issueReq(m, slotCtx(i).task.resize(MMUAddrWidth), True, writeBackSize(), writeBackObjOf(i), False, False, slotIssued(i)) { _ =>}
 
         when(slotIssued(i)) {
           slotIssued(i) := False
@@ -415,7 +412,7 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
       }
 
       READ_DEST_ATTR.whenIsActive {
-        issueReq(m, destRegionAttrAddr(i), False, U(2), U(0), slotIssued(i)) { rd =>
+        issueReq(m, destRegionAttrAddr(i), False, U(2), U(0), True, False, slotIssued(i)) { rd =>
           slotCtx(i).accessDestRegionAttr := True
           slotCtx(i).destRegionAttr       := rd(15 downto 0)
 

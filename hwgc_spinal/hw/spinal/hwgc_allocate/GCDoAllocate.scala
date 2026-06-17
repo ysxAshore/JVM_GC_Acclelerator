@@ -22,8 +22,6 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
   def clearMreq(mreq: LocalMMUIO): Unit = {
     mreq.Request.valid := False
     mreq.Request.payload.clearAll()
-    mreq.RequestSize.valid := False
-    mreq.RequestSize.payload.clearAll()
     mreq.Response.ready := True
   }
 
@@ -110,20 +108,11 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       READ_TOP_END.whenIsActive {
-        issueReq(
-          io.MreqMainIml,
-          alloc_region_r + U"x8",
-          False,
-          U(16),
-          U(0),
-          issuedMainIml
-        ) { rd =>
+        issueReq(io.MreqMainIml, alloc_region_r + U"x8", False, U(16), U(0), True, False, issuedMainIml) { rd =>
           val rd_alloc_end = rd(GCElementWidth - 1 downto 0)
           val rd_alloc_top = rd(GCElementWidth * 2 - 1 downto GCElementWidth)
-          val available =
-            ((rd_alloc_end - rd_alloc_top) >> 3).resize(GCElementWidth)
-          val want_to_allocate =
-            Mux(available > desired_word_size_r, desired_word_size_r, available)
+          val available = ((rd_alloc_end - rd_alloc_top) >> 3).resize(GCElementWidth)
+          val want_to_allocate = Mux(available > desired_word_size_r, desired_word_size_r, available)
 
           alloc_end := rd_alloc_end
           alloc_top := rd_alloc_top
@@ -141,22 +130,10 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       WRITE_TOP.whenIsActive {
-        val new_top =
-          (alloc_top + (want_to_allocate_r << 3)).resize(GCElementWidth)
+        val new_top = (alloc_top + (want_to_allocate_r << 3)).resize(GCElementWidth)
 
         // @todo atomic cmpxchg
-        issueReq(
-          io.MreqMainIml,
-          alloc_region_r + U"x10",
-          True,
-          U(8),
-          new_top,
-          issuedMainIml
-        ) { _ => }
-
-        when(issuedMainIml) {
-          issuedMainIml := False
-
+        issueReq(io.MreqMainIml, alloc_region_r + U"x10", True, U(8), new_top, True, True, issuedMainIml) { rd =>
           when(alloc_top === alloc_top) {
             destObjPtr := alloc_top
             actualWordSize := want_to_allocate_r
@@ -195,12 +172,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
 
     done := False
 
-    def fire(
-        min_word_size: UInt,
-        desired_word_size: UInt,
-        bot_updates: Bool,
-        alloc_region: UInt
-    ): Unit = {
+    def fire(min_word_size: UInt, desired_word_size: UInt, bot_updates: Bool, alloc_region: UInt): Unit = {
       when(!busy) {
         start := True
         bot_updates_r := bot_updates
@@ -232,20 +204,9 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       START_IML_AND_READ_REGION.whenIsActive {
-        parAllocateIml.fire(
-          min_word_size_r,
-          desired_word_size_r,
-          alloc_region_r
-        )
+        parAllocateIml.fire(min_word_size_r, desired_word_size_r, alloc_region_r)
 
-        issueReq(
-          io.MreqPar,
-          alloc_region_r + U"x20",
-          False,
-          U(24),
-          U(0),
-          issuedPar
-        ) { rd =>
+        issueReq(io.MreqPar, alloc_region_r + U"x20", False, U(24), U(0), True, False, issuedPar) { rd =>
           next_offset_threshold := rd(GCElementWidth - 1 downto 0)
           index := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
           bot_ptr := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
@@ -254,7 +215,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       READ_BOT.whenIsActive {
-        issueReq(io.MreqPar, bot_ptr, False, U(24), U(0), issuedPar) { rd =>
+        issueReq(io.MreqPar, bot_ptr, False, U(24), U(0), True, False, issuedPar) { rd =>
           reserved_start := rd(GCElementWidth - 1 downto 0)
           array_ptr := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
           goto(WAIT_IML_DONE)
@@ -265,14 +226,11 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
         when(par_allocate_iml_done_reg) {
           par_allocate_iml_done_reg := False
 
-          val blk_end_value =
-            (destObjPtr + (actualWordSize << 3)).resize(GCElementWidth)
+          val blk_end_value = (destObjPtr + (actualWordSize << 3)).resize(GCElementWidth)
           blk_start := destObjPtr
           blk_end := blk_end_value
 
-          when(
-            destObjPtr =/= 0 && bot_updates_r && blk_end_value > next_offset_threshold
-          ) {
+          when(destObjPtr =/= 0 && bot_updates_r && blk_end_value > next_offset_threshold) {
             goto(WRITE_FIRST_CARD_AND_PREPARE_FILL)
           }.otherwise {
             busy := False
@@ -285,29 +243,20 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       WRITE_FIRST_CARD_AND_PREPARE_FILL.whenIsActive {
         val writeValue = ((next_offset_threshold - blk_start) >> 3).resize(8)
 
-        issueReq(io.MreqPar, array_ptr, True, U(1), writeValue, issuedPar) {
-          _ =>
-        }
+        issueReq(io.MreqPar, array_ptr, True, U(1), writeValue, False, False, issuedPar) { _ => }
 
         when(issuedPar) {
           issuedPar := False
 
-          val end_index_value =
-            ((blk_end - 8 - reserved_start) >> 9).resize(GCElementWidth)
-          val rem_st =
-            (reserved_start + ((index + 1) << 6) << 3).resize(GCElementWidth)
-          val rem_end = (reserved_start + ((end_index_value << 6) + 64) << 3)
-            .resize(GCElementWidth)
-          val start_card =
-            ((((index + 1) << 6) << 3) >> 9).resize(GCElementWidth)
-          val end_card =
-            ((((end_index_value << 6) + 63) << 3) >> 9).resize(GCElementWidth)
+          val end_index_value = ((blk_end - 8 - reserved_start) >> 9).resize(GCElementWidth)
+          val rem_st = (reserved_start + ((index + 1) << 6) << 3).resize(GCElementWidth)
+          val rem_end = (reserved_start + ((end_index_value << 6) + 64) << 3).resize(GCElementWidth)
+          val start_card = ((((index + 1) << 6) << 3) >> 9).resize(GCElementWidth)
+          val end_card = ((((end_index_value << 6) + 63) << 3) >> 9).resize(GCElementWidth)
 
           end_index := end_index_value
 
-          when(
-            index + 1 <= end_index_value && rem_st < rem_end && start_card <= end_card
-          ) {
+          when(index + 1 <= end_index_value && rem_st < rem_end && start_card <= end_card) {
             remaining := end_card - start_card + 1
             begin := array_ptr + start_card
             iterator := 0
@@ -333,9 +282,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
 
           val writeValue = writeBytes.asBits.asUInt
 
-          issueReq(io.MreqPar, begin, True, nbytes, writeValue, issuedPar) {
-            _ =>
-          }
+          issueReq(io.MreqPar, begin, True, nbytes, writeValue, False, False, issuedPar) { _ => }
 
           when(issuedPar) {
             issuedPar := False
@@ -351,18 +298,10 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
 
       UPDATE_BOT.whenIsActive {
         val write_index = end_index + 1
-        val write_threshold =
-          (reserved_start + ((end_index << 6) + 64) << 3).resize(GCElementWidth)
+        val write_threshold = (reserved_start + ((end_index << 6) + 64) << 3).resize(GCElementWidth)
         val writeData = Cat(write_index, write_threshold).asUInt
 
-        issueReq(
-          io.MreqPar,
-          alloc_region_r + U"x20",
-          True,
-          U(16),
-          writeData,
-          issuedPar
-        ) { _ => }
+        issueReq(io.MreqPar, alloc_region_r + U"x20", True, U(16), writeData, False, False, issuedPar) { _ => }
 
         when(issuedPar) {
           issuedPar := False
@@ -409,11 +348,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
 
     done := False
 
-    def fire(
-        region_ptr: UInt,
-        alloc_region: UInt,
-        desired_word_size: UInt
-    ): Unit = {
+    def fire(region_ptr: UInt, alloc_region: UInt, desired_word_size: UInt): Unit = {
       when(!busy) {
         start := True
         region_ptr_r := region_ptr
@@ -459,14 +394,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       READ_REGION_TYPE.whenIsActive {
-        issueReq(
-          io.MreqAttempt,
-          region_ptr_r + U"x40",
-          False,
-          U(1),
-          U(0),
-          issuedAttempt
-        ) { rd =>
+        issueReq(io.MreqAttempt, region_ptr_r + U"x40", False, U(1), U(0), True, False, issuedAttempt) { rd =>
           region_ptr_type := rd(7 downto 0)
           goto(NEW_ALLOC_REQ)
         }
@@ -484,14 +412,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
 
       READ_ALLOC_REGION.whenIsActive {
         when(alloc_region_r =/= io.ConfigIO.DummyRegion) {
-          issueReq(
-            io.MreqAttempt,
-            alloc_region_r,
-            False,
-            U(24),
-            U(0),
-            issuedAttempt
-          ) { rd =>
+          issueReq(io.MreqAttempt, alloc_region_r, False, U(24), U(0), True, False, issuedAttempt) { rd =>
             alloc_bottom := rd(GCElementWidth - 1 downto 0)
             alloc_top := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
             goto(READ_REGION_INFO)
@@ -502,19 +423,10 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       READ_REGION_INFO.whenIsActive {
-        issueReq(
-          io.MreqAttempt,
-          region_ptr_r + U"x10",
-          False,
-          U(24),
-          U(0),
-          issuedAttempt
-        ) { rd =>
+        issueReq(io.MreqAttempt, region_ptr_r + U"x10", False, U(24), U(0), True, False, issuedAttempt) { rd =>
           region_ptr_off10 := rd(GCElementWidth - 1 downto 0)
           bot_updates_r := rd(GCElementWidth * 2)
-          allocated_bytes := alloc_top - alloc_bottom - rd(
-            GCElementWidth - 1 downto 0
-          )
+          allocated_bytes := alloc_top - alloc_bottom - rd(GCElementWidth - 1 downto 0)
 
           when(region_ptr_type === U(1, 8 bits)) {
             goto(READ_OLD_SET)
@@ -527,14 +439,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       READ_OLD_SET.whenIsActive {
         val old_set = io.ConfigIO.G1h + U"xa0"
 
-        issueReq(
-          io.MreqAttempt,
-          old_set + U"x10",
-          False,
-          U(4),
-          U(0),
-          issuedAttempt
-        ) { rd =>
+        issueReq(io.MreqAttempt, old_set + U"x10", False, U(4), U(0), True, False, issuedAttempt) { rd =>
           old_set_cnt_r := rd(31 downto 0)
           goto(WRITE_OLD_SET)
         }
@@ -543,14 +448,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       WRITE_OLD_SET.whenIsActive {
         val old_set = io.ConfigIO.G1h + U"xa0"
 
-        issueReq(
-          io.MreqAttempt,
-          old_set + U"x10",
-          True,
-          U(4),
-          old_set_cnt_r + 1,
-          issuedAttempt
-        ) { _ => }
+        issueReq(io.MreqAttempt, old_set + U"x10", True, U(4), old_set_cnt_r + 1, False, False, issuedAttempt) { _ => }
 
         when(issuedAttempt) {
           issuedAttempt := False
@@ -561,14 +459,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       READ_SURVIVOR.whenIsActive {
         val survivor_ptr = io.ConfigIO.G1h + U"x3f8"
 
-        issueReq(
-          io.MreqAttempt,
-          survivor_ptr + U"x10",
-          False,
-          U(8),
-          U(0),
-          issuedAttempt
-        ) { rd =>
+        issueReq(io.MreqAttempt, survivor_ptr + U"x10", False, U(8), U(0), True, False, issuedAttempt) { rd =>
           survivor_bytes_r := rd(GCElementWidth - 1 downto 0)
           goto(WRITE_SURVIVOR)
         }
@@ -577,14 +468,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       WRITE_SURVIVOR.whenIsActive {
         val survivor_ptr = io.ConfigIO.G1h + U"x3f8"
 
-        issueReq(
-          io.MreqAttempt,
-          survivor_ptr + U"x10",
-          True,
-          U(8),
-          survivor_bytes_r + allocated_bytes,
-          issuedAttempt
-        ) { _ => }
+        issueReq(io.MreqAttempt, survivor_ptr + U"x10", True, U(8), survivor_bytes_r + allocated_bytes, False, False, issuedAttempt) { _ => }
 
         when(issuedAttempt) {
           issuedAttempt := False
@@ -594,14 +478,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
 
       READ_DURING_IM.whenIsActive {
         when(!during_im_valid) {
-          issueReq(
-            io.MreqAttempt,
-            io.ConfigIO.G1h + U"x3c1",
-            False,
-            U(1),
-            U(0),
-            issuedAttempt
-          ) { rd =>
+          issueReq(io.MreqAttempt, io.ConfigIO.G1h + U"x3c1", False, U(1), U(0), True, False, issuedAttempt) { rd =>
             during_im_r := rd(0)
             during_im_valid := True
 
@@ -622,14 +499,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
 
       READ_CM.whenIsActive {
         when(!cm_valid) {
-          issueReq(
-            io.MreqAttempt,
-            io.ConfigIO.G1h + U"x4e8",
-            False,
-            U(8),
-            U(0),
-            issuedAttempt
-          ) { rd =>
+          issueReq(io.MreqAttempt, io.ConfigIO.G1h + U"x4e8", False, U(8), U(0), True, False, issuedAttempt) { rd =>
             cm_r := rd(GCElementWidth - 1 downto 0)
             cm_valid := True
             goto(READ_ROOT_START)
@@ -640,14 +510,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       READ_ROOT_START.whenIsActive {
-        issueReq(
-          io.MreqAttempt,
-          alloc_region_r + U"xe8",
-          False,
-          U(8),
-          U(0),
-          issuedAttempt
-        ) { rd =>
+        issueReq(io.MreqAttempt, alloc_region_r + U"xe8", False, U(8), U(0), True, False, issuedAttempt) { rd =>
           root_start_r := rd(GCElementWidth - 1 downto 0)
           goto(READ_ROOT_REGIONS)
         }
@@ -656,14 +519,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       READ_ROOT_REGIONS.whenIsActive {
         val root_regions_ptr = cm_r + U"xb0"
 
-        issueReq(
-          io.MreqAttempt,
-          root_regions_ptr,
-          False,
-          U(24),
-          U(0),
-          issuedAttempt
-        ) { rd =>
+        issueReq(io.MreqAttempt, root_regions_ptr, False, U(24), U(0), True, False, issuedAttempt) { rd =>
           root_regions_array_r := rd(GCElementWidth - 1 downto 0)
           root_regions_idx_r := rd(
             GCElementWidth * 3 - 1 downto GCElementWidth * 2
@@ -682,14 +538,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
           root_start_r.asBits
         ).asUInt
 
-        issueReq(
-          io.MreqAttempt,
-          mem_region,
-          True,
-          U(16),
-          write_data,
-          issuedAttempt
-        ) { _ => }
+        issueReq(io.MreqAttempt, mem_region, True, U(16), write_data, False, False, issuedAttempt) { _ => }
 
         when(issuedAttempt) {
           issuedAttempt := False
@@ -700,14 +549,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       WRITE_ROOT_INDEX.whenIsActive {
         val root_regions_ptr = cm_r + U"xb0"
 
-        issueReq(
-          io.MreqAttempt,
-          root_regions_ptr + U"x10",
-          True,
-          U(8),
-          root_regions_idx_r + 1,
-          issuedAttempt
-        ) { _ => }
+        issueReq(io.MreqAttempt, root_regions_ptr + U"x10", True, U(8), root_regions_idx_r + 1, False, False, issuedAttempt) { _ => }
 
         when(issuedAttempt) {
           issuedAttempt := False
@@ -716,17 +558,9 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       WRITE_REGION_TO_DUMMY.whenIsActive {
-        val writeData =
-          Cat(U(0), region_ptr_off10, io.ConfigIO.DummyRegion).asUInt
+        val writeData = Cat(U(0), region_ptr_off10, io.ConfigIO.DummyRegion).asUInt
 
-        issueReq(
-          io.MreqAttempt,
-          region_ptr_r + U"x8",
-          True,
-          U(24),
-          writeData,
-          issuedAttempt
-        ) { _ => }
+        issueReq(io.MreqAttempt, region_ptr_r + U"x8", True, U(24), writeData, False, False, issuedAttempt) { _ => }
 
         when(issuedAttempt) {
           issuedAttempt := False
@@ -761,14 +595,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
         when(alloc_region_r === io.ConfigIO.DummyRegion) {
           goto(START_PAR_AND_CLEAR_NEW_REGION)
         }.otherwise {
-          issueReq(
-            io.MreqAttempt,
-            region_ptr_r + U"x10",
-            False,
-            U(24),
-            U(0),
-            issuedAttempt
-          ) { rd =>
+          issueReq(io.MreqAttempt, region_ptr_r + U"x10", False, U(24), U(0), True, False, issuedAttempt) { rd =>
             region_ptr_off10 := rd(GCElementWidth - 1 downto 0)
             bot_updates_r := rd(GCElementWidth * 3)
             goto(START_PAR_AND_CLEAR_NEW_REGION)
@@ -777,21 +604,9 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       START_PAR_AND_CLEAR_NEW_REGION.whenIsActive {
-        parAllocate.fire(
-          desired_word_size_r,
-          desired_word_size_r,
-          bot_updates_r,
-          new_alloc_region_r
-        )
+        parAllocate.fire(desired_word_size_r, desired_word_size_r, bot_updates_r, new_alloc_region_r)
 
-        issueReq(
-          io.MreqAttempt,
-          new_alloc_region_r + U"xa8",
-          True,
-          U(8),
-          U(0),
-          issuedAttempt
-        ) { _ => }
+        issueReq(io.MreqAttempt, new_alloc_region_r + U"xa8", True, U(8), U(0), False, False, issuedAttempt) { _ => }
 
         when(issuedAttempt) {
           issuedAttempt := False
@@ -800,14 +615,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       READ_NEW_ALLOC_REGION.whenIsActive {
-        issueReq(
-          io.MreqAttempt,
-          new_alloc_region_r,
-          False,
-          U(24),
-          U(0),
-          issuedAttempt
-        ) { rd =>
+        issueReq(io.MreqAttempt, new_alloc_region_r, False, U(24), U(0), True, False, issuedAttempt) { rd =>
           alloc_bottom := rd(GCElementWidth - 1 downto 0)
           alloc_top := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
           goto(WRITE_REGION_TO_NEW)
@@ -820,14 +628,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
         val writeOff8 = new_alloc_region_r
         val writeData = Cat(writeOff18, writeOff10, writeOff8).asUInt
 
-        issueReq(
-          io.MreqAttempt,
-          region_ptr_r + U"x8",
-          True,
-          U(24),
-          writeData,
-          issuedAttempt
-        ) { _ => }
+        issueReq(io.MreqAttempt, region_ptr_r + U"x8", True, U(24), writeData, False, False, issuedAttempt) { _ => }
 
         when(issuedAttempt) {
           issuedAttempt := False
@@ -917,22 +718,10 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
         allocRegionLockPtr := allocRegion + U"x40"
         val addr = allocRegion + U"x48"
 
-        issueReq(
-          io.MreqMainIml,
-          addr,
-          True,
-          U(4),
-          U(1, 32 bits),
-          issuedMainIml
-        ) { _ => }
-
-        when(issuedMainIml) {
-          issuedMainIml := False
-
+        // @todo cmpxchg
+        issueReq(io.MreqMainIml, addr, True, U(4), U(1, 32 bits), True, True, issuedMainIml) { rd =>
           when(lockValue === U(0, 32 bits)) {
             goto(START_PAR_ALLOC)
-          }.otherwise {
-            goto(FIRST_ALLOC)
           }
         }
       }
@@ -967,29 +756,17 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       }
     }
 
+    // @todo this can do cmpxchg old == 1 then write 0, else wait irq
     READ_ALLOC_REGION_LOCK.whenIsActive {
-      issueReq(
-        io.MreqMainIml,
-        allocRegionLockPtr + U"x8",
-        False,
-        U(4),
-        U(0),
-        issuedMainIml
-      ) { rd =>
+      issueReq(io.MreqMainIml, allocRegionLockPtr + U"x8", False, U(4), U(0), True, False, issuedMainIml) { rd =>
         lockValue := rd(31 downto 0)
         goto(UNLOCK_ALLOC_REGION)
       }
     }
 
     UNLOCK_ALLOC_REGION.whenIsActive {
-      issueReq(
-        io.MreqMainIml,
-        allocRegionLockPtr + U"x8",
-        True,
-        U(4),
-        U(0, 32 bits),
-        issuedMainIml
-      ) { _ => }
+      // @todo lockValue > 1 wake irq
+      issueReq(io.MreqMainIml, allocRegionLockPtr + U"x8", True, U(4), U(0, 32 bits), False, False, issuedMainIml) { _ => }
 
       when(issuedMainIml) {
         issuedMainIml := False
@@ -1005,14 +782,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
           freelistLockPtr := io.ConfigIO.LockPtr
           goto(LOCK_FREELIST)
         }.otherwise {
-          issueReq(
-            io.MreqMainIml,
-            allocatorPtr + U"x10",
-            False,
-            U(1),
-            U(0),
-            issuedMainIml
-          ) { rd =>
+          issueReq(io.MreqMainIml, allocatorPtr + U"x10", False, U(1), U(0), True, False, issuedMainIml) { rd =>
             val isFull = Mux(destAttrIdx === U(0), rd(0), rd(1))
 
             when(!isFull) {
@@ -1029,18 +799,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
     }
 
     LOCK_FREELIST.whenIsActive {
-      issueReq(
-        io.MreqMainIml,
-        freelistLockPtr + U"x8",
-        True,
-        U(4),
-        U(1, 32 bits),
-        issuedMainIml
-      ) { _ => }
-
-      when(issuedMainIml) {
-        issuedMainIml := False
-
+      issueReq(io.MreqMainIml, freelistLockPtr + U"x8", True, U(4), U(1, 32 bits), True, True, issuedMainIml) { rd =>
         when(lockValue === U(0, 32 bits)) {
           goto(WRITE_FREELIST_OWNER)
         }.otherwise {
@@ -1050,14 +809,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
     }
 
     WRITE_FREELIST_OWNER.whenIsActive {
-      issueReq(
-        io.MreqMainIml,
-        freelistLockPtr,
-        True,
-        U(8),
-        io.ConfigIO.Thread,
-        issuedMainIml
-      ) { _ => }
+      issueReq(io.MreqMainIml, freelistLockPtr, True, U(8), io.ConfigIO.Thread, False, False, issuedMainIml) { _ => }
 
       when(issuedMainIml) {
         issuedMainIml := False
@@ -1066,11 +818,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
     }
 
     START_ATTEMPT.whenIsActive {
-      attemptAlloc.fire(
-        regionPtr,
-        allocRegion,
-        desiredWordSize
-      )
+      attemptAlloc.fire(regionPtr, allocRegion, desiredWordSize)
 
       goto(WAIT_ATTEMPT)
     }
@@ -1089,23 +837,9 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
 
     MARK_ALLOCATOR_FULL.whenIsActive {
       when(destAttrIdx === U(0)) {
-        issueReq(
-          io.MreqMainIml,
-          allocatorPtr + U"x10",
-          True,
-          U(1),
-          U(1, 8 bits),
-          issuedMainIml
-        ) { _ => }
+        issueReq(io.MreqMainIml, allocatorPtr + U"x10", True, U(1), U(1, 8 bits), False, False, issuedMainIml) { _ => }
       }.otherwise {
-        issueReq(
-          io.MreqMainIml,
-          allocatorPtr + U"x11",
-          True,
-          U(1),
-          U(1, 8 bits),
-          issuedMainIml
-        ) { _ => }
+        issueReq(io.MreqMainIml, allocatorPtr + U"x11", True, U(1), U(1, 8 bits), False, False, issuedMainIml) { _ => }
       }
 
       when(issuedMainIml) {
@@ -1114,29 +848,16 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       }
     }
 
+    // @todo use cmpxchg do this
     READ_FREELIST_LOCK.whenIsActive {
-      issueReq(
-        io.MreqMainIml,
-        freelistLockPtr + U"x8",
-        False,
-        U(4),
-        U(0),
-        issuedMainIml
-      ) { rd =>
+      issueReq(io.MreqMainIml, freelistLockPtr + U"x8", False, U(4), U(0), True, False, issuedMainIml) { rd =>
         lockValue := rd(31 downto 0)
         goto(UNLOCK_FREELIST)
       }
     }
 
     UNLOCK_FREELIST.whenIsActive {
-      issueReq(
-        io.MreqMainIml,
-        freelistLockPtr + U"x8",
-        True,
-        U(4),
-        U(0, 32 bits),
-        issuedMainIml
-      ) { _ => }
+      issueReq(io.MreqMainIml, freelistLockPtr + U"x8", True, U(4), U(0, 32 bits), False, False, issuedMainIml) { _ => }
 
       when(issuedMainIml) {
         issuedMainIml := False

@@ -16,8 +16,6 @@ class GCLocalMMU(count: Int) extends Module with HWParameters {
 
   // defaults
   io.LastLevelCacheTLIO.Request.payload.clearAll()
-  io.LastLevelCacheTLIO.RequestSize.valid := False
-  io.LastLevelCacheTLIO.RequestSize.payload.clearAll()
   io.LastLevelCacheTLIO.Response.ready := False
 
   for (i <- 0 until count) {
@@ -72,7 +70,9 @@ class GCLocalMMU(count: Int) extends Module with HWParameters {
     io.LastLevelCacheTLIO.Request.payload.RequestType_isWrite := io.localMMUIOs(chosen_index).Request.payload.RequestType_isWrite
     io.LastLevelCacheTLIO.Request.payload.RequestData := io.localMMUIOs(chosen_index).Request.payload.RequestData
     io.LastLevelCacheTLIO.Request.payload.RequestWStrb := io.localMMUIOs(chosen_index).Request.payload.RequestWStrb
-    io.LastLevelCacheTLIO.RequestSize.payload := io.localMMUIOs(chosen_index).RequestSize.payload
+    io.LastLevelCacheTLIO.Request.payload.RequestSize := io.localMMUIOs(chosen_index).Request.payload.RequestSize
+    io.LastLevelCacheTLIO.Request.payload.NeedResponse := io.localMMUIOs(chosen_index).Request.payload.NeedResponse
+    io.LastLevelCacheTLIO.Request.payload.NeedDoCmpxChg := io.localMMUIOs(chosen_index).Request.payload.NeedDoCmpxChg
   }
 
   val reqFire = io.LastLevelCacheTLIO.Request.valid && io.LastLevelCacheTLIO.Request.ready

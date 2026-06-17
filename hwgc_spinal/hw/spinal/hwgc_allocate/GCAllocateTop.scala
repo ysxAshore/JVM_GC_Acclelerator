@@ -3,7 +3,6 @@ package hwgc_allocate
 import hwgc_acc.{GCLocalMMU, GCUnalignedMMUAdapter}
 
 import spinal.core._
-import spinal.lib._
 
 class GCAllocateTop(count: Int) extends Module {
   val io = new GCAllocateTopIO(count)

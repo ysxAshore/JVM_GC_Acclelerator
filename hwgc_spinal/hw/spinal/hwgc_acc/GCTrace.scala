@@ -23,8 +23,6 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
   // Default outputs
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
-  io.Mreq.RequestSize.valid := False
-  io.Mreq.RequestSize.payload.clearAll()
   io.Mreq.Response.ready := True
 
   io.ToAop.clearIn()
@@ -237,7 +235,7 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
     def issueElementRead(address: UInt): Unit = {
       val elementBytes = Mux(io.ConfigIO.UseCompressedOops, U(4), U(8))
 
-      issueReq(io.Mreq, address, False, elementBytes, U(0), issued) { readData =>
+      issueReq(io.Mreq, address, False, elementBytes, U(0), True, False, issued) { readData =>
         when(io.ConfigIO.UseCompressedOops) {
           rawHeapOop := readData(31 downto 0).resize(GCElementWidth)
         } otherwise {
@@ -250,7 +248,7 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
     }
 
     def issueWindowRead(address: UInt): Unit = {
-      issueReq(io.Mreq, address, False, U(32), U(0), issued) { readData =>
+      issueReq(io.Mreq, address, False, U(32), U(0), True, False, issued) { readData =>
         heapWindowAddr := address
         heapWindowData := readData
         heapWindowValid := True
@@ -334,7 +332,7 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
       when(OopType === U(PartialArrayOop)) {
         val address = DestOopPtr + Mux(io.ConfigIO.UseCompressedKlassPointers, U"xc", U"x10")
 
-        issueReq(io.Mreq, address, True, U(4), ArrayLength, issued) { _ =>}
+        issueReq(io.Mreq, address, True, U(4), ArrayLength, False, False, issued) { _ =>}
         when(issued) {
           issued := False
           goto(PREPARE_ARRAY)
@@ -345,7 +343,7 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
             Cat(StepIndex, KlassPtr(31 downto 0)).resize(96),
             Cat(StepIndex, KlassPtr).resize(96)).asUInt
 
-        issueReq(io.Mreq, address, True, objArrayMarkKlassLenSize, writeValue, issued) { _ =>}
+        issueReq(io.Mreq, address, True, objArrayMarkKlassLenSize, writeValue, False, False, issued) { _ =>}
         when(issued) {
           issued := False
           goto(PREPARE_ARRAY)
@@ -360,7 +358,7 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
         } otherwise {
           val address = KlassPtr + U(160)
 
-          issueReq(io.Mreq, address, False, U(4), U(0), issued) { readData =>
+          issueReq(io.Mreq, address, False, U(4), U(0), True, False, issued) { readData =>
             vtableLen := readData(31 downto 0)
             goto(READ_KLASS_LAYOUT)
           }
@@ -400,7 +398,7 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
     READ_KLASS_LAYOUT.whenIsActive {
       val address = KlassPtr + U(296)
 
-      issueReq(io.Mreq, address, False, U(8), U(0), issued) { readData =>
+      issueReq(io.Mreq, address, False, U(8), U(0), True, False, issued) { readData =>
         val oopMapOffset = readData(63 downto 32)
         val oopMapCount = readData(31 downto 0)
         val newStartMap = (KlassPtr + U(464) + (vtableLen + oopMapOffset) * U(8)).resize(GCElementWidth)
@@ -424,7 +422,7 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
       when(startMap < endMap) {
         val address = endMap - U(8)
 
-        issueReq(io.Mreq, address, False, U(8), U(0), issued) { readData =>
+        issueReq(io.Mreq, address, False, U(8), U(0), True, False, issued) { readData =>
           val mapOffset = readData(31 downto 0)
           val mapCount = readData(63 downto 32)
 
@@ -445,7 +443,7 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
       when(Kid === U(InstanceMirrorKlassID)) {
         val address = SrcOopPtr + U"x24"
 
-        issueReq(io.Mreq, address, False, U(4), U(0), issued) { readData =>
+        issueReq(io.Mreq, address, False, U(4), U(0), True, False, issued) { readData =>
           val mirrorArrayLength = readData(31 downto 0)
 
           p := DestOopPtr + U"x70"
@@ -565,7 +563,7 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
 
         processRegion(cachedAttr, decodedRawHeapOop)
       } otherwise {
-        issueReq(io.Mreq, regionAttrAddrLookup, False, U(2), U(0), issued) { readData =>
+        issueReq(io.Mreq, regionAttrAddrLookup, False, U(2), U(0), True, False, issued) { readData =>
           val loadedAttr = readData(15 downto 0)
 
           heapOop := decodedRawHeapOop
@@ -591,7 +589,7 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
       } otherwise {
         val candidateAddress = (io.ConfigIO.HumongousReclaimCandidatesBoolBase + regionLookup).resize(MMUAddrWidth)
 
-        issueReq(io.Mreq, candidateAddress, False, U(1), U(0), issued) { readData =>
+        issueReq(io.Mreq, candidateAddress, False, U(1), U(0), True, False, issued) { readData =>
           val lookedUpRegion = regionLookup
 
           humRegionCacheValid(humRegionCacheReplacePtr) := True
@@ -612,7 +610,7 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
     CLEAR_HUM_CANDIDATE.whenIsActive {
       val address = (io.ConfigIO.HumongousReclaimCandidatesBoolBase + region).resize(MMUAddrWidth)
 
-      issueReq(io.Mreq, address, True, U(1), U(0), issued) { _ =>}
+      issueReq(io.Mreq, address, True, U(1), U(0), False, False, issued) { _ =>}
 
       when(issued) {
         issued := False
@@ -623,7 +621,7 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
     MARK_HUM_REGION.whenIsActive {
       val address = (io.ConfigIO.RegionAttrBase + region * U(2) + U(1)).resize(MMUAddrWidth)
 
-      issueReq(io.Mreq, address, True, U(1), S(-1, 8 bits).asUInt, issued) { _ =>}
+      issueReq(io.Mreq, address, True, U(1), S(-1, 8 bits).asUInt, False, False, issued) { _ =>}
 
       when(issued) {
         issued := False
