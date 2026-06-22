@@ -328,7 +328,7 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
 
             slotReleaseFetch(i) := True
 
-            goto(READ_HEAP_PTR)
+            goto(WRITE_BACK)
 
             dbg(Seq("slot", i.toString, " use fromMarkWord path"))
 
@@ -349,7 +349,15 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
       READ_HEAP_PTR.whenIsActive {
         when(heapRegionHit(i)) {
           slotCtx(i).heapRegionHumongous := heapRegionCache(heapRegionHitIndex(i))
-          goto(WAIT_COPY_OR_MARK)
+          when(slotCtx(i).fromMarkWord) {
+            slotCtx(i).fromMarkWord := False
+            when(heapRegionCache(heapRegionHitIndex(i))){
+              finishSlot(i)
+            }.otherwise{
+              slotCtx(i).accessDestRegionAttr := False
+              goto(READ_DEST_ATTR)
+            }
+          }.otherwise{ goto(WAIT_COPY_OR_MARK) }
 
         } otherwise {
           issueReq(m, heapRegionLookupAddr(i), False, U(8), U(0), True, False, slotIssued(i)) { rd =>
@@ -371,16 +379,20 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
           heapRegionFillAddr(i)  := heapRegionLookupAddr(i)
           heapRegionFillData(i)  := hum
 
-          goto(WAIT_COPY_OR_MARK)
+          when(slotCtx(i).fromMarkWord) {
+            slotCtx(i).fromMarkWord := False
+            when(hum){
+              finishSlot(i)
+            }.otherwise{
+              slotCtx(i).accessDestRegionAttr := False
+              goto(READ_DEST_ATTR)
+            }
+          }.otherwise{ goto(WAIT_COPY_OR_MARK) }
         }
       }
 
       WAIT_COPY_OR_MARK.whenIsActive {
-        when(slotCtx(i).fromMarkWord) {
-          slotCtx(i).fromMarkWord := False
-          goto(WRITE_BACK)
-
-        } elsewhen slotCopy2SurvivorDone(i) {
+        when (slotCopy2SurvivorDone(i)) {
           val needRelease = !slotCopy2SurvivorBypassGranted(i)
 
           when(needRelease) {
@@ -401,12 +413,22 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
           slotIssued(i) := False
 
           val sameRegion = ((slotCtx(i).task ^ slotCtx(i).destOopPtr) >> io.ConfigIO.LogOfHRGrainBytes) === U(0)
-          when(sameRegion || slotCtx(i).heapRegionHumongous) {
-            finishSlot(i)
 
-          } otherwise {
-            slotCtx(i).accessDestRegionAttr := False
-            goto(READ_DEST_ATTR)
+          when(slotCtx(i).fromMarkWord){
+            when(sameRegion){
+              finishSlot(i)
+            }.otherwise{
+              goto(READ_HEAP_PTR)
+            }
+
+          }.otherwise {
+            when(sameRegion || slotCtx(i).heapRegionHumongous) {
+              finishSlot(i)
+
+            } otherwise {
+              slotCtx(i).accessDestRegionAttr := False
+              goto(READ_DEST_ATTR)
+            }
           }
         }
       }
