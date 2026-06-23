@@ -1,16 +1,25 @@
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/fs.h>
-#include <linux/cdev.h>
-#include <linux/device.h>
-#include <linux/uaccess.h>
 #include <linux/interrupt.h>
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/mutex.h>
 #include <linux/wait.h>
 #include <linux/spinlock.h>
+#include <linux/mm.h>
+#include <linux/sched.h>
+#include <linux/sched/mm.h>
+#include <linux/sched/task.h>
 #include <linux/io.h>
-#include <linux/mutex.h>
+#include <linux/slab.h>
+
+#include <linux/cdev.h>
+#include <linux/device.h>
 #include <linux/bitops.h>
 #include <linux/version.h>
+#include <linux/completion.h>
+#include <linux/highmem.h>
 
 #define DRV_NAME "hwgc"
 #define HWGC_VENDOR_ID 0x1234
@@ -83,6 +92,7 @@
 #define IRQ_ALLOCATE 0x10
 #define IRQ_WAKE 0x20
 #define IRQ_ERROR 0x40
+#define IRQ_ALL (IRQ_ERROR | IRQ_WAKE | IRQ_ALLOCATE | IRQ_EXPAND | IRQ_GORW | IRQ_DONE | IRQ_TLB_MISS)
 
 /* Device access type reported to driver */
 #define ACCESS_READ 1
@@ -129,8 +139,12 @@ struct HWGCParameters
 };
 
 #define HWGC_EVENT_NONE 0
-#define HWGC_EVENT_ALLOCATE 1
-#define HWGC_EVENT_WAKE 2
+#define HWGC_EVENT_DONE 1
+#define HWGC_EVENT_GROW 2
+#define HWGC_EVENT_EXPAND 3
+#define HWGC_EVENT_ALLOCATE 4
+#define HWGC_EVENT_WAKE 5
+#define HWGC_EVENT_ERROR 6
 
 struct HWGCEvent
 {
@@ -146,8 +160,8 @@ struct HWGCEvent
     __u64 res1;
 };
 
-#define XOR_TLB_IOC_MAGIC 'x'
-#define HWGC_IOC_RUN _IOWR(HWGC_IOC_MAGIC, 1, struct HWGCParameters)
+#define HWGC_IOC_MAGIC 'x'
+#define HWGC_IOC_START _IOWR(HWGC_IOC_MAGIC, 1, struct HWGCParameters)
 #define HWGC_IOC_WAIT_EVENT _IOR(HWGC_IOC_MAGIC, 2, struct HWGCEvent)
 #define HWGC_IOC_REPLY_EVENT _IOW(HWGC_IOC_MAGIC, 3, struct HWGCEvent)
 
@@ -162,14 +176,16 @@ struct hwgc
     struct pci_dev *pdev;
     void __iomem *bar0;
     int irq;
+
     struct miscdevice miscdev; // 字符设备
     struct mutex op_lock;      // 保证同一时刻只有一个ioctl操作在使用设备
-    struct completion done;    // ioctl线程sleep在completion上 等待IRQ DONE/ERROR 唤醒
+
+    bool op_active; // 有设备操作正在进行
+    int op_status;
 
     struct task_struct *active_task;
     struct mm_struct *active_mm;
-    bool op_active; // 有设备操作正在进行
-    int op_status;
+
     spinlock_t irq_lock;
     u32 pending_irq;
 
@@ -227,4 +243,51 @@ static inline u64 reg_read64(struct hwgc *d, u32 off)
 
     return ((u64)hi << 32) | lo;
 #endif
+}
+
+static inline bool hwgc_event_needs_reply(u32 type)
+{
+    return type == HWGC_EVENT_GROW ||
+           type == HWGC_EVENT_EXPAND ||
+           type == HWGC_EVENT_ALLOCATE ||
+           type == HWGC_EVENT_WAKE;
+}
+
+static inline bool hwgc_event_is_terminal(u32 type)
+{
+    return type == HWGC_EVENT_DONE ||
+           type == HWGC_EVENT_ERROR;
+}
+
+static inline void hwgc_clear_event_state_locked(struct hwgc *d)
+{
+    memset(&d->current_event, 0, sizeof(d->current_event));
+    d->event_pending = false;
+    d->event_in_service = false;
+}
+
+static void hwgc_program_parameters(struct hwgc *d, const struct HWGCParameters *p)
+{
+    reg_write64(d, FIELD64(p->chunkSize, p->ageThreshold), REG_PAR0);
+    reg_write64(d, FIELD64(p->heapRegionBias, p->heapRegionShiftBy), REG_PAR1);
+    reg_write64(d, FIELD64(p->regionAttrShiftBy, p->logOfHRGrainBytes), REG_PAR2);
+    reg_write32(d, FIELD64(p->localBot, (((u32)(p->compressedKlassPointerShift) << 24) | ((u32)(p->useCompressedKlassPointers) << 16) | ((u32)(p->compressedOopShift) << 8) | ((u32)(p->useCompressedOops)))), REG_PAR3);
+    reg_write64(d, p->stepperOffset, REG_PAR4);
+    reg_write64(d, p->youngWordsBase, REG_PAR5);
+    reg_write64(d, p->regionAttrBase, REG_PAR6);
+    reg_write64(d, p->plabAllocatorPtr, REG_PAR7);
+    reg_write64(d, p->regionAttrBiasedBase, REG_PAR8);
+    reg_write64(d, p->heapRegionBiasedBase, REG_PAR9);
+    reg_write64(d, p->pss, REG_PAR10);
+    reg_write64(d, p->taskQueueElemsBase, REG_PAR11);
+    reg_write64(d, p->humogousReclaimCandidateBoolBase, REG_PAR12);
+    reg_write64(d, p->cardTablePtr, REG_PAR13);
+    reg_write64(d, p->g1h, REG_PAR14);
+    reg_write64(d, p->intArrayKlassObj, REG_PAR15);
+    reg_write64(d, p->objectKlass, REG_PAR16);
+    reg_write64(d, p->lockPtr, REG_PAR17);
+    reg_write64(d, p->thread, REG_PAR18);
+    reg_write64(d, p->dummyRegion, REG_PAR19);
+    reg_write64(d, p->compressedOopBase, REG_PAR20);
+    reg_write64(d, p->compressedKlassPointerBase, REG_PAR21);
 }
