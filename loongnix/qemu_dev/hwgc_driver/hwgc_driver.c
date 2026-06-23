@@ -1,474 +1,703 @@
 #include "hwgc_ioctl.h"
 
-#define HWGC_DEV_NAME "hwgc"
-#define HWGC_MAX_DEVS 256
-
-struct hwgc_dev
+static void hwgc_unpin_all(struct hwgc *d)
 {
-    dev_t devno;
-    int index;
-
-    struct cdev cdev;
-    struct device *dev;
-
-    struct pci_dev *pdev;
-    void __iomem *mmio;
-
-    spinlock_t lock;
-    enum hwgc_state state;
-    wait_queue_head_t waitq;
-};
-
-static dev_t hwgc_base_devno;
-static struct class *hwgc_class;
-
-static DEFINE_MUTEX(hwgc_minor_lock);
-static unsigned long hwgc_minor_bitmap[BITS_TO_LONGS(HWGC_MAX_DEVS)];
-
-static int hwgc_alloc_minor(void)
-{
-    int index;
-
-    mutex_lock(&hwgc_minor_lock);
-
-    index = find_first_zero_bit(hwgc_minor_bitmap, HWGC_MAX_DEVS);
-    if (index >= HWGC_MAX_DEVS)
-    {
-        mutex_unlock(&hwgc_minor_lock);
-        return -ENOSPC;
-    }
-
-    set_bit(index, hwgc_minor_bitmap);
-
-    mutex_unlock(&hwgc_minor_lock);
-    return index;
-}
-
-static void hwgc_free_minor(int index)
-{
-    if (index < 0 || index >= HWGC_MAX_DEVS)
-        return;
-
-    mutex_lock(&hwgc_minor_lock);
-    clear_bit(index, hwgc_minor_bitmap);
-    mutex_unlock(&hwgc_minor_lock);
-}
-
-/* 中断处理 */
-static irqreturn_t hwgc_irq_handler(int irq, void *dev_id)
-{
-    struct hwgc_dev *hwgc = dev_id;
-    u32 irq_status;
-    unsigned long flags;
+    struct page *page;
     int i;
 
-    struct
+    for (i = 0; i < d->nr_pinned; i++)
     {
-        u32 mask;
-        enum hwgc_state new_state;
-    } irq_map[] = {
-        {ALLOCATE_IRQ, HWGC_WAIT_ALLOCATE},
-        {ATTEMPT_IRQ, HWGC_WAIT_ATTEMPT},
-        {LOCK_WAKE_IRQ, HWGC_WAIT_LOCK_WAKE},
-        {PAGE_FAULT_IRQ, HWGC_WAIT_PAGEFAULT},
-        {COMPLETE_IRQ, HWGC_DONE},
-        {ATOMIC_IRQ, HWGC_WAIT_ATOMIC},
-    };
+        page = d->pinned[i].page;
+        if (!page)
+            continue;
 
-    irq_status = ioread32(hwgc->mmio + REG_IRQ_STATUS);
-    if (!irq_status)
-        return IRQ_NONE;
+        /*
+         * Conservatively mark pages writable by the device dirty
+         * before dropping the GUP reference.
+         */
+        if (d->pinned[i].write)
+            set_page_dirty_lock(page);
 
-    spin_lock_irqsave(&hwgc->lock, flags);
+        put_page(page);
 
-    /*
-     * 一次只处理一个中断。
-     * 如果 QEMU 可能一次置多个 bit，这里只清一个。
-     */
-    for (i = 0; i < ARRAY_SIZE(irq_map); ++i)
-        if (irq_status & irq_map[i].mask)
-        {
-            iowrite32(irq_map[i].mask, hwgc->mmio + REG_CLEAR_IRQ);
-            hwgc->state = irq_map[i].new_state;
-            wake_up_interruptible(&hwgc->waitq);
-            break;
-        }
-
-    spin_unlock_irqrestore(&hwgc->lock, flags);
-
-    return IRQ_HANDLED;
-}
-
-static ssize_t hwgc_read(struct file *file,
-                         char __user *buf,
-                         size_t count,
-                         loff_t *ppos)
-{
-    struct hwgc_dev *hwgc = file->private_data;
-    loff_t offset = *ppos;
-    u64 val = ~0ULL;
-
-    if (count > sizeof(val))
-        return -EINVAL;
-
-    switch (offset)
-    {
-    case REG_STATUS:
-        val = hwgc->state;
-        break;
-
-    case REG_IRQ_PAR0:
-    case REG_IRQ_PAR1:
-    case REG_IRQ_PAR2:
-    case REG_IRQ_PAR3:
-    case REG_IRQ_RES0:
-    case REG_IRQ_RES1:
-        val = readq(hwgc->mmio + offset);
-        break;
-
-    default:
-        return -EINVAL;
+        d->pinned[i].page = NULL;
+        d->pinned[i].write = false;
     }
 
-    if (copy_to_user(buf, &val, count))
-        return -EFAULT;
-
-    *ppos += count;
-    return count;
+    d->nr_pinned = 0;
 }
 
-static void hwgc_write_params(struct hwgc_dev *hwgc,
-                              const struct HWGC_PARALLOCATE_PARS *par)
+static int hwgc_remember_pinned(struct hwgc *d, struct page *page, bool write)
 {
-    void __iomem *base = hwgc->mmio + REG_PAR0;
+    int i;
 
-    writeq(par->dest_attr_type, base + 0x00);
-    writeq(par->allocator_ptr, base + 0x08);
-    writeq(par->alloc_region, base + 0x10);
-    writeq(par->min_word_size, base + 0x18);
-    writeq(par->desired_word_size, base + 0x20);
-    writeq(par->freelist_lock_ptr, base + 0x28);
-    writeq(par->thread, base + 0x30);
-}
-
-static long hwgc_ioctl(struct file *file,
-                       unsigned int cmd,
-                       unsigned long arg)
-{
-    struct hwgc_dev *hwgc = file->private_data;
-    struct HWGC_PARALLOCATE_PARS hwgc_par;
-
-    unsigned long flags;
-    enum hwgc_state cur_state;
-    int state;
-    int ret;
-
-    struct
+    // 同一次操作 可能会对同一页多次TLB miss 如果发现这页已经被记录过 则只保留原来的引用
+    // 通过GUP多出来的重复引用需要PUT掉以减少该page的引用次数
+    for (i = 0; i < d->nr_pinned; i++)
     {
-        u64 res;
-        u64 word_size;
-    } temp = {0, 0};
-
-    switch (cmd)
-    {
-    case HWGC_IOC_START:
-        if (copy_from_user(&hwgc_par, (void __user *)arg, sizeof(hwgc_par)))
-            return -EFAULT;
-
-        spin_lock_irqsave(&hwgc->lock, flags);
-
-        if (hwgc->state != HWGC_IDLE)
+        if (d->pinned[i].page == page)
         {
-            spin_unlock_irqrestore(&hwgc->lock, flags);
-            return -EBUSY;
+            d->pinned[i].write |= write;
+
+            put_page(page);
+            return 0;
         }
-
-        hwgc->state = HWGC_RUNNING;
-
-        spin_unlock_irqrestore(&hwgc->lock, flags);
-
-        hwgc_write_params(hwgc, &hwgc_par);
-
-        writel(HWGC_STATUS_IRQ, hwgc->mmio + REG_STATUS);
-        writel(1, hwgc->mmio + REG_START_WORK);
-
-        break;
-
-    case HWGC_IOC_WAIT_EVENT:
-        ret = wait_event_interruptible(hwgc->waitq, hwgc->state != HWGC_IDLE && hwgc->state != HWGC_RUNNING);
-
-        if (ret)
-            return ret;
-
-        spin_lock_irqsave(&hwgc->lock, flags);
-
-        state = hwgc->state;
-
-        if (state == HWGC_DONE)
-            hwgc->state = HWGC_IDLE;
-
-        spin_unlock_irqrestore(&hwgc->lock, flags);
-
-        if (copy_to_user((void __user *)arg, &state, sizeof(state)))
-            return -EFAULT;
-
-        break;
-
-    case HWGC_IOC_SOFT_PROVIDE:
-        spin_lock_irqsave(&hwgc->lock, flags);
-        cur_state = hwgc->state;
-        spin_unlock_irqrestore(&hwgc->lock, flags);
-
-        switch (cur_state)
-        {
-        case HWGC_WAIT_PAGEFAULT:
-        case HWGC_WAIT_ATOMIC:
-        case HWGC_WAIT_ALLOCATE:
-        case HWGC_WAIT_LOCK_WAKE:
-            if (copy_from_user(&temp.res, (void __user *)arg, sizeof(temp.res)))
-                return -EFAULT;
-            break;
-
-        case HWGC_WAIT_ATTEMPT:
-            if (copy_from_user(&temp, (void __user *)arg, sizeof(temp)))
-                return -EFAULT;
-            break;
-
-        default:
-            return -EINVAL;
-        }
-
-        spin_lock_irqsave(&hwgc->lock, flags);
-
-        if (hwgc->state != cur_state)
-        {
-            spin_unlock_irqrestore(&hwgc->lock, flags);
-            return -EAGAIN;
-        }
-
-        switch (cur_state)
-        {
-        case HWGC_WAIT_PAGEFAULT:
-        case HWGC_WAIT_ATOMIC:
-        case HWGC_WAIT_ALLOCATE:
-        case HWGC_WAIT_LOCK_WAKE:
-            writeq(temp.res, hwgc->mmio + REG_IRQ_RES0);
-            break;
-
-        case HWGC_WAIT_ATTEMPT:
-            writeq(temp.res, hwgc->mmio + REG_IRQ_RES0);
-            writeq(temp.word_size, hwgc->mmio + REG_IRQ_RES1);
-            break;
-
-        default:
-            spin_unlock_irqrestore(&hwgc->lock, flags);
-            return -EINVAL;
-        }
-
-        hwgc->state = HWGC_RUNNING;
-
-        spin_unlock_irqrestore(&hwgc->lock, flags);
-
-        writel(1, hwgc->mmio + REG_CONTINUE_WORK);
-
-        break;
-
-    default:
-        return -ENOTTY;
     }
+
+    if (d->nr_pinned >= MAX_PINNED)
+        return -ENOSPC;
+
+    d->pinned[d->nr_pinned].page = page;
+    d->pinned[d->nr_pinned].write = write;
+    d->nr_pinned++;
 
     return 0;
 }
 
-static int hwgc_open(struct inode *inode, struct file *file)
+static void hwgc_release_process_context(struct hwgc *d)
 {
-    struct hwgc_dev *hwgc;
+    if (d->active_mm)
+    {
+        mmput(d->active_mm);
+        d->active_mm = NULL;
+    }
 
-    hwgc = container_of(inode->i_cdev, struct hwgc_dev, cdev);
-    file->private_data = hwgc;
+    if (d->active_task)
+    {
+        put_task_struct(d->active_task);
+        d->active_task = NULL;
+    }
+}
+
+static int hwgc_fill_tlb_for_miss(struct hwgc *d)
+{
+    struct task_struct *task;
+    struct mm_struct *mm;
+    struct page *page;
+    unsigned long miss_va;
+    unsigned long page_va;
+    unsigned int gup_flags;
+    phys_addr_t pa_page;
+    u32 access;
+    bool write;
+    long ret;
+    int locked;
+
+    task = d->active_task;
+    mm = d->active_mm;
+
+    if (!task || !mm)
+        return -EINVAL;
+
+    miss_va = (unsigned long)reg_read64(d, REG_IRQ_PAR0);
+    access = reg_read32(d, REG_IRQ_PAR1);
+
+    if (access != ACCESS_READ && access != ACCESS_WRITE)
+        return -EINVAL;
+
+    write = access == ACCESS_WRITE;
+    page_va = miss_va & PAGE_MASK; // 14 bit page
+
+    gup_flags = 0;
+    if (write)
+        gup_flags |= FOLL_WRITE;
+
+    page = NULL;
+    locked = 1;
+
+    down_read(&mm->mmap_sem);
+
+    ret = get_user_pages_remote(task, mm, page_va, 1, gup_flags, &page, NULL, &locked);
+
+    if (locked)
+        up_read(&mm->mmap_sem);
+
+    if (ret != 1)
+    {
+        if (ret < 0)
+            return (int)ret;
+
+        return -EFAULT;
+    }
+
+    if (!page)
+        return -EFAULT;
+
+    ret = hwgc_remember_pinned(d, page, write);
+    if (ret)
+    {
+        put_page(page);
+        return (int)ret;
+    }
+
+    pa_page = page_to_phys(page) & PAGE_MASK;
+
+    reg_write64(d, (u64)page_va, REG_IRQ_RES0);
+    reg_write64(d, (u64)pa_page, REG_IRQ_RES1);
+
+    reg_write32(d, CMD_CONTINUE, REG_CMD);
+
+    return 0;
+}
+
+static int hwgc_publish_sw_event(struct hwgc *d, u32 type)
+{
+    unsigned long flags;
+    struct HWGCEvent ev;
+
+    memset(&ev, 0, sizeof(ev));
+
+    ev.type = type;
+    ev.par0 = reg_read64(d, REG_IRQ_PAR0);
+    ev.par1 = reg_read64(d, REG_IRQ_PAR1);
+
+    spin_lock_irqsave(&d->event_lock, flags);
+
+    if (d->removing)
+    {
+        spin_unlock_irqrestore(&d->event_lock, flags);
+        return -ENODEV;
+    }
+
+    /*
+     * 当前实现只允许一个 outstanding software event。
+     *
+     * 因为你的设备寄存器也只有一组 IRQ_PAR / IRQ_RES。
+     * 如果以后设备允许多个 software event 并发，就需要 event_id/FIFO。
+     */
+    if (d->event_pending || d->event_in_service)
+    {
+        spin_unlock_irqrestore(&d->event_lock, flags);
+        return -EBUSY;
+    }
+
+    ev.seq = ++d->event_seq;
+    d->current_event = ev;
+    d->event_pending = true;
+
+    spin_unlock_irqrestore(&d->event_lock, flags);
+
+    wake_up_interruptible(&d->event_wq);
+
+    return 0;
+}
+
+static irqreturn_t hwgc_irq_top(int irq, void *data)
+{
+    struct hwgc *d;
+    unsigned long flags;
+    u32 st;
+
+    (void)irq;
+
+    d = data;
+    st = reg_read32(d, REG_IRQ_STATUS);
+
+    if (!st)
+        return IRQ_NONE;
+
+    reg_write32(d, st, REG_IRQ_CLEAR);
+
+    spin_lock_irqsave(&d->irq_lock, flags);
+    d->pending_irq |= st;
+    spin_unlock_irqrestore(&d->irq_lock, flags);
+
+    return IRQ_WAKE_THREAD;
+}
+
+static irqreturn_t hwgc_irq_thread(int irq, void *data)
+{
+    struct hwgc *d;
+    unsigned long flags;
+    u32 pending;
+    int ret;
+
+    (void)irq;
+
+    d = data;
+
+    spin_lock_irqsave(&d->irq_lock, flags);
+    pending = d->pending_irq;
+    d->pending_irq = 0;
+    spin_unlock_irqrestore(&d->irq_lock, flags);
+
+    if (pending & IRQ_ERROR)
+    {
+        d->op_status = -EIO;
+        printk("irq error\n");
+        reg_write32(d, CMD_RESET, REG_CMD);
+        complete(&d->done);
+        return IRQ_HANDLED;
+    }
+
+    if (pending & IRQ_TLB_MISS)
+    {
+        printk("irq tlb miss\n");
+        ret = hwgc_fill_tlb_for_miss(d);
+        if (ret)
+        {
+            d->op_status = ret;
+            reg_write32(d, CMD_RESET, REG_CMD);
+            complete(&d->done);
+            return IRQ_HANDLED;
+        }
+    }
+
+    // report to software
+    if (pending & IRQ_ALLOCATE)
+    {
+    }
+
+    // report to software
+    if (pending & IRQ_WAKE)
+    {
+    }
+
+    if (pending & IRQ_DONE)
+    {
+        d->op_status = 0;
+        complete(&d->done);
+    }
+
+    return IRQ_HANDLED;
+}
+
+static long hwgc_wait_event_ioctl(struct hwgc *d, unsigned long arg)
+{
+    struct HWGCEvent ev;
+    unsigned long flags;
+    int ret;
+
+    ret = wait_event_interruptible(d->event_wq, d->event_pending || d->removing);
+    if (ret)
+        return ret;
+
+    spin_lock_irqsave(&d->event_lock, flags);
+
+    if (d->removing)
+    {
+        spin_unlock_irqrestore(&d->event_lock, flags);
+        return -ENODEV;
+    }
+
+    if (!d->event_pending)
+    {
+        spin_unlock_irqrestore(&d->event_lock, flags);
+        return -EAGAIN;
+    }
+
+    ev = d->current_event;
+
+    d->event_pending = false;
+    d->event_in_service = true;
+
+    spin_unlock_irqrestore(&d->event_lock, flags);
+
+    if (copy_to_user((void __user *)arg, &ev, sizeof(ev)))
+        return -EFAULT;
+
+    return 0;
+}
+
+static long hwgc_reply_event_ioctl(struct hwgc *d, unsigned long arg)
+{
+    struct HWGCEvent ev;
+    unsigned long flags;
+    int ret = 0;
+
+    if (copy_from_user(&ev, (void __user *)arg, sizeof(ev)))
+        return -EFAULT;
+
+    spin_lock_irqsave(&d->event_lock, flags);
+
+    if (d->removing)
+    {
+        ret = -ENODEV;
+        goto out_unlock;
+    }
+
+    if (!d->event_in_service)
+    {
+        ret = -EINVAL;
+        goto out_unlock;
+    }
+
+    if (ev.seq != d->current_event.seq || ev.type != d->current_event.type)
+    {
+        ret = -EINVAL;
+        goto out_unlock;
+    }
+
+    d->event_in_service = false;
+    memset(&d->current_event, 0, sizeof(d->current_event));
+
+out_unlock:
+    spin_unlock_irqrestore(&d->event_lock, flags);
+
+    if (ret)
+        return ret;
+
+    reg_write64(d, ev.res0, REG_IRQ_RES0);
+    reg_write64(d, ev.res1, REG_IRQ_RES1);
+
+    reg_write32(d, CMD_CONTINUE, REG_CMD);
+
+    return 0;
+}
+
+static void hwgc_program_parameters(struct hwgc *d,
+                                    const struct HWGCParameters *p)
+{
+    void __iomem *base = hwgc->bar0 + REG_PAR0;
+    reg_write64(d, FIELD64(par->chunkSize, par->ageThreshold), base + 0x00);
+    reg_write64(d, FIELD64(par->heapRegionBias, par->regionAttrShiftBy), base + 0x08);
+    reg_write64(d, FIELD64(par->heapRegionShiftBy, par->logOfHRGrainBytes), base + 0x10);
+    reg_write32(d, FIELD64((((u64)(par->compressedOopShift) << 24) | ((u64)(par->compressedKlassPointerShift) << 16) | ((u64)(par->useCompressedOops) << 8) | ((u64)(par->useCompressedKlassPointers))), par->localBot), base + 0x18);
+    reg_write64(d, par->stepperOffset, base + 0x20);
+    reg_write64(d, par->youngWordsBase, base + 0x28);
+    reg_write64(d, par->regionAttrBase, base + 0x30);
+    reg_write64(d, par->plabAllocatorPtr, base + 0x38);
+    reg_write64(d, par->regionAttrBiasedBase, base + 0x40);
+    reg_write64(d, par->heapRegionBiasedBase, base + 0x48);
+    reg_write64(d, par->parScanThreadStatePtr, base + 0x50);
+    reg_write64(d, par->taskQueueElemsBase, base + 0x58);
+    reg_write64(d, par->humogousReclaimCandidateBoolBase, base + 0x60);
+    reg_write64(d, par->cardTablePtr, base + 0x68);
+    reg_write64(d, par->g1h, base + 0x70);
+    reg_write64(d, par->intArrayKlassObj, base + 0x78);
+    reg_write64(d, par->objectKlass, base + 0x80);
+    reg_write64(d, par->lockPtr, base + 0x88);
+    reg_write64(d, par->thread, base + 0x90);
+    reg_write64(d, par->dummyRegion, base + 0x98);
+    reg_write64(d, par->compressedOopBase, base + 0xa0);
+    reg_write64(d, par->compressedKlassPointerBase, base + 0xa8);
+}
+
+#define HWGC_RUN_TIMEOUT_MS 30000
+
+static long hwgc_run_ioctl(struct hwgc *d, unsigned long arg)
+{
+    struct HWGCParameters params;
+    unsigned long flags;
+    long timeout;
+    int ret;
+
+    if (copy_from_user(&params, (void __user *)arg, sizeof(params)))
+        return -EFAULT;
+
+    mutex_lock(&d->op_lock);
+
+    ret = 0;
+
+    if (d->op_active)
+    {
+        ret = -EBUSY;
+        goto out_unlock;
+    }
+
+    d->active_task = current;
+    get_task_struct(d->active_task);
+
+    d->active_mm = get_task_mm(current);
+    if (!d->active_mm)
+    {
+        put_task_struct(d->active_task);
+        d->active_task = NULL;
+        ret = -EINVAL;
+        goto out_unlock;
+    }
+
+    d->op_active = true;
+    d->op_status = 0;
+    d->nr_pinned = 0;
+
+    reinit_completion(&d->done);
+
+    spin_lock_irqsave(&d->irq_lock, flags);
+    d->pending_irq = 0;
+    spin_unlock_irqrestore(&d->irq_lock, flags);
+
+    spin_lock_irqsave(&d->event_lock, flags);
+    d->event_pending = false;
+    d->event_in_service = false;
+    memset(&d->current_event, 0, sizeof(d->current_event));
+    spin_unlock_irqrestore(&d->event_lock, flags);
+
+    /*
+     * 清理设备旧状态。
+     */
+    reg_write32(d, CMD_RESET, REG_CMD);
+    reg_write32(d, IRQ_ALL, REG_IRQ_CLEAR);
+
+    /*
+     * 打开设备中断。
+     */
+    reg_write32(d, ST_IRQ_EN, REG_STATUS);
+
+    /*
+     * 写入本次 HWGC 参数。
+     */
+    hwgc_program_parameters(d, &params);
+
+    /*
+     * 启动设备。
+     */
+    reg_write32(d, CMD_START, REG_CMD);
+
+    timeout = wait_for_completion_interruptible_timeout(
+        &d->done,
+        msecs_to_jiffies(HWGC_RUN_TIMEOUT_MS));
+
+    if (timeout == 0)
+    {
+        ret = -ETIMEDOUT;
+        reg_write32(d, CMD_RESET, REG_CMD);
+    }
+    else if (timeout < 0)
+    {
+        ret = (int)timeout;
+        reg_write32(d, CMD_RESET, REG_CMD);
+    }
+    else
+    {
+        ret = d->op_status;
+    }
+
+    /*
+     * 确保 IRQ thread 不再使用 active_task / active_mm / pinned pages。
+     */
+    synchronize_irq(d->irq);
+
+    /*
+     * 如果你有运行结果需要写回 params，可以在这里读结果寄存器，
+     * 然后 copy_to_user()。
+     *
+     * 当前 HWGCParameters 只是输入参数，所以这里不强制写回。
+     */
+    if (!ret)
+    {
+        if (copy_to_user((void __user *)arg, &params, sizeof(params)))
+            ret = -EFAULT;
+    }
+
+    hwgc_unpin_all(d);
+    hwgc_release_process_context(d);
+
+    spin_lock_irqsave(&d->event_lock, flags);
+    d->event_pending = false;
+    d->event_in_service = false;
+    memset(&d->current_event, 0, sizeof(d->current_event));
+    spin_unlock_irqrestore(&d->event_lock, flags);
+
+    wake_up_interruptible_all(&d->event_wq);
+
+    d->op_active = false;
+
+out_unlock:
+    mutex_unlock(&d->op_lock);
+    return ret;
+}
+
+static long hwgc_ioctl(struct file *filp,
+                       unsigned int cmd,
+                       unsigned long arg)
+{
+    struct hwgc *d = filp->private_data;
+
+    if (!d)
+        return -ENODEV;
+
+    switch (cmd)
+    {
+    case HWGC_IOC_RUN:
+        return hwgc_run_ioctl(d, arg);
+
+    case HWGC_IOC_WAIT_EVENT:
+        return hwgc_wait_event_ioctl(d, arg);
+
+    case HWGC_IOC_REPLY_EVENT:
+        return hwgc_reply_event_ioctl(d, arg);
+
+    default:
+        return -ENOTTY;
+    }
+}
+
+static int hwgc_open(struct inode *inode, struct file *filp)
+{
+    struct miscdevice *mdev = filp->private_data;
+    struct hwgc *d;
+
+    d = container_of(mdev, struct hwgc, miscdev);
+    filp->private_data = d;
+
     return 0;
 }
 
 static const struct file_operations hwgc_fops = {
     .owner = THIS_MODULE,
     .open = hwgc_open,
-    .read = hwgc_read,
     .unlocked_ioctl = hwgc_ioctl,
-    .llseek = default_llseek,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = hwgc_ioctl,
+#endif
+    .llseek = no_llseek,
 };
 
-/* PCI probe */
-static int hwgc_probe(struct pci_dev *pdev,
-                      const struct pci_device_id *id)
+static int hwgc_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
-    struct hwgc_dev *hwgc;
+
+    /*
+     * probe 阶段负责把 PCI 设备初始化成一个可用的字符设备：
+     *
+     *   1. 启用 PCI device
+     *   2. 申请 BAR region
+     *   3. 映射 BAR0 MMIO
+     *   4. 分配 IRQ vector
+     *   5. 注册 threaded IRQ
+     *   6. 注册 miscdevice，生成 /dev/xor_tlbdev0
+     */
+    struct hwgc *d;
     int ret;
 
-    hwgc = devm_kzalloc(&pdev->dev, sizeof(*hwgc), GFP_KERNEL);
-    if (!hwgc)
+    (void)id;
+
+    d = kzalloc(sizeof(*d), GFP_KERNEL);
+    if (!d)
         return -ENOMEM;
 
-    hwgc->pdev = pdev;
-    hwgc->state = HWGC_IDLE;
+    d->pdev = pdev;
+    pci_set_drvdata(pdev, d);
 
-    spin_lock_init(&hwgc->lock);
-    init_waitqueue_head(&hwgc->waitq);
-
-    pci_set_drvdata(pdev, hwgc);
-
-    ret = pcim_enable_device(pdev);
+    ret = pci_enable_device(pdev);
     if (ret)
-    {
-        dev_err(&pdev->dev, "pcim_enable_device failed: %d\n", ret);
-        return ret;
-    }
+        goto err_free;
+
+    ret = pci_request_regions(pdev, DRV_NAME);
+    if (ret)
+        goto err_disable;
 
     pci_set_master(pdev);
 
-    ret = pcim_iomap_regions(pdev, BIT(0), HWGC_DEV_NAME);
+    d->bar0 = pci_iomap(pdev, 0, 0);
+    if (!d->bar0)
+    {
+        ret = -ENOMEM;
+        goto err_regions;
+    }
+
+    ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI | PCI_IRQ_LEGACY);
+    if (ret < 0)
+        goto err_iounmap;
+
+    d->irq = pci_irq_vector(pdev, 0);
+    if (d->irq < 0)
+    {
+        ret = d->irq;
+        goto err_irq_vectors;
+    }
+
+    spin_lock_init(&d->irq_lock);
+    mutex_init(&d->op_lock);
+    init_completion(&d->done);
+
+    spin_lock_init(&d->event_lock);
+    init_waitqueue_head(&d->event_wq);
+
+    d->event_pending = false;
+    d->event_in_service = false;
+    d->event_seq = 0;
+    d->removing = false;
+
+    ret = request_threaded_irq(d->irq, hwgc_irq_top, hwgc_irq_thread, IRQF_ONESHOT, DRV_NAME, d);
     if (ret)
-    {
-        dev_err(&pdev->dev, "pcim_iomap_regions failed: %d\n", ret);
-        return ret;
-    }
+        goto err_irq_vectors;
 
-    hwgc->mmio = pcim_iomap_table(pdev)[0];
-    if (!hwgc->mmio)
-    {
-        dev_err(&pdev->dev, "BAR0 iomap failed\n");
-        return -ENOMEM;
-    }
+    d->miscdev.minor = MISC_DYNAMIC_MINOR;
+    d->miscdev.name = "xor_tlbdev0";
+    d->miscdev.fops = &hwgc_fops;
+    d->miscdev.parent = &pdev->dev;
 
-    // 多个 PCI 设备可能共享 INTx，所以这里用 IRQF_SHARED。irq_handler 里会检查 REG_IRQ_STATUS，不属于自己的中断返回 IRQ_NONE。
-    ret = devm_request_irq(&pdev->dev, pdev->irq, hwgc_irq_handler, IRQF_SHARED, HWGC_DEV_NAME, hwgc);
+    ret = misc_register(&d->miscdev);
     if (ret)
-    {
-        dev_err(&pdev->dev, "request_irq failed: %d\n", ret);
-        return ret;
-    }
+        goto err_free_irq;
 
-    hwgc->index = hwgc_alloc_minor();
-    if (hwgc->index < 0)
-    {
-        dev_err(&pdev->dev, "no free minor\n");
-        return hwgc->index;
-    }
-
-    hwgc->devno = MKDEV(MAJOR(hwgc_base_devno), hwgc->index);
-
-    cdev_init(&hwgc->cdev, &hwgc_fops);
-    hwgc->cdev.owner = THIS_MODULE;
-
-    ret = cdev_add(&hwgc->cdev, hwgc->devno, 1);
-    if (ret)
-    {
-        dev_err(&pdev->dev, "cdev_add failed: %d\n", ret);
-        goto err_free_minor;
-    }
-
-    hwgc->dev = device_create(hwgc_class, &pdev->dev, hwgc->devno, hwgc, HWGC_DEV_NAME "%d", hwgc->index);
-    if (IS_ERR(hwgc->dev))
-    {
-        ret = PTR_ERR(hwgc->dev);
-        dev_err(&pdev->dev, "device_create failed: %d\n", ret);
-        goto err_cdev_del;
-    }
-
-    dev_info(&pdev->dev, "hwgc: device probed as /dev/%s%d\n", HWGC_DEV_NAME, hwgc->index);
+    dev_info(&pdev->dev, "xor-tlbdev Linux 4.19 driver loaded: /dev/%s\n", d->miscdev.name);
 
     return 0;
 
-err_cdev_del:
-    cdev_del(&hwgc->cdev);
+err_free_irq:
+    free_irq(d->irq, d);
 
-err_free_minor:
-    hwgc_free_minor(hwgc->index);
+err_irq_vectors:
+    pci_free_irq_vectors(pdev);
 
+err_iounmap:
+    pci_iounmap(pdev, d->bar0);
+
+err_regions:
+    pci_clear_master(pdev);
+    pci_release_regions(pdev);
+
+err_disable:
+    pci_disable_device(pdev);
+
+err_free:
+    pci_set_drvdata(pdev, NULL);
+    kfree(d);
     return ret;
 }
 
 static void hwgc_remove(struct pci_dev *pdev)
 {
-    struct hwgc_dev *hwgc = pci_get_drvdata(pdev);
+    struct hwgc *d;
 
-    if (!hwgc)
+    d = pci_get_drvdata(pdev);
+    if (!d)
         return;
 
-    device_destroy(hwgc_class, hwgc->devno);
-    cdev_del(&hwgc->cdev);
-    hwgc_free_minor(hwgc->index);
+    misc_deregister(&d->miscdev);
 
-    dev_info(&pdev->dev, "hwgc: device /dev/%s%d removed\n", HWGC_DEV_NAME, hwgc->index);
+    mutex_lock(&d->op_lock);
+
+    reg_write32(d, CMD_RESET, REG_CMD);
+    synchronize_irq(d->irq);
+
+    xor_unpin_all(d);
+    xor_release_process_context(d);
+    d->op_active = false;
+
+    mutex_unlock(&d->op_lock);
+
+    free_irq(d->irq, d);
+    pci_free_irq_vectors(pdev);
+
+    pci_iounmap(pdev, d->bar0);
+
+    pci_clear_master(pdev);
+    pci_release_regions(pdev);
+    pci_disable_device(pdev);
+
+    pci_set_drvdata(pdev, NULL);
+    kfree(d);
 }
 
-static const struct pci_device_id hwgc_pci_ids[] = {
-    {PCI_DEVICE(0x1234, 0x0308)},
-    {},
-};
-MODULE_DEVICE_TABLE(pci, hwgc_pci_ids);
+static const struct pci_device_id hwgc_ids[] = {
+    {PCI_DEVICE(HWGC_VENDOR_ID, HWGC_DEVICE_ID)},
+    {
+        0,
+    }};
+MODULE_DEVICE_TABLE(pci, hwgc_ids);
 
 static struct pci_driver hwgc_pci_driver = {
-    .name = HWGC_DEV_NAME,
-    .id_table = hwgc_pci_ids,
+    .name = DRV_NAME,
+    .id_table = hwgc_ids,
     .probe = hwgc_probe,
     .remove = hwgc_remove,
 };
 
-static int __init hwgc_init(void)
-{
-    int ret;
-
-    ret = alloc_chrdev_region(&hwgc_base_devno, 0, HWGC_MAX_DEVS, HWGC_DEV_NAME);
-    if (ret)
-    {
-        pr_err("hwgc: alloc_chrdev_region failed: %d\n", ret);
-        return ret;
-    }
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-    hwgc_class = class_create(HWGC_DEV_NAME);
-#else
-    hwgc_class = class_create(THIS_MODULE, HWGC_DEV_NAME);
-#endif
-
-    if (IS_ERR(hwgc_class))
-    {
-        ret = PTR_ERR(hwgc_class);
-        pr_err("hwgc: class_create failed: %d\n", ret);
-        goto err_unregister_chrdev;
-    }
-
-    ret = pci_register_driver(&hwgc_pci_driver);
-    if (ret)
-    {
-        pr_err("hwgc: pci_register_driver failed: %d\n", ret);
-        goto err_class_destroy;
-    }
-
-    pr_info("hwgc: module loaded, major=%d\n", MAJOR(hwgc_base_devno));
-    return 0;
-
-err_class_destroy:
-    class_destroy(hwgc_class);
-
-err_unregister_chrdev:
-    unregister_chrdev_region(hwgc_base_devno, HWGC_MAX_DEVS);
-
-    return ret;
-}
-
-static void __exit hwgc_exit(void)
-{
-    pci_unregister_driver(&hwgc_pci_driver);
-
-    class_destroy(hwgc_class);
-    unregister_chrdev_region(hwgc_base_devno, HWGC_MAX_DEVS);
-
-    pr_info("hwgc: module unloaded\n");
-}
-
-module_init(hwgc_init);
-module_exit(hwgc_exit);
+module_pci_driver(xor_pci_driver);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("QEMU hwgc PCI driver with per-device /dev/hwgcN nodes");
+MODULE_AUTHOR("demo");
+MODULE_DESCRIPTION("QEMU xor-tlbdev PCI driver with Linux 4.19 GUP compatibility");

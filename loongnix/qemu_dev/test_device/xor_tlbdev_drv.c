@@ -289,7 +289,7 @@ static int xor_fill_tlb_for_miss(struct xor_tlbdev *d)
 	 */
 	down_read(&mm->mmap_sem);
 
-	ret = get_user_pages_remote(task, mm, page_va, 1, gup_flag, &page, NULL, &locked);
+	ret = get_user_pages_remote(task, mm, page_va, 1, gup_flags, &page, NULL, &locked);
 
 	if (locked)
 		up_read(&mm->mmap_sem);
