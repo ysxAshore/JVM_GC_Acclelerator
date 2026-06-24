@@ -1,0 +1,1 @@
+sudo ./build_v1/linux-loongarch64-server-release/jdk/bin/java -XX:+PrintGCDetails -XX:+UseCompressedOops -XX:+UseCompressedClassPointers -XX:ParallelGCThreads=1 -XX:ConcGCThreads=1 -XX:+UseG1GC -jar ../test/benchmark/dacapo/dacapo-23.11-MR2-chopin.jar avrora

@@ -1,5 +1,8 @@
 #include "hwgc_ioctl.h"
 
+// 分配 /dev/hwgcN 的 N，保证多个 PCI 实例不会重名
+static DEFINE_IDA(hwgc_ida);
+
 static void hwgc_unpin_all(struct hwgc *d)
 {
     struct page *page;
@@ -563,7 +566,7 @@ static int hwgc_probe(struct pci_dev *pdev, const struct pci_device_id *id)
      *   3. 映射 BAR0 MMIO
      *   4. 分配 IRQ vector
      *   5. 注册 threaded IRQ
-     *   6. 注册 miscdevice，生成 /dev/xor_tlbdev0
+     *   6. 注册 miscdevice，生成 /dev/hwgcN
      */
     struct hwgc *d;
     int ret;
@@ -620,18 +623,28 @@ static int hwgc_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (ret)
         goto err_irq_vectors;
 
+    ret = ida_simple_get(&hwgc_ida, 0, 0, GFP_KERNEL);
+    if (ret < 0)
+        goto err_free_irq;
+    d->dev_id = ret;
+    snprintf(d->dev_name, sizeof(d->dev_name), "hwgc%d", d->dev_id);
+
     d->miscdev.minor = MISC_DYNAMIC_MINOR;
-    d->miscdev.name = "hwgc0";
+    d->miscdev.name = d->dev_name;
     d->miscdev.fops = &hwgc_fops;
     d->miscdev.parent = &pdev->dev;
 
     ret = misc_register(&d->miscdev);
     if (ret)
-        goto err_free_irq;
+        goto err_free_id;
 
-    dev_info(&pdev->dev, "xor-tlbdev Linux 4.19 driver loaded: /dev/%s\n", d->miscdev.name);
+    dev_info(&pdev->dev, "hwgc Linux 4.19 driver loaded: /dev/%s\n", d->miscdev.name);
 
     return 0;
+
+err_free_id:
+    ida_simple_remove(&hwgc_ida, d->dev_id);
+    d->dev_id = -1;
 
 err_free_irq:
     free_irq(d->irq, d);
@@ -672,6 +685,12 @@ static void hwgc_remove(struct pci_dev *pdev)
     wake_up_interruptible_all(&d->event_wq);
 
     misc_deregister(&d->miscdev);
+
+    if (d->dev_id >= 0)
+    {
+        ida_simple_remove(&hwgc_ida, d->dev_id);
+        d->dev_id = -1;
+    }
 
     mutex_lock(&d->op_lock);
 

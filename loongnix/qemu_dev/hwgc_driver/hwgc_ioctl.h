@@ -1,29 +1,23 @@
-#include <linux/module.h>
-#include <linux/pci.h>
-#include <linux/interrupt.h>
-#include <linux/miscdevice.h>
-#include <linux/fs.h>
-#include <linux/uaccess.h>
-#include <linux/mutex.h>
-#include <linux/wait.h>
-#include <linux/spinlock.h>
-#include <linux/mm.h>
-#include <linux/sched.h>
+
+#include <linux/io.h>         // ioread iowrite
+#include <linux/fs.h>         // file_operations
+#include <linux/mm.h>         // mmap
+#include <linux/pci.h>        // pci_dev
+#include <linux/wait.h>       // wait_queue_head_t
+#include <linux/mutex.h>      // mutex_lock and unlock
+#include <linux/module.h>     // module_init/exit module_pci_driver
+#include <linux/spinlock.h>   // spin_lock and unlock
+#include <linux/interrupt.h>  // request irq
+#include <linux/miscdevice.h> // miscdevice
+#include <linux/sched.h>      // get_user_pages_remote need parameters
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
-#include <linux/io.h>
-#include <linux/slab.h>
-
-#include <linux/cdev.h>
-#include <linux/device.h>
-#include <linux/bitops.h>
-#include <linux/version.h>
-#include <linux/completion.h>
-#include <linux/highmem.h>
 
 #define DRV_NAME "hwgc"
 #define HWGC_VENDOR_ID 0x1234
 #define HWGC_DEVICE_ID 0x0308
+
+#define HWGC_DEV_NAME_LEN 32
 
 #define REG_STATUS 0x0
 #define REG_IRQ_STATUS 0x4
@@ -177,6 +171,9 @@ struct hwgc
     void __iomem *bar0;
     int irq;
 
+    int dev_id;
+    char dev_name[HWGC_DEV_NAME_LEN];
+
     struct miscdevice miscdev; // 字符设备
     struct mutex op_lock;      // 保证同一时刻只有一个ioctl操作在使用设备
 
@@ -271,7 +268,7 @@ static void hwgc_program_parameters(struct hwgc *d, const struct HWGCParameters 
     reg_write64(d, FIELD64(p->chunkSize, p->ageThreshold), REG_PAR0);
     reg_write64(d, FIELD64(p->heapRegionBias, p->heapRegionShiftBy), REG_PAR1);
     reg_write64(d, FIELD64(p->regionAttrShiftBy, p->logOfHRGrainBytes), REG_PAR2);
-    reg_write32(d, FIELD64(p->localBot, (((u32)(p->compressedKlassPointerShift) << 24) | ((u32)(p->useCompressedKlassPointers) << 16) | ((u32)(p->compressedOopShift) << 8) | ((u32)(p->useCompressedOops)))), REG_PAR3);
+    reg_write64(d, FIELD64(p->localBot, (((u32)(p->compressedKlassPointerShift) << 24) | ((u32)(p->useCompressedKlassPointers) << 16) | ((u32)(p->compressedOopShift) << 8) | ((u32)(p->useCompressedOops)))), REG_PAR3);
     reg_write64(d, p->stepperOffset, REG_PAR4);
     reg_write64(d, p->youngWordsBase, REG_PAR5);
     reg_write64(d, p->regionAttrBase, REG_PAR6);
