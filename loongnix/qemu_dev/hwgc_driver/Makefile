@@ -5,7 +5,7 @@ obj-m += hwgc_driver.o
 MACHINE := $(shell uname -m)
 
 ifeq ($(MACHINE),x86_64)
-	KDIR := /home/sxyang/Projects/vm-env/busybox/linux-4.19.190.8.14
+	KDIR := ../../../../vm-env/busybox/linux-4.19.190.8.14
 #	ARCH := loongarch
 else
 	KDIR := /lib/modules/$(shell uname -r)/build
