@@ -90,7 +90,6 @@ class GCAccTop extends Module with GCTopParameters {
   // GCTaskStack
   gcTaskStack.io.toFetch <> gcFetch.io.toFetch
   gcTaskStack.io.toStack <> gcTrace.io.ToStack
-  gcTaskStack.io.gcUpdatedRegion <> gcOopCopy2Survivor.io.ToStack
   gcTaskStack.io.gcUpdatedAop <> gcAop.io.ToStack
   gcTaskStack.io.Mreq <> gcUnalignedMMUAdapter(0).io.in
   gcTaskStack.io.ConfigIO.TaskQueue_Bottom := TaskQueue_Bottom

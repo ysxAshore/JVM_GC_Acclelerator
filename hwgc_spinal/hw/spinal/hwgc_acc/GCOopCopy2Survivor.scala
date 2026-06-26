@@ -60,7 +60,6 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
     val ToCopy = master(new GCToCopy)
     val ToFetch = master(new GCWriteSrcOopPtr)
     val ToTrace = master(new GCToTrace)
-    val ToStack = master(new GCUpdatedRegion)
     val ToAllocate = master(new GCToAllocate)
 
     val ToCopySurvivor = slave(new GCToSurvivor)
@@ -325,13 +324,6 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
     plabCacheBufferValid(0) := False
     plabCacheBufferValid(1) := False
   }
-
-  io.ToStack.Valid0 := plabCacheValid(0)
-  io.ToStack.Valid1 := plabCacheValid(1)
-  io.ToStack.Buffer0 := plabCacheBuffer(0)
-  io.ToStack.Buffer1 := plabCacheBuffer(1)
-  io.ToStack.RegionTop0 := plabCacheTop(0)
-  io.ToStack.RegionTop1 := plabCacheTop(1)
 
   // downstream done capture
   when(copyBusy && io.ToCopy.Done) {

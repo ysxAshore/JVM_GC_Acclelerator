@@ -58,7 +58,9 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
   val inOffsetNow        = io.in.Request.payload.RequestVirtualAddr(log2Up(LineBytesNum) - 1 downto 0)
   val inCrossBeatNow     = inOffsetNow + io.in.Request.payload.RequestSize > LineBytesNum
   val alignedAccessNow   = inOffsetNow === 0 && !inCrossBeatNow
-  val directAlignedReqNow = !busy && !respBufValid && io.in.Request.valid && alignedAccessNow
+  val cmpxchgNow         = io.in.Request.payload.NeedDoCmpxChg
+  val directAccessNow    = alignedAccessNow || cmpxchgNow
+  val directReqNow = !busy && !respBufValid && io.in.Request.valid && directAccessNow
 
   val writeData0 = reqData |<< (offset << 3)
   val writeData1 = reqData |>> (firstBytes << 3)
@@ -66,7 +68,7 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
   val mask1      = (U(1, LineBytesNum bits) |<< secondBytes) - 1
 
   // accept one new request
-  io.in.Request.ready := (!busy && !respBufValid) && (!alignedAccessNow || io.out.Request.ready)
+  io.in.Request.ready := (!busy && !respBufValid) && (!directAccessNow || io.out.Request.ready)
 
   when(io.in.Request.fire) {
     size          := io.in.Request.payload.RequestSize
@@ -76,8 +78,8 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
     needResponse  := io.in.Request.payload.NeedResponse
     needDoCmpXchg := io.in.Request.payload.NeedDoCmpxChg
 
-    splitReq := inCrossBeatNow && !alignedAccessNow
-    when(alignedAccessNow) {
+    splitReq := inCrossBeatNow && !alignedAccessNow & !cmpxchgNow
+    when(directAccessNow) {
       sendBeat0Pending := False
       sendBeat1Pending := False
     } otherwise {
@@ -92,9 +94,9 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
   val issueBeat0 = busy && sendBeat0Pending
   val issueBeat1 = busy && !sendBeat0Pending && sendBeat1Pending
 
-  io.out.Request.valid := issueBeat0 || issueBeat1 || directAlignedReqNow
+  io.out.Request.valid := issueBeat0 || issueBeat1 || directReqNow
 
-  when(directAlignedReqNow) {
+  when(directReqNow) {
     io.out.Request.payload.RequestVirtualAddr := io.in.Request.payload.RequestVirtualAddr
     io.out.Request.payload.RequestSourceID := io.out.ConherentRequsetSourceID.payload
     io.out.Request.payload.RequestData := io.in.Request.payload.RequestData
@@ -136,7 +138,7 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
     }.elsewhen(issueBeat1) {
       secondSourceID := io.out.ConherentRequsetSourceID.payload
       sendBeat1Pending := False
-    }.elsewhen(directAlignedReqNow) {
+    }.elsewhen(directReqNow) {
       firstSourceID := io.out.ConherentRequsetSourceID.payload
     }
   }

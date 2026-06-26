@@ -152,19 +152,6 @@ class GCWriteSrcOopPtr extends Bundle with GCTopParameters with IMasterSlave {
   }
 }
 
-class GCUpdatedRegion extends Bundle with GCTopParameters with IMasterSlave {
-  val Valid0 = in Bool ()
-  val Valid1 = in Bool ()
-  val Buffer0 = in UInt (GCElementWidth bits)
-  val Buffer1 = in UInt (GCElementWidth bits)
-  val RegionTop0 = in UInt (GCElementWidth bits)
-  val RegionTop1 = in UInt (GCElementWidth bits)
-
-  override def asMaster(): Unit = {
-    out(Valid0, Valid1, Buffer0, Buffer1, RegionTop0, RegionTop1)
-  }
-}
-
 class GCUpdatedAop extends Bundle with GCTopParameters with IMasterSlave {
   val Valid0 = in Bool ()
   val Valid1 = in Bool ()

@@ -20,7 +20,6 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   val io = new Bundle {
     val toFetch = master(new GCToFetch)
     val toStack = slave(new GCToStack)
-    val gcUpdatedRegion = slave(new GCUpdatedRegion)
     val gcUpdatedAop = slave(new GCUpdatedAop)
     val Mreq = master(new LocalMMUIO)
     val ConfigIO = slave(new GCTaskStackConfigIO)
@@ -208,9 +207,11 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
     def clear(): Unit = { issued := False }
   }
 
-  //  MMU Update Area – 6 sequential write requests (UPDATE_CACHE state)
+  //  MMU Update Area – 3 sequential write requests (UPDATE_CACHE state)
   val mmuUpdate = new Area {
-    val idx = RegInit(U(0, 3 bits))
+    val reqIdx = RegInit(U(0, 2 bits))
+    val sendIdx = RegInit(U(0, 2 bits))
+    val respIdx = RegInit(U(0, 2 bits))
 
     def generateUpdateMMU(idx: UInt): (Bool, UInt, UInt, UInt) = {
       val valid = Bool()
@@ -218,37 +219,46 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       val size  = UInt(LineBytesNumBitSize bits)
       val data  = UInt(MMUDataWidth bits)
       switch (idx) {
-        is(U(0)) { addr := io.gcUpdatedRegion.Buffer0;  size := U(8);  data := io.gcUpdatedRegion.RegionTop0.resize(MMUDataWidth); valid := io.gcUpdatedRegion.Valid0 }
-        is(U(1)) { addr := io.gcUpdatedRegion.Buffer1;  size := U(8);  data := io.gcUpdatedRegion.RegionTop1.resize(MMUDataWidth); valid := io.gcUpdatedRegion.Valid1 }
-        is(U(2)) { addr := io.gcUpdatedAop.Addr0;       size := U(8);  data := io.gcUpdatedAop.Data0.resize(MMUDataWidth);      valid := io.gcUpdatedAop.Valid0 }
-        is(U(3)) { addr := io.gcUpdatedAop.Addr1;       size := U(24); data := io.gcUpdatedAop.Data1.resize(MMUDataWidth);      valid := io.gcUpdatedAop.Valid1 }
-        is(U(4)) { addr := io.gcUpdatedAop.Addr2;       size := U(16); data := io.gcUpdatedAop.Data2.resize(MMUDataWidth);      valid := io.gcUpdatedAop.Valid2 }
-        is(U(5)) { addr := io.gcUpdatedAop.Addr3;       size := U(32) - io.gcUpdatedAop.Addr3(4 downto 0); data := io.gcUpdatedAop.Data3.resize(MMUDataWidth); valid := io.gcUpdatedAop.Valid3 }
+        is(U(0)) { addr := io.gcUpdatedAop.Addr0;       size := U(8);  data := io.gcUpdatedAop.Data0.resize(MMUDataWidth);      valid := io.gcUpdatedAop.Valid0 }
+        is(U(1)) { addr := io.gcUpdatedAop.Addr1;       size := U(24); data := io.gcUpdatedAop.Data1.resize(MMUDataWidth);      valid := io.gcUpdatedAop.Valid1 }
+        is(U(2)) { addr := io.gcUpdatedAop.Addr2;       size := U(16); data := io.gcUpdatedAop.Data2.resize(MMUDataWidth);      valid := io.gcUpdatedAop.Valid2 }
         default  { addr := U(0); size := U(0); data := U(0); valid := False }
       }
       (valid, addr, size, data)
     }
 
     def run(): Unit = {
-      val (valid, addr, size, data) = generateUpdateMMU(idx)
-      io.Mreq.Request.valid := valid
+      val (valid, addr, size, data) = generateUpdateMMU(reqIdx)
+      io.Mreq.Request.valid := valid && reqIdx < 3
       io.Mreq.Request.payload.RequestType_isWrite := True
       io.Mreq.Request.payload.RequestVirtualAddr := addr
       io.Mreq.Request.payload.RequestSourceID := io.Mreq.ConherentRequsetSourceID.payload
       io.Mreq.Request.payload.NeedDoCmpxChg := False
       io.Mreq.Request.payload.RequestWStrb := getWstrb(size.resize(LineBytesNumBitSize))
-      io.Mreq.Request.payload.NeedResponse := False
+      io.Mreq.Request.payload.NeedResponse := True
       io.Mreq.Request.payload.RequestData := data
       io.Mreq.Request.payload.RequestSize := size.resize(LineBytesNumBitSize)
       io.Mreq.Response.ready := True
 
-      when(io.Mreq.Request.fire || !valid) {
-        when(idx < 6) { idx := idx + 1 }
+      when(!valid && reqIdx < 3){
+        reqIdx := reqIdx + 1
+      }
+
+      when(io.Mreq.Request.fire){
+        reqIdx := reqIdx + 1
+        sendIdx := sendIdx + 1
+      }
+
+      when(io.Mreq.Response.fire){
+        respIdx := respIdx + 1
       }
     }
 
-    def clear(): Unit = { idx := U(0) }
-    def updateFinished: Bool = idx === 6
+    def clear(): Unit = {
+      reqIdx := U(0)
+      respIdx := U(0)
+    }
+    def updateFinished: Bool = reqIdx === 3 && respIdx === sendIdx
   }
 
   //  StateMachine: IDLE → WORK → UPDATE_CACHE → IDLE
