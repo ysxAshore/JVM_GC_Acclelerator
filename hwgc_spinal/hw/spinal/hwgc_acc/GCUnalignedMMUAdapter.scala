@@ -58,7 +58,10 @@ class GCUnalignedMMUAdapter extends Component with HWParameters  {
   val inOffsetNow        = io.in.Request.payload.RequestVirtualAddr(log2Up(LineBytesNum) - 1 downto 0)
   val inCrossBeatNow     = inOffsetNow + io.in.Request.payload.RequestSize > LineBytesNum
   val alignedAccessNow   = inOffsetNow === 0 && !inCrossBeatNow
-  val cmpxchgNow         = io.in.Request.payload.NeedDoCmpxChg
+
+  // Chipyard still must aligned
+  // val cmpxchgNow         = io.in.Request.payload.NeedDoCmpxChg
+  val cmpxchgNow         = False
   val directAccessNow    = alignedAccessNow || cmpxchgNow
   val directReqNow = !busy && !respBufValid && io.in.Request.valid && directAccessNow
 
