@@ -31,6 +31,8 @@ case class CopySurvivorSlotCtx() extends Bundle with GCTopParameters {
   val plabForceOld = Bool()
 
   val monitor_mw = UInt(GCElementWidth bits)
+  val plabCacheBottom = UInt(GCElementWidth bits)
+  val plabCacheHardEnd = UInt(GCElementWidth bits)
 
   val writeDestOopPtrDone = Bool()
 
@@ -128,10 +130,8 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   val plabCacheBuffer = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
   val plabCacheBufferPtr = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
   val plabCacheBufferValid = Vec.fill(2)(RegInit(False))
-  val plabCacheBottom = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
   val plabCacheTop = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
   val plabCacheEnd = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
-  val plabCacheHardEnd = Vec.fill(2)(RegInit(U(0, GCElementWidth bits)))
   val plabCacheValid = Vec.fill(2)(RegInit(False))
   val plabRefillBusy = Vec.fill(2)(RegInit(False))
   val plabRefillOwner = Vec.fill(2)(RegInit(U(0, 1 bits)))
@@ -242,16 +242,6 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   def selectDestAttrOfRegionType(regionType: UInt): UInt =
     Mux(regionType === U(1), destAttrRegionCache(31 downto 16), destAttrRegionCache(15 downto 0)).resize(16)
 
-  def gotoPlabSelectHelper(i: Int, markWord: UInt): Unit = {
-    val new_age = (markWord >> 3).resize(4).resize(32)
-    slotCtx(i).age := new_age
-    when(new_age < io.ConfigIO.AgeThreshold) {
-      slotCtx(i).destRegionAttr := slotCtx(i).srcRegionAttr
-      slotCtx(i).destAttrPtr := slotCtx(i).regionAttrPtr
-      slotCtx(i).plabTargetIdx := slotCtx(i).srcRegionAttr(15 downto 8).resize(1)
-    }
-  }
-
   // klass cache lookup
   val klassLookupPtr = Vec.fill(2)(UInt(GCElementWidth bits))
   val klassCacheHit = Vec.fill(2)(Bool())
@@ -287,10 +277,8 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
 
   val plabTopEndFillValid = Vec.fill(2)(Bool())
   val plabTopEndFillIdx = Vec.fill(2)(UInt(1 bits))
-  val plabBottomFillData = Vec.fill(2)(UInt(GCElementWidth bits))
   val plabTopFillData = Vec.fill(2)(UInt(GCElementWidth bits))
   val plabEndFillData = Vec.fill(2)(UInt(GCElementWidth bits))
-  val plabHardEndFillData = Vec.fill(2)(UInt(GCElementWidth bits))
 
   for (i <- 0 until 2) {
     klassFillValid(i) := False
@@ -312,8 +300,6 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
     plabTopEndFillIdx(i) := U(0, 1 bits)
     plabTopFillData(i) := U(0, GCElementWidth bits)
     plabEndFillData(i) := U(0, GCElementWidth bits)
-    plabBottomFillData(i) := U(0, GCElementWidth bits)
-    plabHardEndFillData(i) := U(0, GCElementWidth bits)
   }
 
   // task done invalidates shared caches
@@ -375,6 +361,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
       val READ_KLASS = new State
       val SIZE_DEICIDE = new State
       val DEST_ATTR_DECIDE = new State
+      val AGE_THRESHOLD = new State
       val AGE_DECIDE = new State
       val PLAB_SELECT = new State
       val READ_PLAB_PTR = new State
@@ -388,6 +375,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
       val GET_MONITOR_MW = new State
       val WRITE_MONITOR_MW = new State
       val WAIT_COPY_TRACE = new State
+      val READ_BOTTOM_HARD_END = new State
       val WRITE_FORWARDPTR_NOT_ZERO = new State
 
       def doPlabCacheAllocDirect(): Unit = {
@@ -416,7 +404,6 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
           goto(DECIDE_FORWARD_PTR)
         }
       }
-
 
       IDLE.whenIsActive {
       }
@@ -474,14 +461,15 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
           when(slotCtx(i).kid =/= U(InstanceMirrorKlassID, 32 bits)) {
             slotCtx(i).size := (slotCtx(i).lh >> U(3)).resize(32)
           }.otherwise {
-            issueReq(m, slotCtx(i).srcOopPtr + U"x20", False, U(8), U(0), True, False, mmuIssued(i)) { rd =>
+            val offset = Mux(io.ConfigIO.UseCompressedKlassPointer, U"x20", U"x24")
+            issueReq(m, slotCtx(i).srcOopPtr + offset, False, U(8), U(0), True, False, mmuIssued(i)) { rd =>
               slotCtx(i).size := rd(31 downto 0)
               goto(DEST_ATTR_DECIDE)
             }
           }
         }
 
-        when(slotCtx(i).lh.asSInt === S(0) || (slotCtx(i).lh.asSInt > S(0) && slotCtx(i).lh(0))) {
+        when((slotCtx(i).lh.asSInt === S(0) || (slotCtx(i).lh.asSInt > S(0) && slotCtx(i).lh(0))) && slotCtx(i).kid === U(InstanceMirrorKlassID, 32 bits)) {
         } otherwise {
           goto(DEST_ATTR_DECIDE)
         }
@@ -517,37 +505,39 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
           slotCtx(i).destRegionAttr := cachedDestAttr
           slotCtx(i).plabTargetIdx := cachedPlabIdx
 
-          when(srcType =/= U(0)) {
-            goto(PLAB_SELECT)
-          }.elsewhen(slotCtx(i).markWord(0)) {
-            gotoPlabSelectHelper(i, slotCtx(i).markWord)
-            goto(PLAB_SELECT)
-          } otherwise {
-            val addr = Mux(slotCtx(i).markWord(1), slotCtx(i).markWord ^ U"x2".resize(GCElementWidth), slotCtx(i).markWord)
+          goto(AGE_DECIDE)
+        }
+      }
 
-            issueReq(m, addr, False, U(8), U(0), True, False, mmuIssued(i)) { rd =>
-              gotoPlabSelectHelper(i, rd(GCElementWidth - 1 downto 0))
-              goto(PLAB_SELECT)
-            }
+      AGE_THRESHOLD.whenIsActive {
+        issueReq(m, io.ConfigIO.ParScanThreadStatePtr + U"x17c", False, U(4), U(0), True, False, mmuIssued(i)) { rd =>
+          val ageThreshold = rd(31 downto 0)
+          val new_age = (slotCtx(i).monitor_mw >> 3).resize(4).resize(32)
+          slotCtx(i).age := new_age
+
+          when(new_age < ageThreshold) {
+            slotCtx(i).destRegionAttr := slotCtx(i).srcRegionAttr
+            slotCtx(i).destAttrPtr := slotCtx(i).regionAttrPtr
+            slotCtx(i).plabTargetIdx := slotCtx(i).srcRegionAttr(15 downto 8).resize(1)
           }
+          goto(PLAB_SELECT)
         }
       }
 
       AGE_DECIDE.whenIsActive {
         val src_region_attr_type = slotCtx(i).srcRegionAttr(15 downto 8)
+
         when(src_region_attr_type =/= U(0)) {
           goto(PLAB_SELECT)
-        }.otherwise {
-          when(slotCtx(i).markWord(0)) {
-            gotoPlabSelectHelper(i, slotCtx(i).markWord)
-            goto(PLAB_SELECT)
-          }.otherwise {
-            val addr = Mux(slotCtx(i).markWord(1), slotCtx(i).markWord ^ U"x2".resize(GCElementWidth), slotCtx(i).markWord)
+        }.elsewhen(slotCtx(i).markWord(0)) {
+          slotCtx(i).monitor_mw := slotCtx(i).markWord
+          goto(AGE_THRESHOLD)
+        } otherwise {
+          val addr = Mux(slotCtx(i).markWord(1), slotCtx(i).markWord ^ U"x2".resize(GCElementWidth), slotCtx(i).markWord)
 
-            issueReq(m, addr, False, U(8), U(0), True, False, mmuIssued(i)) { rd =>
-              gotoPlabSelectHelper(i, rd(GCElementWidth - 1 downto 0))
-              goto(PLAB_SELECT)
-            }
+          issueReq(m, addr, False, U(8), U(0), True, False, mmuIssued(i)) { rd =>
+            slotCtx(i).monitor_mw := rd(GCElementWidth - 1 downto  0)
+            goto(AGE_THRESHOLD)
           }
         }
       }
@@ -596,15 +586,13 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
 
       READ_PLAB_TOPEND.whenIsActive {
         val idx = slotCtx(i).plabTargetIdx
-        val addr = (plabCacheBuffer(idx) + U"x28").resize(MMUAddrWidth)
+        val addr = (plabCacheBuffer(idx) + U"x30").resize(MMUAddrWidth)
 
-        issueReq(m, addr, False, U(32), U(0), True, False, mmuIssued(i)) { rd =>
+        issueReq(m, addr, False, U(16), U(0), True, False, mmuIssued(i)) { rd =>
           plabTopEndFillValid(i) := True
           plabTopEndFillIdx(i) := idx
-          plabBottomFillData(i) := rd(GCElementWidth - 1 downto 0)
-          plabTopFillData(i) := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
-          plabEndFillData(i) := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
-          plabHardEndFillData(i) := rd(GCElementWidth * 4 - 1 downto GCElementWidth * 3)
+          plabTopFillData(i) := rd(GCElementWidth - 1 downto 0)
+          plabEndFillData(i) := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
 
           goto(PLAB_SELECT)
         }
@@ -704,7 +692,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
             goto(SEND_WORK)
           } otherwise {
             slotCtx(i).forwardPtr := slotCtx(i).markWord & ~U"x3".resize(GCElementWidth bits)
-            goto(WRITE_FORWARDPTR_NOT_ZERO)
+            goto(READ_BOTTOM_HARD_END)
           }
 
         }
@@ -779,10 +767,23 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
         }
       }
 
+      READ_BOTTOM_HARD_END.whenIsActive {
+        val idx = slotCtx(i).plabTargetIdx
+        val addr = (plabCacheBuffer(idx) + U"x28").resize(MMUAddrWidth)
+
+        issueReq(m, addr, False, U(32), U(0), True, False, mmuIssued(i)) { rd =>
+          slotCtx(i).plabCacheBottom := rd(GCElementWidth - 1 downto 0)
+          slotCtx(i).plabCacheHardEnd := rd(GCElementWidth * 4 - 1 downto GCElementWidth * 3)
+
+          goto(WRITE_FORWARDPTR_NOT_ZERO)
+        }
+
+      }
+
       WRITE_FORWARDPTR_NOT_ZERO.whenIsActive {
         val idx = slotCtx(i).plabTargetIdx
 
-        when(slotCtx(i).destOopPtr >= plabCacheBottom(idx) && slotCtx(i).destOopPtr < plabCacheHardEnd(idx)) {
+        when(slotCtx(i).destOopPtr >= slotCtx(i).plabCacheBottom && slotCtx(i).destOopPtr < slotCtx(i).plabCacheHardEnd) {
           val otherIdx = idx ^ 1
 
           when(plabCacheValid(idx)) {
@@ -994,15 +995,11 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
     when(plabTopEndFillValid(0) && plabTopEndFillIdx(0) === U(j, 1 bits)) {
       plabCacheTop(j) := plabTopFillData(0)
       plabCacheEnd(j) := plabEndFillData(0)
-      plabCacheBottom(j) := plabBottomFillData(0)
-      plabCacheHardEnd(j) := plabHardEndFillData(0)
       plabCacheValid(j) := True
       plabRefillBusy(j) := False
     } elsewhen(plabTopEndFillValid(1) && plabTopEndFillIdx(1) === U(j, 1 bits)) {
       plabCacheTop(j) := plabTopFillData(1)
       plabCacheEnd(j) := plabEndFillData(1)
-      plabCacheBottom(j) := plabBottomFillData(1)
-      plabCacheHardEnd(j) := plabHardEndFillData(1)
       plabCacheValid(j) := True
       plabRefillBusy(j) := False
     }
