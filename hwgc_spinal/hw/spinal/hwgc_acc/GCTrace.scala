@@ -441,14 +441,16 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
 
     POST_INSTANCE_SCAN.whenIsActive {
       when(Kid === U(InstanceMirrorKlassID)) {
-        val address = SrcOopPtr + U"x24"
+        val staticCountOff = Mux(io.ConfigIO.UseCompressedKlassPointers, U"x24", U"x28")
+        val beginOff = Mux(io.ConfigIO.UseCompressedKlassPointers, U"x70", U"xb8")
+        val address = SrcOopPtr + staticCountOff
 
         issueReq(io.Mreq, address, False, U(4), U(0), True, False, issued) { readData =>
-          val mirrorArrayLength = readData(31 downto 0)
+          val mirrorCount = readData(31 downto 0)
 
-          p := DestOopPtr + U"x70"
-          q := (DestOopPtr + U"x70" + mirrorArrayLength * oopStride).resize(GCElementWidth)
-          remainCount := mirrorArrayLength.resize(32)
+          p := DestOopPtr + beginOff
+          q := (DestOopPtr + beginOff + mirrorCount * oopStride).resize(GCElementWidth)
+          remainCount := mirrorCount.resize(32)
 
           goto(SCAN_FORWARD)
         }

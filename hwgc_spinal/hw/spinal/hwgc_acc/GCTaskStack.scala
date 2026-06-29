@@ -16,32 +16,16 @@ import scala.language.postfixOps
  *   2. Pop / PrePop 不直接等待 readSync，而是从栈顶寄存器缓存 TopCache 中返回。
  *   3. readSync 在后台 refill TopCache，把同步读 1 拍延迟隐藏起来。
  *
- * 指针语义：
- *   stack_top
- *      - 指向当前栈顶元素。
- *      - Push 写入 stack_top + 1。
- *      - Pop 读取 stack_top，然后 stack_top - 1。
+ * 关键修复：
+ *   旧版本带 refillHold，TopCache 满后如果发生 Push，旧 refill response
+ *   可能被 hold 住，之后错误 append，导致像 BF10 被 BCE8 替换这种错序。
  *
- *   stack_bottom
- *      - spillOut / readBack 操作的一端。
+ *   现在取消 refillHold：
+ *     - refill response 当拍能 append 就 append
+ *     - 不能 append 就直接丢弃
+ *     - Push 发生时清掉 in-flight refill response
  *
- *   queue_bottom
- *      - JVM TaskQueue 中已有元素数量 / bottom 偏移。
- *
- * TopCache 语义：
- *   topCacheData(0) = 当前 stack_top 对应的数据
- *   topCacheData(1) = stack_top - 1
- *   topCacheData(2) = stack_top - 2
- *   ...
- *
- *   Pop:
- *      直接返回 topCacheData(0)。
- *
- *   PrePop:
- *      扫描 topCacheData(1..N)，找未 prefetched 的 entry。
- *
- *   Refill:
- *      后台用 stack_data.readSync 读取 topCache 尾部的下一个元素。
+ *   这样 Push 改变 TopCache offset 后，不会再插入旧 offset 下读回来的错误数据。
  */
 class GCTaskStack extends Module with GCTopParameters with GCParameters with HWParameters {
   val io = new Bundle {
@@ -123,14 +107,17 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   //
   // offset 0 是当前栈顶，offset 越大越靠近 stack_bottom。
   //
-  // 这里额外保存 topCacheIdx，是为了：
-  //   1. PrePop fire 后可以准确设置 prefetched(physicalIndex)
-  //   2. refill 时可以知道缓存的数据来自哪个物理 stack entry
+  // topCacheData(0) = 当前 stack_top 对应的数据
+  // topCacheData(1) = stack_top - 1
+  // topCacheData(2) = stack_top - 2
+  // ...
+  //
+  // topCacheIdx 用于记录每个 cache entry 对应的物理 stack index。
   // ============================================================================
 
   val TopCacheDepth = scala.math.min(
     GCTaskStack_Entry,
-    scala.math.max(PreFetchScanWindow + 2, PreFetchBufferNum + 2)
+    PreFetchScanWindow + 4
   )
 
   val topCacheCountWidth  = log2Up(TopCacheDepth + 1)
@@ -172,13 +159,11 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   val inWork = Bool()
 
   // ============================================================================
-  // Pop interface
+  // Pop / Push interface
   //
-  // Pop 数据优先级：
-  //   2. topCacheData(0)
-  //
-  // 注意：
-  //   push-follow 阶段暂时禁止 Pop，优先让 Fetch 通过 PrePop 获取新 pushed entries。
+  // LastPush 注意：
+  //   LastPush 不是进入 TaskStack 的 payload。
+  //   它只是通知 Push burst 结束，可以重新允许 PrePop。
   // ============================================================================
 
   val pushCanAccept =
@@ -204,7 +189,7 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   val popFire  = io.toFetch.Pop.fire
 
   // PushCount 给 GCFetch 使用。
-  // 不能让 Fetch 的 Pop.ready 组合依赖 PushCount，否则会形成组合环。
+  // Fetch 的 Pop.ready 不能组合依赖 PushCount，否则会形成组合环。
   val pushCountForFetch = Mux(
     popFire && push_count =/= U(0, 32 bits),
     push_count - U(1, 32 bits),
@@ -266,7 +251,6 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   )
 
   // 为了简化 TopCache shift / 标记逻辑，PrePop 不和 Push/Pop 同拍。
-  // 这比 readSync 直接 Pop 慢得少，但能显著降低冲突复杂度。
   val prefetchBlockedByStackMove =
     pushFire || popFire
 
@@ -283,22 +267,16 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   // ============================================================================
   // TopCache refill using stack_data.readSync
   //
-  // 这是本版本的关键：
+  // 关键修复：
+  //   不再使用 refillHold。
+  //   readSync response 如果本周期不能 append，就直接丢弃。
   //
-  //   Pop / PrePop 从 TopCache 出。
-  //   stack_data.readSync 只在后台补 TopCache 尾部。
-  //
-  // refillOffsetWide 表示“从当前 stack_top 往下数，第几个 entry 是下一个
-  // 应该被 refill 的 entry”。
-  //
-  // 如果本周期正好有一个 refill response 会 append 到 TopCache，
-  // 那么新的 refill request 要继续往后读一个 entry。
+  // 为什么：
+  //   TopCache 满后如果发生 Push，TopCache 会整体右移并挤出 tail。
+  //   Push 之前发出的 refill response 是基于旧 stack_top / old offset 算的。
+  //   如果把它 hold 住，之后再 append，就可能把 BCE8 这种更深处的数据
+  //   错误插入，导致 BF10 被跳过。
   // ============================================================================
-
-  val refillHoldValid      = RegInit(False)
-  val refillHoldIdx        = Reg(UInt(stackPtrWidth bits))
-  val refillHoldData       = Reg(UInt(GCElementWidth bits))
-  val refillHoldPrefetched = RegInit(False)
 
   val refillRespValid = RegInit(False)
   val refillRespIdx   = Reg(UInt(stackPtrWidth bits))
@@ -308,25 +286,20 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
 
   val refillData = stack_data.readSync(refillReqIdx, refillReq)
 
-  // 当前周期是否可以把返回的 refill 数据 append 到 TopCache。
-  // 为了避免和 Push 的右移冲突，这里 Push 同拍不 append。
-  val refillRespOrHoldValid = refillHoldValid || refillRespValid
-
+  // 只有 response 回来并且当拍可以接收时才 append。
+  // Push 同拍不 append，因为 Push 会改变 TopCache offset 关系。
   val refillAppendAllowed =
-    refillRespOrHoldValid &&
+    refillRespValid &&
       !pushFire &&
       (popFire || !topCacheFull)
 
-  val refillAppendData = Mux(refillHoldValid, refillHoldData, refillData)
-  val refillAppendIdx  = Mux(refillHoldValid, refillHoldIdx, refillRespIdx)
+  val refillAppendData = refillData
+  val refillAppendIdx  = refillRespIdx
 
-  val refillAppendPrefetched = Mux(
-    refillHoldValid,
-    refillHoldPrefetched,
+  val refillAppendPrefetched =
     prefetched(refillRespIdx)
-  )
 
-  // 如果本周期会 append 一个 refill 数据，那么新的 refill request 要往后多读一个。
+  // 如果本周期 append 了一个返回值，那么新的 refill request 要继续往更深处读。
   val refillAppendWillHappen = refillAppendAllowed
 
   val refillOffsetWide =
@@ -338,11 +311,15 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   val refillHasMoreData =
     task_usage > refillOffsetWide.resize(task_usage.getWidth)
 
-  // 允许同步 RAM 每拍发起一个 refill request。
-  // 但如果有 hold 数据还没塞进 TopCache，就先别继续发。
+  // 发起新的 refill request。
+  //
+  // Push 同拍不发新的 refill：
+  //   因为 Push 会更新 stack_top 和 TopCache 排列。
+  //   下一拍再基于新的 stack_top/topCacheCount 重新计算 refill 地址。
+  //
+  // TopCache 满时，只有 Pop 同拍才允许预读。
   refillReq :=
     inWork &&
-      !refillHoldValid &&
       !pushFire &&
       refillHasMoreData &&
       (popFire || !topCacheFull)
@@ -351,18 +328,13 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
     refillRespIdx := refillReqIdx
   }
 
+  // readSync response valid 延迟一拍。
   refillRespValid := refillReq
 
-  // 如果 readSync 返回了，但本周期不能 append，就暂存到 hold。
-  when(refillRespValid && !refillAppendAllowed && !refillHoldValid) {
-    refillHoldValid      := True
-    refillHoldIdx        := refillRespIdx
-    refillHoldData       := refillData
-    refillHoldPrefetched := prefetched(refillRespIdx)
-  }
-
-  when(refillAppendAllowed && refillHoldValid) {
-    refillHoldValid := False
+  // Push 发生时，上一拍发出的 refill response 已经不可信。
+  // 直接清掉，避免旧 response 在之后被错误 append。
+  when(pushFire) {
+    refillRespValid := False
   }
 
   // ============================================================================
@@ -380,9 +352,8 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   //
   // 这里统一维护：
   //   1. push_count / push-follow 状态
-  //   2. LastPush hold
-  //   3. TopCache shift / replace / refill append
-  //   4. stack_top 更新
+  //   2. TopCache shift / replace / refill append
+  //   3. stack_top 更新
   // ============================================================================
 
   def handleFastPath(): Unit = {
@@ -420,6 +391,8 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       not_prefetch := True
     }
 
+    // LastPush 是 push burst 结束信号。
+    // 它不进入 TaskStack，只表示可以重新开启 PrePop。
     when(io.toStack.LastPush) {
       not_prefetch := False
     }
@@ -468,6 +441,10 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       // Push only：
       //   写入 stack_top + 1
       //   TopCache 整体右移，新数据插入 offset 0
+      //
+      // 如果 TopCache 已满，最后一个 entry 会被挤出。
+      // 被挤出的数据没有丢，因为它仍然在 stack_data 中。
+      // 后续 Pop 造成空位时，会重新从 stack_data refill 回来。
       val pushIndex = stk_nextTop
 
       stack_data.write(pushIndex, io.toStack.Push.payload)
@@ -499,8 +476,8 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       //   消费 offset 0
       //   TopCache 左移
       //
-      // 如果本周期刚好有 refill 数据可 append，则插到尾部，
-      // topCacheCount 净效果不变。
+      // 如果本周期刚好有 refill response 可 append，则插到尾部。
+      // 没有 refill response 时，topCacheCount 减 1。
       for (i <- 0 until TopCacheDepth - 1) {
         topCacheData(i)       := topCacheData(i + 1)
         topCacheIdx(i)        := topCacheIdx(i + 1)
@@ -510,7 +487,8 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       topCachePrefetched(TopCacheDepth - 1) := False
 
       when(refillAppendAllowed) {
-        val insertOff = (topCacheCount - U(1, topCacheCountWidth bits)).resize(topCacheOffsetWidth)
+        val insertOff =
+          (topCacheCount - U(1, topCacheCountWidth bits)).resize(topCacheOffsetWidth)
 
         topCacheData(insertOff)       := refillAppendData
         topCacheIdx(insertOff)        := refillAppendIdx
@@ -539,7 +517,12 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       stack_top := stk_prevTop
 
     }.otherwise {
-      // 没有 Push / Pop 时，如果有 refill 数据，直接 append 到 TopCache 尾部。
+      // 无 Push / Pop：
+      //   如果有 refill response，并且 TopCache 未满，则 append 到尾部。
+      //
+      // 注意：
+      //   如果 TopCache 已满，response 会被丢弃，不会 hold。
+      //   这是为了避免旧 response 在 Push 后错序插入。
       when(refillAppendAllowed) {
         val insertOff = topCacheCount.resize(topCacheOffsetWidth)
 
@@ -562,7 +545,7 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   //
   // 当片上 stack_data 太满时，从 bottom 端搬数据到 JVM queue。
   //
-  // 这里也改成 readSync：
+  // 这里也使用 readSync：
   //   readReq      发起同步读
   //   readPending  下一拍拿到数据并打包
   //   dataValid    发 MMU write request
@@ -590,7 +573,8 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
 
       val addr = elemAddr(queue_bottom)
 
-      val spillPtrs = Vec((0 until 4).map(i => stkInc(stack_bottom, U(i + 1, stackPtrWidth bits))))
+      val spillPtrs =
+        Vec((0 until 4).map(i => stkInc(stack_bottom, U(i + 1, stackPtrWidth bits))))
 
       val readReq = !issued && !readPending && !dataValid
 
@@ -629,7 +613,8 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
         issued    := False
         dataValid := False
 
-        val newQueueBottom = queInc(queueBottomBuf, reqNumBuf.resize(queuePtrWidth))
+        val newQueueBottom =
+          queInc(queueBottomBuf, reqNumBuf.resize(queuePtrWidth))
 
         stack_bottom := stkInc(stackBottomBuf, reqNumBuf.resized)
         queue_bottom := newQueueBottom
@@ -816,7 +801,7 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   // ============================================================================
   // Task exhausted
   //
-  // 注意 TopCache / LastPushHold / refill 也要算进去。
+  // 注意 TopCache / refill response 也要算进去。
   // 否则可能 stack_top == stack_bottom 时提前结束。
   // ============================================================================
 
@@ -825,7 +810,6 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       queue_bottom === U(0, queuePtrWidth bits) &&
       topCacheCount === U(0, topCacheCountWidth bits) &&
       !refillRespValid &&
-      !refillHoldValid &&
       push_count === U(0, 32 bits) &&
       pushPrePopRem === U(0, 32 bits)
 
@@ -882,7 +866,6 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       pushPrePopRem    := U(0, 32 bits)
       pushPrePopOffset := U(1, topCacheOffsetWidth bits)
 
-      refillHoldValid := False
       refillRespValid := False
 
       spillOutArea.clear()
@@ -902,7 +885,7 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
         //   2. 栈太满时 spillOut
         //   3. 栈太空时 readBack
         //
-        // TopCache refill 是独立的后台同步读逻辑，前面已经定义。
+        // TopCache refill 是独立的后台同步读逻辑。
         when(need_spillOut || spillOutArea.busy) {
           spillOutArea.run()
         }.elsewhen(need_readback) {

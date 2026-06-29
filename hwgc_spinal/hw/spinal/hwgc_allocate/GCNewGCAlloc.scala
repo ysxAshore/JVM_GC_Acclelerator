@@ -109,6 +109,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
     val WAIT_ALLOC_AND_CONFIG         = new State
     val WRITE_REGION_TYPE             = new State
     val READ_GROW_ARRAY               = new State
+    val READ_DATA_PTR                 = new State
     val WRITE_GROW_ARRAY_LEN          = new State
     val WRITE_GROW_ARRAY_ITEM         = new State
     val READ_REGION_INFO              = new State
@@ -258,10 +259,9 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
     }
 
     READ_GROW_ARRAY.whenIsActive {
-      issueReq(io.Mreq, growArrayPtr, False, SZ_16, U(0), True, False, issued) { rd =>
+      issueReq(io.Mreq, growArrayPtr, False, SZ_8, U(0), True, False, issued) { rd =>
         arrayLen := rd(31 downto 0)
         arrayMax := rd(63 downto 32)
-        dataPtr  := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
 
         when(rd(31 downto 0) === rd(63 downto 32)) {
           /* @todo send irq
@@ -270,8 +270,15 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
            */
           goto(READ_REGION_INFO)
         } otherwise {
-          goto(WRITE_GROW_ARRAY_LEN)
+          goto(READ_DATA_PTR)
         }
+      }
+    }
+
+    READ_DATA_PTR.whenIsActive {
+      issueReq(io.Mreq, growArrayPtr + U(8), False, SZ_8, U(0), True, False, issued) { rd =>
+        dataPtr := rd(GCElementWidth - 1 downto 0)
+        goto(WRITE_GROW_ARRAY_LEN)
       }
     }
 
