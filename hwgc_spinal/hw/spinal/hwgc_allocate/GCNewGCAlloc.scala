@@ -208,6 +208,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
         newAllocRegion      := allocResult
 
         when(againCallAllocRegion || allocResult =/= zeroPtr){
+          againCallAllocRegion := False
           goto(WRITE_REGION_TYPE)
         }.elsewhen(allocResult === zeroPtr) {
           when(!expandFailureValid) {
@@ -236,6 +237,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
     // @todo wait irq res
     WAIT_IRQ.whenIsActive {
      // when(irq.res){
+     //   againCallAllocRegion = True
      //   goto(CALL_ALLOC_FREE)
      // }.otherwise{
      //   expandFailureCache := False
@@ -268,7 +270,6 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
            * 原代码这里准备 callGrowIRQ，但没有真正的 IRQ 握手。
            * 当前版本不死等，跳过 grow array 写入，继续后续 region 初始化。
            */
-          goto(READ_REGION_INFO)
         } otherwise {
           goto(READ_DATA_PTR)
         }

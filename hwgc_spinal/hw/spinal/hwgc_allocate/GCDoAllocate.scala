@@ -52,8 +52,6 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
 
   val lockValue = RegInit(U(0, 32 bits))
 
-  val firstTryDone = RegInit(False)
-  val retryTryDone = RegInit(False)
   val attemptNewRegionDone = RegInit(False)
 
   val updateValid = RegInit(False)
@@ -170,6 +168,9 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
     val min_word_size_r = Reg(UInt(GCElementWidth bits)) init 0
     val desired_word_size_r = Reg(UInt(GCElementWidth bits)) init 0
 
+    val cardBytesLeft = Reg(UInt(GCElementWidth bits)) init(0)
+    val cardTotalBytes = Reg(UInt(GCElementWidth bits)) init(0)
+
     done := False
 
     def fire(min_word_size: UInt, desired_word_size: UInt, bot_updates: Bool, alloc_region: UInt): Unit = {
@@ -194,6 +195,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       val WAIT_IML_DONE = new State
       val WRITE_FIRST_CARD_AND_PREPARE_FILL = new State
       val FILL_CARDS = new State
+      val FILL_CARDS_DATA = new State
       val UPDATE_BOT = new State
 
       IDLE.whenIsActive {
@@ -272,27 +274,47 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
           val chunk = (U(15) << (iterator << 2)).resize(GCElementWidth)
           val nbytes = Mux(remaining < chunk, remaining, chunk)
 
-          val fillByte = (U(64, 8 bits) + iterator.resize(8)).asBits
-          val lanes = MMUDataWidth / 8
-          val writeBytes = Vec(Bits(8 bits), lanes)
+          cardBytesLeft := nbytes
+          cardTotalBytes := nbytes
 
-          for (b <- 0 until lanes) {
-            writeBytes(b) := Mux(U(b) < nbytes, fillByte, B(0, 8 bits))
-          }
-
-          val writeValue = writeBytes.asBits.asUInt
-
-          issueReq(io.MreqPar, begin, True, nbytes, writeValue, False, False, issuedPar) { _ => }
-
-          when(issuedPar) {
-            issuedPar := False
-            begin := begin + nbytes
-            remaining := remaining - nbytes
-            iterator := iterator + 1
-            goto(FILL_CARDS)
-          }
+          goto(FILL_CARDS_DATA)
         }.otherwise {
           goto(UPDATE_BOT)
+        }
+      }
+
+      FILL_CARDS_DATA.whenIsActive {
+        val lanes = MMUDataWidth / 8
+
+        val beatBytes = Mux(cardBytesLeft < U(lanes, GCElementWidth bits),
+          cardBytesLeft,
+          U(lanes, GCElementWidth bits))
+
+        val fillByte = (U(64, 8 bits) + iterator.resize(8)).asBits
+        val writeBytes = Vec(Bits(8 bits), lanes)
+
+        for (b <- 0 until lanes) {
+          writeBytes(b) := Mux(U(b, GCElementWidth bits) < beatBytes, fillByte, B(0, 8 bits))
+        }
+
+        val writeValue = writeBytes.asBits.asUInt
+
+        issueReq(io.MreqPar, begin, True, beatBytes, writeValue, False, False, issuedPar) { _ => }
+
+        when(issuedPar) {
+          issuedPar := False
+
+          begin := begin + beatBytes
+
+          when(cardBytesLeft === beatBytes) {
+            cardBytesLeft := 0
+            remaining := remaining - cardTotalBytes
+            iterator := iterator + 1
+            goto(FILL_CARDS)
+          }.otherwise {
+            cardBytesLeft := cardBytesLeft - beatBytes
+            goto(FILL_CARDS_DATA)
+          }
         }
       }
 
@@ -426,7 +448,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
         issueReq(io.MreqAttempt, region_ptr_r + U"x10", False, U(24), U(0), True, False, issuedAttempt) { rd =>
           region_ptr_off10 := rd(GCElementWidth - 1 downto 0)
           bot_updates_r := rd(GCElementWidth * 2)
-          allocated_bytes := alloc_top - alloc_bottom - rd(GCElementWidth - 1 downto 0)
+          allocated_bytes := alloc_top - alloc_bottom - rd(GCElementWidth * 2 - 1 downto GCElementWidth)
 
           when(region_ptr_type === U(1, 8 bits)) {
             goto(READ_OLD_SET)
@@ -521,22 +543,16 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
 
         issueReq(io.MreqAttempt, root_regions_ptr, False, U(24), U(0), True, False, issuedAttempt) { rd =>
           root_regions_array_r := rd(GCElementWidth - 1 downto 0)
-          root_regions_idx_r := rd(
-            GCElementWidth * 3 - 1 downto GCElementWidth * 2
-          )
+          root_regions_idx_r := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
           goto(WRITE_ROOT_REGION)
         }
       }
 
       WRITE_ROOT_REGION.whenIsActive {
-        val mem_region = (root_regions_array_r + (root_regions_idx_r << 4))
-          .resize(MMUAddrWidth)
+        val mem_region = (root_regions_array_r + (root_regions_idx_r << 4)).resize(MMUAddrWidth)
         val word_len = (alloc_top - root_start_r) >> 3
 
-        val write_data = Cat(
-          word_len.asBits,
-          root_start_r.asBits
-        ).asUInt
+        val write_data = Cat(word_len.asBits, root_start_r.asBits).asUInt
 
         issueReq(io.MreqAttempt, mem_region, True, U(16), write_data, False, False, issuedAttempt) { _ => }
 
@@ -700,8 +716,6 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
 
         actualWordSize := 0
 
-        firstTryDone := False
-        retryTryDone := False
         attemptNewRegionDone := False
 
         selectAllocate := False
@@ -729,12 +743,6 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
 
     WAIT_IML_DONE.whenIsActive {
       when(parAllocateIml.done) {
-        when(selectAllocate) {
-          retryTryDone := True
-        }.otherwise {
-          firstTryDone := True
-        }
-
         goto(CHECK_ALLOC_RESULT)
       }
     }
@@ -746,12 +754,6 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
 
     WAIT_PAR_ALLOC.whenIsActive {
       when(parAllocate.done) {
-        when(selectAllocate) {
-          retryTryDone := True
-        }.otherwise {
-          firstTryDone := True
-        }
-
         goto(READ_ALLOC_REGION_LOCK)
       }
     }
@@ -771,7 +773,6 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
       when(issuedMainIml) {
         issuedMainIml := False
         lockValue := 0
-        firstTryDone := True
         goto(CHECK_ALLOC_RESULT)
       }
     }
@@ -779,6 +780,7 @@ class GCDoAllocate extends Module with GCTopParameters with HWParameters {
     CHECK_ALLOC_RESULT.whenIsActive {
       when(destObjPtr === 0) {
         when(selectAllocate) {
+          selectAllocate := False
           freelistLockPtr := io.ConfigIO.LockPtr
           goto(LOCK_FREELIST)
         }.otherwise {

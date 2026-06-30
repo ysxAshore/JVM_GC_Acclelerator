@@ -35,7 +35,7 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
   private val OFF_REGION_NEXT  = ptrConst(0xd0)
   private val OFF_REGION_PREV  = ptrConst(0xd8)
 
-  private val OFF_HALF_LINE    = ptrConst(0x10)
+  private val OFF_HALF_LINE    = ptrConst(0x18)
   private val OFF_FULL_LINE    = ptrConst(0x20)
 
   private val SZ_8  = U(8)
@@ -116,7 +116,7 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
 
     // Read free-list metadata part 0
     READ_LIST_META_0.whenIsActive {
-      val readSize = Mux(listBaseAligned, SZ_32, SZ_16)
+      val readSize = Mux(listBaseAligned, SZ_32, U(4))
 
       readReqGo(listBaseAddr, readSize, READ_LIST_META_1) { rd =>
         listLength := rd(31 downto 0)
@@ -129,16 +129,16 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
 
     READ_LIST_META_1.whenIsActive {
       val addr     = listBaseAddr + Mux(listBaseAligned, OFF_FULL_LINE, OFF_HALF_LINE)
-      val readSize = Mux(listBaseAligned, SZ_16, SZ_32)
+      val readSize = Mux(listBaseAligned, SZ_16, SZ_24)
 
       issueReq(io.Mreq, addr, False, readSize, U(0), True, False, issued) { rd =>
         when(listBaseAligned) {
           listTailPtr := rd(GCElementWidth - 1 downto 0)
           listLastPtr := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
         } otherwise {
-          listHeadPtr := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
-          listTailPtr := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
-          listLastPtr := rd(GCElementWidth * 4 - 1 downto GCElementWidth * 3)
+          listHeadPtr := rd(GCElementWidth - 1 downto 0)
+          listTailPtr := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+          listLastPtr := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
         }
 
         when(listLength === 0) {
@@ -151,19 +151,13 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
 
     READ_SELECTED_LINK.whenIsActive {
       val candidate = selectedRegion
+      val addr = candidate + selectedLinkOffset
 
-      when(candidate === zeroPtr) {
-        // 防御式处理：length 非 0 但 head/tail 为空，避免访问 0xd0 / 0xd8。
-        finish(zeroPtr)
-      } otherwise {
-        val addr = candidate + selectedLinkOffset
+      issueReq(io.Mreq, addr, False, SZ_8, U(0), True, False, issued) { rd =>
+        newAllocRegion := candidate
+        neighborPtr := rd(GCElementWidth - 1 downto 0)
 
-        issueReq(io.Mreq, addr, False, SZ_8, U(0), True, False, issued) { rd =>
-          newAllocRegion := candidate
-          neighborPtr := rd(GCElementWidth - 1 downto 0)
-
-          goto(UPDATE_LIST_HEAD_TAIL)
-        }
+        goto(UPDATE_LIST_HEAD_TAIL)
       }
     }
 
@@ -177,7 +171,6 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
 
         // list becomes empty: clear head / tail / last
         writeReqIssuedGo(addr, SZ_24, data, CLEAR_REMOVED_LINK)
-
       } elsewhen noNeighbor {
         val addr = freeListPtr + OFF_LIST_PATCH_0
         val data = Cat(zeroPtr, zeroPtr).asUInt
@@ -201,13 +194,13 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
     CLEAR_NEIGHBOR_LINK.whenIsActive {
       val addr = neighborPtr + neighborBackLinkOffset
 
-      listLength := listLength - 1
-
       writeReqIssuedGo(addr, SZ_8, zeroPtr, CLEAR_REMOVED_LINK)
     }
 
     CLEAR_REMOVED_LINK.whenIsActive {
       val addr = newAllocRegion + selectedLinkOffset
+
+      listLength := listLength - 1
 
       writeReqIssuedGo(addr, SZ_8, zeroPtr, WRITE_LIST_LENGTH)
     }
