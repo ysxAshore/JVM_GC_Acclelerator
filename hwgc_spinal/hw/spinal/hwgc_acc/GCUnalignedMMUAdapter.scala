@@ -95,7 +95,7 @@ class GCUnalignedMMUAdapter(
 
   // In true mode, do not accept a new transaction until old no-response responses
   // have been drained. This avoids SourceID reuse hazards without forming a comb loop.
-  val canStartNewReq = !busy && !respBufValid && !hasIgnoredNoRespSource
+  val canStartNewReq = !busy && !respBufValid
   val directReqNow   = canStartNewReq && io.in.Request.valid && directAccessNow
 
   val writeData0 = reqData |<< (offset << 3)
@@ -229,24 +229,22 @@ class GCUnalignedMMUAdapter(
   }
 
   val ignoredRespHit = ignoredNoRespSourceHit(respSourceID)
-
-  val firstSplitRespCanArrive =
-    splitReq && !gotOneResp && !sendBeat0Pending && !respBufValid
-
-  val finalRespCanArrive =
-    (!splitReq && !sendBeat0Pending && !sendBeat1Pending && !respBufValid) ||
+  val firstSplitRespCanArrive = splitReq && !gotOneResp && !sendBeat0Pending && !respBufValid
+  val finalRespCanArrive = (!splitReq && !sendBeat0Pending && !sendBeat1Pending && !respBufValid) ||
       (splitReq && gotOneResp && !sendBeat0Pending && !sendBeat1Pending && !respBufValid)
 
-  val currentRespCanTake =
+  val currentRespCanTakeRaw =
     busy && needResponse && currentRespHit &&
       (firstSplitRespCanArrive || finalRespCanArrive)
 
   val ignoredRespCanDrop =
     if (downstreamReturnsResponse) {
-      ignoredRespHit && !currentRespCanTake
+      ignoredRespHit
     } else {
       False
     }
+
+  val currentRespCanTake = currentRespCanTakeRaw && !ignoredRespCanDrop
 
   io.out.Response.ready := currentRespCanTake || ignoredRespCanDrop
 
