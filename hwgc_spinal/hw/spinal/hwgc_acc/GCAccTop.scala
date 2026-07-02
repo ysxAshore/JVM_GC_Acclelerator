@@ -15,17 +15,22 @@ class GCAccTop extends Module with GCTopParameters {
   val gcOopCopy2Survivor = new GCOopCopy2Survivor
   val gcAllocate = new GCAllocate
   val gcParAllocate = new GCParAllocate
+  val gcNewGCAlloc = new GCNewGCAlloc
+  val gcAllocFreeRegion = new GCAllocFreeRegion
   val gcCopy = new GCCopy
   val gcTrace = new GCTrace
   val gcAop = new GCAop
-  val gcLocalMMU = new GCLocalMMU(15)
-  val gcUnalignedMMUAdapter = Array.fill(13)(new GCUnalignedMMUAdapter)
+  val gcLocalMMU = new GCLocalMMU(19)
+  val gcUnalignedMMUAdapter = Array.fill(17)(new GCUnalignedMMUAdapter)
 
-  for(i <- 0 until 13){
+  for(i <- 0 until 17){
     gcLocalMMU.io.localMMUIOs(i) <> gcUnalignedMMUAdapter(i).io.out
   }
 
-  val task_valid = RegInit(False)
+  val task_valid = RegInit(False) // 当前有任务在进行
+  val taskStackDone = RegInit(False) // TaskStack 完成缓存
+  val taskStackStart = RegInit(False) // TaskStack 握手Valid
+
   val ChunkSize = RegInit(U(0, 32 bits))
   val AgeThreshold = RegInit(U(0, 32 bits))
   val HeapRegionBias = RegInit(U(0, 32 bits))
@@ -44,6 +49,9 @@ class GCAccTop extends Module with GCTopParameters {
   val HumongousReclaimCandidatesBoolBase = RegInit(U(0, GCElementWidth bits))
   val CardTablePtr = RegInit(U(0, GCElementWidth bits))
   val G1h = RegInit(U(0, GCElementWidth bits))
+  val Thread = RegInit(U(0, GCElementWidth bits))
+  val LockPtr = RegInit(U(0, GCElementWidth bits))
+  val DummyRegion = RegInit(U(0, GCElementWidth bits))
   val IntArrayKlassObj = RegInit(U(0, GCElementWidth bits))
   val ObjectKlass = RegInit(U(0, GCElementWidth bits))
   val CompressedOopBase = RegInit(U(0, GCElementWidth bits))
@@ -53,15 +61,24 @@ class GCAccTop extends Module with GCTopParameters {
   val DebugTimeStamp = RegInit(U(0,64 bits))
   DebugTimeStamp := DebugTimeStamp + U(1)
 
+  val taskStackAccepted = task_valid && !taskStackStart
+
   io.config.Ready := !task_valid
-  io.config.Done := task_valid && gcTaskStack.io.ConfigIO.Done
+  io.config.Done := task_valid && (taskStackAccepted && gcTaskStack.io.ConfigIO.TaskStackDone || taskStackDone) && gcOopProcess.io.SlotIsEmpty
+
+  when(taskStackAccepted && gcTaskStack.io.ConfigIO.TaskStackDone){
+    taskStackDone := True
+  }
 
   when(io.config.Done){
     task_valid := False
+    taskStackDone := False
   }
 
   when(io.config.Valid && io.config.Ready){
     task_valid := True
+    taskStackStart := True
+
     ChunkSize                         := io.config.ChunkSize
     AgeThreshold                      := io.config.AgeThreshold
     HeapRegionBias                    := io.config.HeapRegionBias
@@ -80,6 +97,9 @@ class GCAccTop extends Module with GCTopParameters {
     HumongousReclaimCandidatesBoolBase:= io.config.HumongousReclaimCandidatesBoolBase
     CardTablePtr                      := io.config.CardTablePtr
     G1h                               := io.config.G1h
+    Thread                            := io.config.Thread
+    LockPtr                           := io.config.LockPtr
+    DummyRegion                       := io.config.DummyRegion
     IntArrayKlassObj                  := io.config.IntArrayKlassObj
     ObjectKlass                       := io.config.ObjectKlass
     CompressedOopBase                 := io.config.CompressedOopBase
@@ -87,14 +107,17 @@ class GCAccTop extends Module with GCTopParameters {
     CompressedFlag                    := io.config.CompressedFlag
   }
 
+  when(gcTaskStack.io.ConfigIO.TaskReady && gcTaskStack.io.ConfigIO.TaskValid){
+    taskStackStart := False
+  }
+
   // GCTaskStack
   gcTaskStack.io.toFetch <> gcFetch.io.toFetch
   gcTaskStack.io.toStack <> gcTrace.io.ToStack
-  gcTaskStack.io.gcUpdatedAop <> gcAop.io.ToStack
   gcTaskStack.io.Mreq <> gcUnalignedMMUAdapter(0).io.in
   gcTaskStack.io.ConfigIO.TaskQueue_Bottom := TaskQueue_Bottom
   gcTaskStack.io.ConfigIO.TaskQueue_ElemsBase := TaskQueue_ElemsBase
-  gcTaskStack.io.ConfigIO.TaskValid := task_valid
+  gcTaskStack.io.ConfigIO.TaskValid := taskStackStart
   gcTaskStack.io.DebugTimeStamp := DebugTimeStamp
 
   // GCFetch
@@ -168,12 +191,30 @@ class GCAccTop extends Module with GCTopParameters {
   gcAllocate.io.DebugTimeStamp := DebugTimeStamp
 
   // gcParAllocate
-  gcParAllocate.io.Mreq <> gcUnalignedMMUAdapter(10).io.in
-  gcParAllocate.io.ToDoAllocate <> io.toDoAllocate
+  gcParAllocate.io.MreqMainIml <> gcUnalignedMMUAdapter(10).io.in
+  gcParAllocate.io.MreqPar <> gcUnalignedMMUAdapter(11).io.in
+  gcParAllocate.io.MreqAttempt <> gcUnalignedMMUAdapter(12).io.in
+  gcParAllocate.io.ToNewGCAlloc <> gcNewGCAlloc.io.ToNewGCAlloc
+  gcParAllocate.io.CacheUpdateOut <> io.CacheUpdateOut
+  gcParAllocate.io.CacheUpdateIn <> io.CacheUpdateIn
+  gcParAllocate.io.ConfigIO.G1h := io.config.G1h
+  gcParAllocate.io.ConfigIO.Thread := io.config.Thread
+  gcParAllocate.io.ConfigIO.LockPtr := io.config.LockPtr
+  gcParAllocate.io.ConfigIO.DummyRegion := io.config.DummyRegion
   gcParAllocate.io.DebugTimeStamp := DebugTimeStamp
 
+  // gcNewAlloc
+  gcNewGCAlloc.io.Mreq <> gcUnalignedMMUAdapter(13).io.in
+  gcNewGCAlloc.io.ToAllocFreeRegion <> gcAllocFreeRegion.io.ToAllocFreeRegion
+  gcNewGCAlloc.io.ConfigIO.G1h := io.config.G1h
+  gcNewGCAlloc.io.ConfigIO.DummyRegion := io.config.DummyRegion
+
+  // gcAllocFreeRegion
+  gcAllocFreeRegion.io.Mreq <> gcUnalignedMMUAdapter(14).io.in
+  gcAllocFreeRegion.io.ConfigIO.G1h := io.config.G1h
+
   // gcTrace
-  gcTrace.io.Mreq <> gcUnalignedMMUAdapter(11).io.in
+  gcTrace.io.Mreq <> gcUnalignedMMUAdapter(15).io.in
   gcTrace.io.ConfigIO.ChunkSize                        := ChunkSize
   gcTrace.io.ConfigIO.RegionAttrBase                   := RegionAttrBase
   gcTrace.io.ConfigIO.RegionAttrShiftBy                := RegionAttrShiftBy
@@ -190,15 +231,16 @@ class GCAccTop extends Module with GCTopParameters {
   gcTrace.io.TaskDone := io.config.Done
 
   // gcAop
-  gcAop.io.Mreq <> gcUnalignedMMUAdapter(12).io.in
-  gcAop.io.TaskDone := io.config.Done
+  gcAop.io.Mreq <> gcUnalignedMMUAdapter(16).io.in
   gcAop.io.ConfigIO.CardTablePtr := CardTablePtr
   gcAop.io.ConfigIO.ParScanThreadStatePtr := ParScanThreadStatePtr
   gcAop.io.DebugTimeStamp := DebugTimeStamp
+  gcAop.io.NoAopSrc := (gcTaskStack.io.ConfigIO.TaskStackDone || taskStackDone) && gcOopProcess.io.SlotIsEmpty
 
   // gcCopy
-  gcCopy.io.readMReq <> gcLocalMMU.io.localMMUIOs(13)
-  gcCopy.io.writeMReq <> gcLocalMMU.io.localMMUIOs(14)
+  gcCopy.io.readMReq <> gcLocalMMU.io.localMMUIOs(17)
+  gcCopy.io.writeMReq <> gcLocalMMU.io.localMMUIOs(18)
+
 
   // gcLocalMMU
   gcLocalMMU.io.LastLevelCacheTLIO <> io.mmu2llc

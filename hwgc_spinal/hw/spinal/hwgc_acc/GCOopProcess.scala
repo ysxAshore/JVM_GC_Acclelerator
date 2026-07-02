@@ -36,6 +36,8 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
 
     val ConfigIO             = slave(new GCOopProcessConfigIO)
     val DebugTimeStamp       = in UInt(64 bits)
+
+    val SlotIsEmpty          = out Bool()
   }
 
   // defaults
@@ -63,6 +65,8 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   // slot registers
   val slotValid = Vec.fill(2)(RegInit(False))
   val slotCtx   = Vec.fill(2)(Reg(SlotCtx()) init (SlotCtx().getZero))
+
+  io.SlotIsEmpty := !slotValid.orR
 
   // issueReq 内部使用的 per-slot request 状态
   val slotIssued = Vec.fill(2)(RegInit(False))

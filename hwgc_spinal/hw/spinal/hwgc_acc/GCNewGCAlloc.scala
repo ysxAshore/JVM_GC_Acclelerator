@@ -1,4 +1,4 @@
-package hwgc_allocate
+package hwgc_acc
 
 import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO}
 
@@ -33,7 +33,6 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
   private val SZ_4  = U(4)
   private val SZ_8  = U(8)
   private val SZ_12 = U(12)
-  private val SZ_16 = U(16)
 
   private val HEAP_REGION_YOUNG = U(3, 32 bits)
   private val HEAP_REGION_OLD   = U(0x10, 32 bits)

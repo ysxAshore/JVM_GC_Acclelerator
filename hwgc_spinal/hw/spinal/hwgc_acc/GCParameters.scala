@@ -1,8 +1,6 @@
 package hwgc_acc
 
-import hwgc_allocate.GCToDoAllocate
-import hwgc_top.{GCTopParameters, LocalMMUIO}
-
+import hwgc_top.{GCAllocCacheUpdate, GCTopParameters, LocalMMUIO}
 import spinal.core._
 import spinal.lib._
 
@@ -339,11 +337,11 @@ class GCTaskStackConfigIO extends Bundle with GCTopParameters with IMasterSlave 
 
   val TaskValid = in Bool ()
   val TaskReady = out Bool ()
-  val Done = out Bool ()
+  val TaskStackDone = out Bool ()
 
   override def asMaster(): Unit = {
     out(TaskQueue_Bottom, TaskQueue_ElemsBase, TaskValid)
-    in(TaskReady, Done)
+    in(TaskReady, TaskStackDone)
   }
 }
 
@@ -456,6 +454,93 @@ class GCAopConfigIO extends Bundle with GCTopParameters with IMasterSlave {
   }
 }
 
+
+class GCToNewGCAlloc extends Bundle with GCTopParameters with IMasterSlave {
+  val Valid = in Bool ()
+  val Ready = out Bool ()
+  val Done = out Bool ()
+
+  val regionPtr = in UInt (GCElementWidth bits)
+  val regionType = in UInt (8 bits)
+
+  val newAllocRegion = out UInt (GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    in(Ready, Done, newAllocRegion)
+    out(Valid, regionPtr, regionType)
+  }
+
+  def clearIn(): Unit = {
+    Valid := False
+    regionPtr := U(0)
+    regionType := U(0)
+  }
+
+  def clearOut(): Unit = {
+    Ready := False
+    Done := False
+    newAllocRegion := U(0)
+  }
+}
+
+class GCToAllocFreeRegion extends Bundle with GCTopParameters with IMasterSlave {
+  val Valid = in Bool ()
+  val Ready = out Bool ()
+  val Done = out Bool ()
+
+  val heapRegionType = in UInt (32 bits)
+  val newAllocRegion = out UInt (GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    in(Ready, Done, newAllocRegion)
+    out(Valid, heapRegionType)
+  }
+
+  def clearIn(): Unit = {
+    Valid := False
+    heapRegionType := U(0)
+  }
+
+  def clearOut(): Unit = {
+    Ready := False
+    Done := False
+    newAllocRegion := U(0)
+  }
+}
+
+class GCDoAllocateConfigIO extends Bundle with GCTopParameters with IMasterSlave {
+  val G1h = in UInt (GCElementWidth bits)
+  val Thread = in UInt (GCElementWidth bits)
+  val LockPtr = in UInt (GCElementWidth bits)
+  val DummyRegion = in UInt (GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    out(G1h, Thread, LockPtr, DummyRegion)
+    in()
+  }
+}
+
+class GCNewGCAllocConfigIO extends Bundle with GCTopParameters with IMasterSlave {
+  val G1h = in UInt (GCElementWidth bits)
+  val DummyRegion = in UInt (GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    out(G1h, DummyRegion)
+    in()
+  }
+}
+
+class GCAllocFreeRegionConfigIO extends Bundle with GCTopParameters with IMasterSlave {
+  val G1h = in UInt (GCElementWidth bits)
+  val NumaPtr = in UInt (GCElementWidth bits)
+
+  override def asMaster(): Unit = {
+    out(G1h, NumaPtr)
+    in()
+  }
+}
+
+
 class GCAccCtrl2Top extends Bundle with GCTopParameters with IMasterSlave {
   val ChunkSize = in UInt (32 bits)
   val AgeThreshold = in UInt (32 bits)
@@ -475,6 +560,9 @@ class GCAccCtrl2Top extends Bundle with GCTopParameters with IMasterSlave {
   val HumongousReclaimCandidatesBoolBase = in UInt (GCElementWidth bits)
   val CardTablePtr = in UInt (GCElementWidth bits)
   val G1h = in UInt (GCElementWidth bits)
+  val Thread = in UInt (GCElementWidth bits)
+  val LockPtr = in UInt (GCElementWidth bits)
+  val DummyRegion = in UInt (GCElementWidth bits)
   val IntArrayKlassObj = in UInt (GCElementWidth bits)
   val ObjectKlass = in UInt (GCElementWidth bits)
   val CompressedOopBase = in UInt (GCElementWidth bits)
@@ -489,7 +577,7 @@ class GCAccCtrl2Top extends Bundle with GCTopParameters with IMasterSlave {
     out(Valid, ChunkSize, AgeThreshold, HeapRegionBias, RegionAttrShiftBy, HeapRegionShiftBy, LogOfHRGrainBytes,
       StepperOffset, YoungWordsBase, RegionAttrBase, PlabAllocatorPtr, RegionAttrBiasedBase, HeapRegionBiasedBase,
       ParScanThreadStatePtr, TaskQueue_Bottom, TaskQueue_ElemsBase, HumongousReclaimCandidatesBoolBase, CardTablePtr,
-      G1h, IntArrayKlassObj, ObjectKlass, CompressedOopBase, CompressedKlassPointerBase, CompressedFlag)
+      G1h, Thread, LockPtr, DummyRegion, IntArrayKlassObj, ObjectKlass, CompressedOopBase, CompressedKlassPointerBase, CompressedFlag)
     in(Ready, Done)
   }
 }
@@ -497,5 +585,6 @@ class GCAccCtrl2Top extends Bundle with GCTopParameters with IMasterSlave {
 class GCAccTopIO extends Bundle {
   val mmu2llc = master(new LocalMMUIO)
   val config = slave(new GCAccCtrl2Top)
-  val toDoAllocate = master(new GCToDoAllocate)
+  val CacheUpdateOut = master(Stream(new GCAllocCacheUpdate))
+  val CacheUpdateIn = slave(Flow(new GCAllocCacheUpdate))
 }

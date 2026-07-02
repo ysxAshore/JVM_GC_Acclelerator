@@ -1,4 +1,4 @@
-package hwgc_allocate
+package hwgc_acc
 
 import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO}
 import spinal.core._

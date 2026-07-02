@@ -120,6 +120,11 @@ trait GCTopParameters {
   val GCElementWidth = 64 // 和MMUAddrWidth一样
 }
 
+class GCAllocCacheUpdate extends Bundle with GCTopParameters with HWParameters {
+  val regionPtr = UInt(GCElementWidth bits)
+  val region = UInt(GCElementWidth bits)
+}
+
 class LocalMMUIO extends Bundle with HWParameters with IMasterSlave {
   // 发出的访存请求
   val Request = master Stream new Bundle {

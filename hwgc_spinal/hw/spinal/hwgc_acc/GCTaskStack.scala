@@ -31,27 +31,20 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   val io = new Bundle {
     val toFetch        = master(new GCToFetch)
     val toStack        = slave(new GCToStack)
-    val gcUpdatedAop   = slave(new GCUpdatedAop)
     val Mreq           = master(new LocalMMUIO)
     val ConfigIO       = slave(new GCTaskStackConfigIO)
     val DebugTimeStamp = in UInt(64 bits)
   }
 
-  // ============================================================================
   // Default outputs
-  // ============================================================================
-
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
   io.Mreq.Response.ready := True
 
-  io.ConfigIO.Done      := False
+  io.ConfigIO.TaskStackDone := False
   io.ConfigIO.TaskReady := False
 
-  // ============================================================================
   // Stack / Queue pointers
-  // ============================================================================
-
   val stackPtrWidth = log2Up(GCTaskStack_Entry)
   val queuePtrWidth = 32
 
@@ -61,64 +54,36 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   val queue_elems_base = RegInit(U(0, MMUAddrWidth bits))
   val queue_bottom     = RegInit(U(0, queuePtrWidth bits))
 
-  // 主存储：同步读 RAM。
-  // Pop / PrePop 不直接从这里出，而是通过 TopCache。
+  // 主存储：同步读 RAM. Pop / PrePop 不直接从这里出，而是通过 TopCache
   val stack_data = Mem(UInt(GCElementWidth bits), GCTaskStack_Entry)
 
-  // 全局 prefetched 标记。
-  // 表示某个物理 stack entry 是否已经被 PrePop 过。
+  // 全局 prefetched 标记 表示某个物理 stack entry 是否已经被 PrePop 过
   val prefetched = Vec.fill(GCTaskStack_Entry)(RegInit(False))
 
-  // ============================================================================
   // Helper functions
-  // ============================================================================
-
-  def stkInc(ptr: UInt, step: UInt): UInt =
-    WrapInc(ptr, GCTaskStack_Entry, step)
-
-  def stkDec(ptr: UInt, step: UInt): UInt =
-    WrapDec(ptr, GCTaskStack_Entry, step)
-
-  def queInc(ptr: UInt, step: UInt): UInt =
-    WrapInc(ptr, GCTaskQueue_Size, step).resize(queuePtrWidth)
-
-  def queDec(ptr: UInt, step: UInt): UInt =
-    WrapDec(ptr, GCTaskQueue_Size, step).resize(queuePtrWidth)
-
-  def elemAddr(idx: UInt): UInt =
-    (queue_elems_base + (idx.resize(MMUAddrWidth) << 3)).resize(MMUAddrWidth)
+  def stkInc(ptr: UInt, step: UInt): UInt = WrapInc(ptr, GCTaskStack_Entry, step)
+  def stkDec(ptr: UInt, step: UInt): UInt = WrapDec(ptr, GCTaskStack_Entry, step)
+  def queInc(ptr: UInt, step: UInt): UInt = WrapInc(ptr, GCTaskQueue_Size, step).resize(queuePtrWidth)
+  def queDec(ptr: UInt, step: UInt): UInt = WrapDec(ptr, GCTaskQueue_Size, step).resize(queuePtrWidth)
+  def elemAddr(idx: UInt): UInt = (queue_elems_base + (idx.resize(MMUAddrWidth) << 3)).resize(MMUAddrWidth)
 
   val stk_nextTop = stkInc(stack_top, U(1, stackPtrWidth bits))
   val stk_prevTop = stkDec(stack_top, U(1, stackPtrWidth bits))
 
-  val task_empty = stack_top === stack_bottom
-  val task_usage = (stack_top - stack_bottom).resize(stackPtrWidth + 1)
-  val task_free  = U(GCTaskStack_Entry - 1, stackPtrWidth + 1 bits) - task_usage
+  val task_empty = stack_top === stack_bottom // 硬件栈队列空
+  val task_usage = (stack_top - stack_bottom).resize(stackPtrWidth + 1) // 硬件栈已用项数
+  val task_free  = U(GCTaskStack_Entry - 1, stackPtrWidth + 1 bits) - task_usage // 牺牲一个槽判断满
 
-  val need_spillOut =
-    task_usage >= U(GCTaskStack_SpillNeed + 4, task_usage.getWidth bits)
+  val need_spillOut = task_usage >= U(GCTaskStack_SpillNeed + 4, task_usage.getWidth bits)
+  val need_readback = (task_usage <= U(GCTaskStack_ReadNeed - 4, task_usage.getWidth bits)) && (queue_bottom =/= U(0, queuePtrWidth bits))
 
-  val need_readback =
-    (task_usage <= U(GCTaskStack_ReadNeed - 4, task_usage.getWidth bits)) &&
-      (queue_bottom =/= U(0, queuePtrWidth bits))
-
-  // ============================================================================
-  // TopCache
-  //
-  // offset 0 是当前栈顶，offset 越大越靠近 stack_bottom。
-  //
-  // topCacheData(0) = 当前 stack_top 对应的数据
-  // topCacheData(1) = stack_top - 1
-  // topCacheData(2) = stack_top - 2
-  // ...
-  //
+  // TopCache(pop从这里取)
+  // offset 0 是stack_top 对应数据，offset 越大越靠近 stack_bottom。
+  //    topCacheData(0) = 当前 stack_top 对应的数据
+  //    topCacheData(1) = stack_top - 1
+  //    topCacheData(2) = stack_top - 2
   // topCacheIdx 用于记录每个 cache entry 对应的物理 stack index。
-  // ============================================================================
-
-  val TopCacheDepth = scala.math.min(
-    GCTaskStack_Entry,
-    PreFetchScanWindow + 4
-  )
+  val TopCacheDepth = PreFetchScanWindow << 1
 
   val topCacheCountWidth  = log2Up(TopCacheDepth + 1)
   val topCacheOffsetWidth = log2Up(TopCacheDepth)
@@ -128,156 +93,74 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   val topCachePrefetched = Vec.fill(TopCacheDepth)(RegInit(False))
   val topCacheCount      = RegInit(U(0, topCacheCountWidth bits))
 
-  def cacheOffsetValid(offset: UInt): Bool =
-    offset.resize(topCacheCountWidth) < topCacheCount
+  def cacheOffsetValid(offset: UInt): Bool = offset.resize(topCacheCountWidth) < topCacheCount
 
   val topCacheEmpty = topCacheCount === U(0, topCacheCountWidth bits)
   val topCacheFull  = topCacheCount === U(TopCacheDepth, topCacheCountWidth bits)
 
-  // ============================================================================
   // Push-follow PrePop bookkeeping
-  //
-  // push_count:
-  //   记录最近 Push 进来的任务数量。
-  //
-  // pushPrePopRem:
-  //   第一次 push-follow PrePop 之后，还剩几个 pushed entry 要继续 PrePop。
-  //
-  // pushPrePopOffset:
-  //   后续 push-follow PrePop 从 topCacheData(offset) 取数据。
-  // ============================================================================
-
+  // push_count: 记录最近 Push 进来的任务数量。
+  // pushPrePopRem: 第一次 push-follow PrePop 之后，还剩几个 pushed entry 要继续 PrePop。
+  // pushPrePopOffset: 后续 push-follow PrePop 从 topCacheData(offset) 取数据。
   val push_count       = RegInit(U(0, 32 bits))
   val not_prefetch     = RegInit(False)
   val pushPrePopRem    = RegInit(U(0, 32 bits))
   val pushPrePopOffset = RegInit(U(1, topCacheOffsetWidth bits))
 
-  // ============================================================================
   // State visibility
-  // ============================================================================
-
   val inWork = Bool()
 
-  // ============================================================================
   // Pop / Push interface
-  //
-  // LastPush 注意：
-  //   LastPush 不是进入 TaskStack 的 payload。
-  //   它只是通知 Push burst 结束，可以重新允许 PrePop。
-  // ============================================================================
-
-  val pushCanAccept =
-    inWork &&
-      task_free =/= U(0, task_free.getWidth bits)
-
+  // LastPush: LastPush 不是进入 TaskStack 的 payload. 它只是通知 Push burst 结束，可以重新允许 PrePop。
+  val pushCanAccept = inWork && task_free =/= U(0, task_free.getWidth bits)
   io.toStack.Push.ready := pushCanAccept
 
-  val popBlockedByPushFollow =
-    (push_count =/= U(0, 32 bits)) ||
-      (pushPrePopRem =/= U(0, 32 bits))
-
+  // pop 被 连续的 几个 push 阻塞
+  val popBlockedByPushFollow = (push_count =/= U(0, 32 bits)) || (pushPrePopRem =/= U(0, 32 bits))
   val popAvailable = !topCacheEmpty
-
-  io.toFetch.Pop.valid :=
-    inWork &&
-      popAvailable &&
-      !popBlockedByPushFollow
-
+  io.toFetch.Pop.valid := inWork && popAvailable && !popBlockedByPushFollow
   io.toFetch.Pop.payload := topCacheData(0)
 
   val pushFire = io.toStack.Push.fire
   val popFire  = io.toFetch.Pop.fire
 
-  // PushCount 给 GCFetch 使用。
-  // Fetch 的 Pop.ready 不能组合依赖 PushCount，否则会形成组合环。
-  val pushCountForFetch = Mux(
-    popFire && push_count =/= U(0, 32 bits),
-    push_count - U(1, 32 bits),
-    push_count
-  )
-
+  // PushCount 给 GCFetch 使用 Fetch 的 Pop.ready 不能组合依赖 PushCount，否则会形成组合环。
+  val pushCountForFetch = Mux(popFire && push_count =/= U(0, 32 bits), push_count - U(1, 32 bits), push_count)
   io.toFetch.PushCount := pushCountForFetch
 
-  // ============================================================================
   // PrePop candidate selection from TopCache
-  //
-  // 普通 PrePop：
-  //   扫描 topCacheData(1..PreFetchScanWindow)，不扫描 offset 0。
-  //   offset 0 留给 Pop。
-  //
-  // push-follow PrePop：
-  //   第一次返回 offset 0。
-  //   后续返回 offset 1, 2, ...
-  // ============================================================================
-
+  // 普通 PrePop： 扫描 topCacheData(1..PreFetchScanWindow)，不扫描 offset 0. offset 0 留给 Pop
+  // push-follow PrePop： 第一次返回 offset 0. 后续返回 offset 1, 2, ...
   val normalCandidates    = Vec(Bool(), PreFetchScanWindow)
   val normalCandidateOffs = Vec(UInt(topCacheOffsetWidth bits), PreFetchScanWindow)
 
   for (i <- 1 until PreFetchScanWindow + 1) {
     val off = U(i, topCacheOffsetWidth bits)
-
-    normalCandidates(i - 1) :=
-      cacheOffsetValid(off) &&
-        !topCachePrefetched(off) &&
-        !prefetched(topCacheIdx(off))
-
+    normalCandidates(i - 1) := cacheOffsetValid(off) && !topCachePrefetched(off) && !prefetched(topCacheIdx(off))
     normalCandidateOffs(i - 1) := off
   }
 
   val normalFirstOH = OHMasking.first(normalCandidates.asBits)
-
-  val pushFollowPrePopMode =
-    (pushCountForFetch =/= U(0, 32 bits)) ||
-      (pushPrePopRem =/= U(0, 32 bits))
-
-  val pushFollowOffset = Mux(
-    pushCountForFetch =/= U(0, 32 bits),
-    U(0, topCacheOffsetWidth bits),
-    pushPrePopOffset
-  )
-
+  val pushFollowPrePopMode = (pushCountForFetch =/= U(0, 32 bits)) || (pushPrePopRem =/= U(0, 32 bits))
+  val pushFollowOffset = Mux(pushCountForFetch =/= U(0, 32 bits), U(0, topCacheOffsetWidth bits), pushPrePopOffset)
   val normalPrePopOffset = MuxOH(normalFirstOH, normalCandidateOffs)
+  val prefetchOffset = Mux(pushFollowPrePopMode, pushFollowOffset, normalPrePopOffset)
 
-  val prefetchOffset = Mux(
-    pushFollowPrePopMode,
-    pushFollowOffset,
-    normalPrePopOffset
-  )
+  val prefetchHit = Mux(pushFollowPrePopMode, cacheOffsetValid(pushFollowOffset), normalFirstOH.orR)
 
-  val prefetchHit = Mux(
-    pushFollowPrePopMode,
-    cacheOffsetValid(pushFollowOffset),
-    normalFirstOH.orR
-  )
+  // 为了简化 TopCache shift / 标记逻辑，PrePop 不和 Push/Pop 同拍
+  val prefetchBlockedByStackMove = pushFire || popFire
 
-  // 为了简化 TopCache shift / 标记逻辑，PrePop 不和 Push/Pop 同拍。
-  val prefetchBlockedByStackMove =
-    pushFire || popFire
-
-  io.toFetch.PrePop.valid :=
-    inWork &&
-      prefetchHit &&
-      !not_prefetch &&
-      !prefetchBlockedByStackMove
-
+  io.toFetch.PrePop.valid := inWork && prefetchHit && !not_prefetch && !prefetchBlockedByStackMove
   io.toFetch.PrePop.payload := topCacheData(prefetchOffset)
-
   val preFire = io.toFetch.PrePop.fire
 
-  // ============================================================================
   // TopCache refill using stack_data.readSync
-  //
-  // 关键修复：
-  //   不再使用 refillHold。
   //   readSync response 如果本周期不能 append，就直接丢弃。
-  //
-  // 为什么：
   //   TopCache 满后如果发生 Push，TopCache 会整体右移并挤出 tail。
   //   Push 之前发出的 refill response 是基于旧 stack_top / old offset 算的。
   //   如果把它 hold 住，之后再 append，就可能把 BCE8 这种更深处的数据
   //   错误插入，导致 BF10 被跳过。
-  // ============================================================================
-
   val refillRespValid = RegInit(False)
   val refillRespIdx   = Reg(UInt(stackPtrWidth bits))
 
@@ -288,28 +171,20 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
 
   // 只有 response 回来并且当拍可以接收时才 append。
   // Push 同拍不 append，因为 Push 会改变 TopCache offset 关系。
-  val refillAppendAllowed =
-    refillRespValid &&
-      !pushFire &&
-      (popFire || !topCacheFull)
-
+  val refillAppendAllowed = refillRespValid && !pushFire && (popFire || !topCacheFull)
   val refillAppendData = refillData
   val refillAppendIdx  = refillRespIdx
 
-  val refillAppendPrefetched =
-    prefetched(refillRespIdx)
+  val refillAppendPrefetched = prefetched(refillRespIdx)
 
   // 如果本周期 append 了一个返回值，那么新的 refill request 要继续往更深处读。
   val refillAppendWillHappen = refillAppendAllowed
 
-  val refillOffsetWide =
-    topCacheCount.resize(stackPtrWidth + 1) +
-      refillAppendWillHappen.asUInt.resize(stackPtrWidth + 1)
+  val refillOffsetWide = topCacheCount.resize(stackPtrWidth + 1) + refillAppendWillHappen.asUInt.resize(stackPtrWidth + 1)
 
   refillReqIdx := stkDec(stack_top, refillOffsetWide.resize(stackPtrWidth))
 
-  val refillHasMoreData =
-    task_usage > refillOffsetWide.resize(task_usage.getWidth)
+  val refillHasMoreData = task_usage > refillOffsetWide.resize(task_usage.getWidth)
 
   // 发起新的 refill request。
   //
@@ -318,11 +193,7 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   //   下一拍再基于新的 stack_top/topCacheCount 重新计算 refill 地址。
   //
   // TopCache 满时，只有 Pop 同拍才允许预读。
-  refillReq :=
-    inWork &&
-      !pushFire &&
-      refillHasMoreData &&
-      (popFire || !topCacheFull)
+  refillReq := inWork && !pushFire && refillHasMoreData && (popFire || !topCacheFull)
 
   when(refillReq) {
     refillRespIdx := refillReqIdx
@@ -337,30 +208,22 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
     refillRespValid := False
   }
 
-  // ============================================================================
   // Debug helper
-  // ============================================================================
-
   def dbg(msg: Seq[Any]): Unit = {
     if (DebugEnable) {
       report(Seq("[GCTaskStack<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
     }
   }
 
-  // ============================================================================
   // Fast path handling
   //
   // 这里统一维护：
   //   1. push_count / push-follow 状态
   //   2. TopCache shift / replace / refill append
   //   3. stack_top 更新
-  // ============================================================================
 
   def handleFastPath(): Unit = {
-    // --------------------------------------------------------------------------
     // PrePop 标记
-    // --------------------------------------------------------------------------
-
     when(preFire) {
       topCachePrefetched(prefetchOffset) := True
       prefetched(topCacheIdx(prefetchOffset)) := True
@@ -372,13 +235,8 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       ))
     }
 
-    // --------------------------------------------------------------------------
     // push_count / push-follow bookkeeping
-    // --------------------------------------------------------------------------
-
-    val pushCountAfterPush =
-      push_count + pushFire.asUInt.resize(32)
-
+    val pushCountAfterPush = push_count + pushFire.asUInt.resize(32)
     val pushCountAfterPop = Mux(
       popFire && push_count =/= U(0, 32 bits),
       pushCountAfterPush - U(1, 32 bits),
@@ -415,10 +273,7 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       }
     }
 
-    // --------------------------------------------------------------------------
     // TopCache update
-    // --------------------------------------------------------------------------
-
     when(pushFire && popFire) {
       // Push + Pop 同拍：
       //   Pop 返回旧 topCacheData(0)
@@ -487,8 +342,7 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       topCachePrefetched(TopCacheDepth - 1) := False
 
       when(refillAppendAllowed) {
-        val insertOff =
-          (topCacheCount - U(1, topCacheCountWidth bits)).resize(topCacheOffsetWidth)
+        val insertOff = (topCacheCount - U(1, topCacheCountWidth bits)).resize(topCacheOffsetWidth)
 
         topCacheData(insertOff)       := refillAppendData
         topCacheIdx(insertOff)        := refillAppendIdx
@@ -710,117 +564,15 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
     }
   }
 
-  // ============================================================================
-  // MMU Update Area
-  //
-  // GC 任务结束后，把 gcUpdatedAop 中的 3 段更新写回。
-  // ============================================================================
-
-  val mmuUpdate = new Area {
-    val reqIdx  = RegInit(U(0, 2 bits))
-    val sendIdx = RegInit(U(0, 2 bits))
-    val respIdx = RegInit(U(0, 2 bits))
-
-    def generateUpdateMMU(idx: UInt): (Bool, UInt, UInt, UInt) = {
-      val valid = Bool()
-      val addr  = UInt(GCElementWidth bits)
-      val size  = UInt(LineBytesNumBitSize bits)
-      val data  = UInt(MMUDataWidth bits)
-
-      switch(idx) {
-        is(U(0)) {
-          addr  := io.gcUpdatedAop.Addr0
-          size  := U(8)
-          data  := io.gcUpdatedAop.Data0.resize(MMUDataWidth)
-          valid := io.gcUpdatedAop.Valid0
-        }
-
-        is(U(1)) {
-          addr  := io.gcUpdatedAop.Addr1
-          size  := U(24)
-          data  := io.gcUpdatedAop.Data1.resize(MMUDataWidth)
-          valid := io.gcUpdatedAop.Valid1
-        }
-
-        is(U(2)) {
-          addr  := io.gcUpdatedAop.Addr2
-          size  := U(16)
-          data  := io.gcUpdatedAop.Data2.resize(MMUDataWidth)
-          valid := io.gcUpdatedAop.Valid2
-        }
-
-        default {
-          addr  := U(0)
-          size  := U(0)
-          data  := U(0)
-          valid := False
-        }
-      }
-
-      (valid, addr, size, data)
-    }
-
-    def run(): Unit = {
-      val (valid, addr, size, data) = generateUpdateMMU(reqIdx)
-
-      io.Mreq.Request.valid := valid && reqIdx < 3
-      io.Mreq.Request.payload.RequestType_isWrite := True
-      io.Mreq.Request.payload.RequestVirtualAddr  := addr
-      io.Mreq.Request.payload.RequestSourceID     := io.Mreq.ConherentRequsetSourceID.payload
-      io.Mreq.Request.payload.NeedDoCmpxChg       := False
-      io.Mreq.Request.payload.RequestWStrb        := getWstrb(size.resize(LineBytesNumBitSize))
-      io.Mreq.Request.payload.NeedResponse        := True
-      io.Mreq.Request.payload.RequestData         := data
-      io.Mreq.Request.payload.RequestSize         := size.resize(LineBytesNumBitSize)
-      io.Mreq.Response.ready := True
-
-      when(!valid && reqIdx < 3) {
-        reqIdx := reqIdx + 1
-      }
-
-      when(io.Mreq.Request.fire) {
-        reqIdx  := reqIdx + 1
-        sendIdx := sendIdx + 1
-      }
-
-      when(io.Mreq.Response.fire) {
-        respIdx := respIdx + 1
-      }
-    }
-
-    def clear(): Unit = {
-      reqIdx  := U(0)
-      sendIdx := U(0)
-      respIdx := U(0)
-    }
-
-    def updateFinished: Bool =
-      reqIdx === 3 && respIdx === sendIdx
-  }
-
-  // ============================================================================
   // Task exhausted
-  //
-  // 注意 TopCache / refill response 也要算进去。
-  // 否则可能 stack_top == stack_bottom 时提前结束。
-  // ============================================================================
+  // 注意 TopCache / refill response 也要算进去。 否则可能 stack_top == stack_bottom 时提前结束。
+  val task_exhausted = task_empty && queue_bottom === U(0, queuePtrWidth bits) && topCacheCount === U(0, topCacheCountWidth bits) &&
+      !refillRespValid && push_count === U(0, 32 bits) && pushPrePopRem === U(0, 32 bits)
 
-  val task_exhausted =
-    task_empty &&
-      queue_bottom === U(0, queuePtrWidth bits) &&
-      topCacheCount === U(0, topCacheCountWidth bits) &&
-      !refillRespValid &&
-      push_count === U(0, 32 bits) &&
-      pushPrePopRem === U(0, 32 bits)
-
-  // ============================================================================
   // FSM
-  // ============================================================================
-
   val fsm = new StateMachine {
     val IDLE: State         = new State with EntryPoint
     val WORK: State         = new State
-    val UPDATE_CACHE: State = new State
 
     inWork := isActive(WORK)
 
@@ -835,12 +587,8 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
         ))
       }
 
-      when(isEntering(UPDATE_CACHE) && isExiting(WORK)) {
-        mmuUpdate.clear()
-      }
-
-      when(isEntering(IDLE) && isExiting(UPDATE_CACHE)) {
-        io.ConfigIO.Done := True
+      when(isEntering(IDLE) && isExiting(WORK)) {
+        io.ConfigIO.TaskStackDone := True
       }
     }
 
@@ -893,15 +641,8 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
         }
       }
 
+      // Fetch Module idle and taskStack localBot == 0
       when(task_exhausted && io.toFetch.Pop.ready) {
-        goto(UPDATE_CACHE)
-      }
-    }
-
-    UPDATE_CACHE.whenIsActive {
-      mmuUpdate.run()
-
-      when(mmuUpdate.updateFinished) {
         goto(IDLE)
       }
     }
