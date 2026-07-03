@@ -8,17 +8,30 @@
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <sys/types.h>
+#include <unistd.h>
 
-#define SHADOW_SIZE 0x200000000
+#define SHADOW_SIZE 0x200000000ULL
+#define SHADOW_VA_BASE 0xfe00000000ULL
+
 static void *shadow_base = NULL;
 
 static void init_shadowChunks()
 {
-    shadow_base = mmap((void *)0xfe00000000,
+    void *requested = (void *)(uintptr_t)SHADOW_VA_BASE;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+
+    shadow_base = mmap(requested,
                        SHADOW_SIZE,
                        PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                       -1, 0);
+                       flags,
+                       -1,
+					   0);
+
     if (shadow_base == MAP_FAILED)
     {
         perror("mmap shadow 6GB");
@@ -28,7 +41,26 @@ static void init_shadowChunks()
 
 static inline void *shadow_addr(uint64_t addr)
 {
-    return (char *)addr;
+    uint64_t offset;
+
+    if (addr < SHADOW_VA_BASE) {
+        fprintf(stderr, "shadow address below range: 0x%llx\n",
+                (unsigned long long)addr);
+        abort();
+    }
+
+    offset = addr - SHADOW_VA_BASE;
+    if (offset >= SHADOW_SIZE) {
+        fprintf(stderr, "shadow address outside range: 0x%llx\n",
+                (unsigned long long)addr);
+        abort();
+    }
+
+    /*
+     * 只有确认 mmap 返回 SHADOW_VA_BASE 后，
+     * 恒等地址转换才成立。
+     */
+    return (void *)(uintptr_t)addr;
 }
 
 static inline uint64_t load64(uintptr_t addr)
@@ -51,6 +83,17 @@ static inline void store32(uintptr_t addr, uint32_t val)
 {
     addr = (uintptr_t)shadow_addr(addr);
     *(volatile uint32_t *)addr = val;
+}
+
+static inline uint64_t load16(uintptr_t addr)
+{
+    return *(volatile uint16_t *)shadow_addr(addr);
+}
+
+static inline void store16(uintptr_t addr, uint8_t val)
+{
+    addr = (uintptr_t)shadow_addr(addr);
+    *(volatile uint16_t *)addr = val;
 }
 
 static inline uint64_t load8(uintptr_t addr)

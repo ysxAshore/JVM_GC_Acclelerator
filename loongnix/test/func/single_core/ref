@@ -1,0 +1,24 @@
+[0.715s][info][gc,task] GC(0) Using 1 workers of 1 for evacuation
+work start, 49
+CPU 时钟周期数: 276584(ea69-60949-22.0%-4.54)
+执行时间: 114290 ns
+[0.925s][info][gc,task] GC(1) Using 1 workers of 1 for evacuation
+work start, 6e
+CPU 时钟周期数: 330666(e5fd-58877-17.8%-5.62)
+执行时间: 136540 ns
+[0.976s][info][gc,task] GC(2) Using 1 workers of 1 for evacuation
+work start, 45
+CPU 时钟周期数: 33464(1bf8-7480-22.4%-4.47)
+执行时间: 16980 ns
+[1.057s][info][gc,task] GC(3) Using 1 workers of 1 for evacuation
+work start, 6b
+CPU 时钟周期数: 683544(30cd2-199890-29.2%-3.42)
+执行时间: 277380 ns
+Version: avrora cvs-20131011 (use -p to print nominal benchmark stats)
+[1.171s][info][gc,task] GC(4) Using 1 workers of 1 for full compaction
+===== DaCapo 23.11-MR2-chopin avrora starting =====
+[12.169s][info][gc,task] GC(5) Using 1 workers of 1 for evacuation
+work start, 4c
+CPU 时钟周期数: 104616(542a-21546-20.6%-4.86)
+执行时间: 46020 ns
+===== DaCapo 23.11-MR2-chopin avrora PASSED in 11925 msec =====
