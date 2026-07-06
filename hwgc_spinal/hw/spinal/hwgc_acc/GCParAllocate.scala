@@ -43,7 +43,6 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
   val issuedPar = RegInit(False)
   val issuedAttempt = RegInit(False)
 
-  val nodeIndex = RegInit(U(0, 8 bits))
   val destAttrIdx = RegInit(U(0, 1 bits))
   val regionPtr = RegInit(U(0, GCElementWidth bits))
   val allocRegion = RegInit(U(0, GCElementWidth bits))
@@ -73,9 +72,9 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
   val new_gc_alloc_done_reg = RegInit(False)
   val new_alloc_region_reg = RegInit(U(0, GCElementWidth bits))
 
-  when(io.ToNewGCAlloc.Done) {
-    new_gc_alloc_done_reg := io.ToNewGCAlloc.Done
-    new_alloc_region_reg := io.ToNewGCAlloc.newAllocRegion
+  when(io.ToNewGCAlloc.done.valid) {
+    new_gc_alloc_done_reg := io.ToNewGCAlloc.done.valid
+    new_alloc_region_reg := io.ToNewGCAlloc.done.payload.NewAllocRegion
   }
 
   io.CacheUpdateOut.valid := updateValid
@@ -488,11 +487,11 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       NEW_ALLOC_REQ.whenIsActive {
-        io.ToNewGCAlloc.Valid := True
-        io.ToNewGCAlloc.regionPtr := region_ptr_r
-        io.ToNewGCAlloc.regionType := region_ptr_type
+        io.ToNewGCAlloc.cmd.valid := True
+        io.ToNewGCAlloc.cmd.payload.RegionPtr := region_ptr_r
+        io.ToNewGCAlloc.cmd.payload.RegionType := region_ptr_type
 
-        when(io.ToNewGCAlloc.Valid && io.ToNewGCAlloc.Ready) {
+        when(io.ToNewGCAlloc.cmd.fire) {
           goto(READ_ALLOC_REGION)
         }
       }
@@ -762,21 +761,20 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
     val UNLOCK_FREELIST = new State
 
     def resetState(): Unit = {
-      io.ToParAllocate.Done := True
-      io.ToParAllocate.DestObjPtr := destObjPtr
-      io.ToParAllocate.ActualPlabSize := actualWordSize
+      io.ToParAllocate.done.valid := True
+      io.ToParAllocate.done.payload.DestObjPtr := destObjPtr
+      io.ToParAllocate.done.payload.ActualPlabSize := actualWordSize
       goto(IDLE)
     }
 
     IDLE.whenIsActive {
-      io.ToParAllocate.Ready := True
+      io.ToParAllocate.cmd.ready := True
 
-      when(io.ToParAllocate.Valid && io.ToParAllocate.Ready) {
-        nodeIndex := io.ToParAllocate.NodeIndex
-        destAttrIdx := io.ToParAllocate.DestAttrIdx
-        minWordSize := io.ToParAllocate.MinWordSize
-        allocatorPtr := io.ToParAllocate.AllocatorPtr
-        desiredWordSize := io.ToParAllocate.DesiredWordSize
+      when(io.ToParAllocate.cmd.fire) {
+        destAttrIdx := io.ToParAllocate.cmd.payload.DestAttrIdx
+        minWordSize := io.ToParAllocate.cmd.payload.MinWordSize
+        allocatorPtr := io.ToParAllocate.cmd.payload.AllocatorPtr
+        desiredWordSize := io.ToParAllocate.cmd.payload.DesiredWordSize
 
         regionPtr := 0
         allocRegion := 0

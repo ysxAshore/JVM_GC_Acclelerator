@@ -41,8 +41,8 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   io.Mreq.Request.payload.clearAll()
   io.Mreq.Response.ready := True
 
-  io.ConfigIO.TaskStackDone := False
-  io.ConfigIO.TaskReady := False
+  io.ConfigIO.Done := False
+  io.ConfigIO.config.ready := False
 
   // Stack / Queue pointers
   val stackPtrWidth = log2Up(GCTaskStack_Entry)
@@ -578,22 +578,22 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
 
     always {
       when(isEntering(WORK) && isExiting(IDLE)) {
-        queue_bottom     := io.ConfigIO.TaskQueue_Bottom
-        queue_elems_base := io.ConfigIO.TaskQueue_ElemsBase.resize(MMUAddrWidth)
+        queue_bottom     := io.ConfigIO.config.payload.TaskQueue_Bottom
+        queue_elems_base := io.ConfigIO.config.payload.TaskQueue_ElemsBase.resize(MMUAddrWidth)
 
         dbg(Seq(
-          "Config JVM Queue, Bottom=", io.ConfigIO.TaskQueue_Bottom,
-          " ElemsBase=", io.ConfigIO.TaskQueue_ElemsBase
+          "Config JVM Queue, Bottom=", io.ConfigIO.config.payload.TaskQueue_Bottom,
+          " ElemsBase=", io.ConfigIO.config.payload.TaskQueue_ElemsBase
         ))
       }
 
       when(isEntering(IDLE) && isExiting(WORK)) {
-        io.ConfigIO.TaskStackDone := True
+        io.ConfigIO.Done := True
       }
     }
 
     IDLE.whenIsActive {
-      io.ConfigIO.TaskReady := True
+      io.ConfigIO.config.ready := True
 
       for (i <- 0 until GCTaskStack_Entry) {
         prefetched(i) := False
@@ -619,7 +619,7 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
       spillOutArea.clear()
       readBackArea.clear()
 
-      when(io.ConfigIO.TaskValid && io.ConfigIO.TaskReady) {
+      when(io.ConfigIO.config.fire) {
         goto(WORK)
       }
     }

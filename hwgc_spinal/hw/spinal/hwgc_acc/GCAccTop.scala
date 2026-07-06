@@ -2,11 +2,14 @@ package hwgc_acc
 
 import hwgc_top.{Config, GCTopParameters}
 import spinal.core._
+import spinal.lib.StreamArbiterFactory
 
 import scala.language.postfixOps
 
 class GCAccTop extends Module with GCTopParameters {
   val io  = new GCAccTopIO
+
+  val LocalMMUIOsNum = 19
 
   val gcTaskStack = new GCTaskStack
   val gcFetch = new GCFetch
@@ -20,11 +23,11 @@ class GCAccTop extends Module with GCTopParameters {
   val gcCopy = new GCCopy
   val gcTrace = new GCTrace
   val gcAop = new GCAop
-  val gcLocalMMU = new GCLocalMMU(19)
-  val gcUnalignedMMUAdapter = Array.fill(17)(new GCUnalignedMMUAdapter)
+  val gcLocalMMU = new GCLocalMMU(LocalMMUIOsNum)
+  val gcUnalignedMMUAdapter = Array.fill(LocalMMUIOsNum - 2)(new GCUnalignedMMUAdapter)
 
-  for(i <- 0 until 17){
-    gcLocalMMU.io.localMMUIOs(i) <> gcUnalignedMMUAdapter(i).io.out
+  gcUnalignedMMUAdapter.zipWithIndex.foreach{ case(adapter, i) =>
+    gcLocalMMU.io.localMMUIOs(i) <> adapter.io.out
   }
 
   val task_valid = RegInit(False) // 当前有任务在进行
@@ -61,12 +64,13 @@ class GCAccTop extends Module with GCTopParameters {
   val DebugTimeStamp = RegInit(U(0,64 bits))
   DebugTimeStamp := DebugTimeStamp + U(1)
 
+  // 已经接受了一个task
   val taskStackAccepted = task_valid && !taskStackStart
 
-  io.config.Ready := !task_valid
-  io.config.Done := task_valid && (taskStackAccepted && gcTaskStack.io.ConfigIO.TaskStackDone || taskStackDone) && gcOopProcess.io.SlotIsEmpty
+  io.config.cmd.ready := !task_valid
+  io.config.Done := task_valid && (taskStackAccepted && gcTaskStack.io.ConfigIO.Done || taskStackDone) && gcOopProcess.io.SlotIsEmpty
 
-  when(taskStackAccepted && gcTaskStack.io.ConfigIO.TaskStackDone){
+  when(taskStackAccepted && gcTaskStack.io.ConfigIO.Done){
     taskStackDone := True
   }
 
@@ -75,39 +79,39 @@ class GCAccTop extends Module with GCTopParameters {
     taskStackDone := False
   }
 
-  when(io.config.Valid && io.config.Ready){
+  when(io.config.cmd.fire){
     task_valid := True
     taskStackStart := True
 
-    ChunkSize                         := io.config.ChunkSize
-    AgeThreshold                      := io.config.AgeThreshold
-    HeapRegionBias                    := io.config.HeapRegionBias
-    RegionAttrShiftBy                 := io.config.RegionAttrShiftBy
-    HeapRegionShiftBy                 := io.config.HeapRegionShiftBy
-    LogOfHRGrainBytes                 := io.config.LogOfHRGrainBytes
-    StepperOffset                     := io.config.StepperOffset
-    YoungWordsBase                    := io.config.YoungWordsBase
-    RegionAttrBase                    := io.config.RegionAttrBase
-    PlabAllocatorPtr                  := io.config.PlabAllocatorPtr
-    RegionAttrBiasedBase              := io.config.RegionAttrBiasedBase
-    HeapRegionBiasedBase              := io.config.HeapRegionBiasedBase
-    ParScanThreadStatePtr             := io.config.ParScanThreadStatePtr
-    TaskQueue_Bottom                  := io.config.TaskQueue_Bottom
-    TaskQueue_ElemsBase               := io.config.TaskQueue_ElemsBase
-    HumongousReclaimCandidatesBoolBase:= io.config.HumongousReclaimCandidatesBoolBase
-    CardTablePtr                      := io.config.CardTablePtr
-    G1h                               := io.config.G1h
-    Thread                            := io.config.Thread
-    LockPtr                           := io.config.LockPtr
-    DummyRegion                       := io.config.DummyRegion
-    IntArrayKlassObj                  := io.config.IntArrayKlassObj
-    ObjectKlass                       := io.config.ObjectKlass
-    CompressedOopBase                 := io.config.CompressedOopBase
-    CompressedKlassPointerBase        := io.config.CompressedKlassPointerBase
-    CompressedFlag                    := io.config.CompressedFlag
+    ChunkSize                         := io.config.cmd.payload.ChunkSize
+    AgeThreshold                      := io.config.cmd.payload.AgeThreshold
+    HeapRegionBias                    := io.config.cmd.payload.HeapRegionBias
+    RegionAttrShiftBy                 := io.config.cmd.payload.RegionAttrShiftBy
+    HeapRegionShiftBy                 := io.config.cmd.payload.HeapRegionShiftBy
+    LogOfHRGrainBytes                 := io.config.cmd.payload.LogOfHRGrainBytes
+    StepperOffset                     := io.config.cmd.payload.StepperOffset
+    YoungWordsBase                    := io.config.cmd.payload.YoungWordsBase
+    RegionAttrBase                    := io.config.cmd.payload.RegionAttrBase
+    PlabAllocatorPtr                  := io.config.cmd.payload.PlabAllocatorPtr
+    RegionAttrBiasedBase              := io.config.cmd.payload.RegionAttrBiasedBase
+    HeapRegionBiasedBase              := io.config.cmd.payload.HeapRegionBiasedBase
+    ParScanThreadStatePtr             := io.config.cmd.payload.ParScanThreadStatePtr
+    TaskQueue_Bottom                  := io.config.cmd.payload.TaskQueue_Bottom
+    TaskQueue_ElemsBase               := io.config.cmd.payload.TaskQueue_ElemsBase
+    HumongousReclaimCandidatesBoolBase:= io.config.cmd.payload.HumongousReclaimCandidatesBoolBase
+    CardTablePtr                      := io.config.cmd.payload.CardTablePtr
+    G1h                               := io.config.cmd.payload.G1h
+    Thread                            := io.config.cmd.payload.Thread
+    LockPtr                           := io.config.cmd.payload.LockPtr
+    DummyRegion                       := io.config.cmd.payload.DummyRegion
+    IntArrayKlassObj                  := io.config.cmd.payload.IntArrayKlassObj
+    ObjectKlass                       := io.config.cmd.payload.ObjectKlass
+    CompressedOopBase                 := io.config.cmd.payload.CompressedOopBase
+    CompressedKlassPointerBase        := io.config.cmd.payload.CompressedKlassPointerBase
+    CompressedFlag                    := io.config.cmd.payload.CompressedFlag
   }
 
-  when(gcTaskStack.io.ConfigIO.TaskReady && gcTaskStack.io.ConfigIO.TaskValid){
+  when(gcTaskStack.io.ConfigIO.config.fire){
     taskStackStart := False
   }
 
@@ -115,9 +119,9 @@ class GCAccTop extends Module with GCTopParameters {
   gcTaskStack.io.toFetch <> gcFetch.io.toFetch
   gcTaskStack.io.toStack <> gcTrace.io.ToStack
   gcTaskStack.io.Mreq <> gcUnalignedMMUAdapter(0).io.in
-  gcTaskStack.io.ConfigIO.TaskQueue_Bottom := TaskQueue_Bottom
-  gcTaskStack.io.ConfigIO.TaskQueue_ElemsBase := TaskQueue_ElemsBase
-  gcTaskStack.io.ConfigIO.TaskValid := taskStackStart
+  gcTaskStack.io.ConfigIO.config.payload.TaskQueue_Bottom := TaskQueue_Bottom
+  gcTaskStack.io.ConfigIO.config.payload.TaskQueue_ElemsBase := TaskQueue_ElemsBase
+  gcTaskStack.io.ConfigIO.config.valid := taskStackStart
   gcTaskStack.io.DebugTimeStamp := DebugTimeStamp
 
   // GCFetch
@@ -174,16 +178,16 @@ class GCAccTop extends Module with GCTopParameters {
   gcOopCopy2Survivor.io.ConfigIO.UseCompressedKlassPointer := CompressedFlag(1)
   gcOopCopy2Survivor.io.ConfigIO.CompressedKlassPointerBase := CompressedKlassPointerBase
   gcOopCopy2Survivor.io.ConfigIO.CompressedKlassPointerShift := CompressedFlag(23 downto 16)
-  gcOopCopy2Survivor.io.ConfigIO.intArrayKlassObj := IntArrayKlassObj
-  gcOopCopy2Survivor.io.ConfigIO.objectKlassObj := ObjectKlass
+  gcOopCopy2Survivor.io.ConfigIO.IntArrayKlassObj := IntArrayKlassObj
+  gcOopCopy2Survivor.io.ConfigIO.ObjectKlassObj := ObjectKlass
   gcOopCopy2Survivor.io.DebugTimeStamp := DebugTimeStamp
 
   // gcAllocate(ToParAllocate)
   gcAllocate.io.Mreq <> gcUnalignedMMUAdapter(9).io.in
   gcAllocate.io.ToParAllocate <> gcParAllocate.io.ToParAllocate
   gcAllocate.io.ConfigIO.G1h := G1h
-  gcAllocate.io.ConfigIO.objectKlassObj := ObjectKlass
-  gcAllocate.io.ConfigIO.intArrayKlassObj := IntArrayKlassObj
+  gcAllocate.io.ConfigIO.ObjectKlassObj := ObjectKlass
+  gcAllocate.io.ConfigIO.IntArrayKlassObj := IntArrayKlassObj
   gcAllocate.io.ConfigIO.PlabAllocatorPtr := PlabAllocatorPtr
   gcAllocate.io.ConfigIO.UseCompressedKlassPointers := CompressedFlag(1)
   gcAllocate.io.ConfigIO.CompressedKlassPointerBase := CompressedKlassPointerBase
@@ -197,21 +201,21 @@ class GCAccTop extends Module with GCTopParameters {
   gcParAllocate.io.ToNewGCAlloc <> gcNewGCAlloc.io.ToNewGCAlloc
   gcParAllocate.io.CacheUpdateOut <> io.CacheUpdateOut
   gcParAllocate.io.CacheUpdateIn <> io.CacheUpdateIn
-  gcParAllocate.io.ConfigIO.G1h := io.config.G1h
-  gcParAllocate.io.ConfigIO.Thread := io.config.Thread
-  gcParAllocate.io.ConfigIO.LockPtr := io.config.LockPtr
-  gcParAllocate.io.ConfigIO.DummyRegion := io.config.DummyRegion
+  gcParAllocate.io.ConfigIO.G1h := G1h
+  gcParAllocate.io.ConfigIO.Thread := Thread
+  gcParAllocate.io.ConfigIO.LockPtr := LockPtr
+  gcParAllocate.io.ConfigIO.DummyRegion := DummyRegion
   gcParAllocate.io.DebugTimeStamp := DebugTimeStamp
 
   // gcNewAlloc
   gcNewGCAlloc.io.Mreq <> gcUnalignedMMUAdapter(13).io.in
   gcNewGCAlloc.io.ToAllocFreeRegion <> gcAllocFreeRegion.io.ToAllocFreeRegion
-  gcNewGCAlloc.io.ConfigIO.G1h := io.config.G1h
-  gcNewGCAlloc.io.ConfigIO.DummyRegion := io.config.DummyRegion
+  gcNewGCAlloc.io.ConfigIO.G1h := G1h
+  gcNewGCAlloc.io.ConfigIO.DummyRegion := DummyRegion
 
   // gcAllocFreeRegion
   gcAllocFreeRegion.io.Mreq <> gcUnalignedMMUAdapter(14).io.in
-  gcAllocFreeRegion.io.ConfigIO.G1h := io.config.G1h
+  gcAllocFreeRegion.io.ConfigIO.G1h := G1h
 
   // gcTrace
   gcTrace.io.Mreq <> gcUnalignedMMUAdapter(15).io.in
@@ -235,7 +239,7 @@ class GCAccTop extends Module with GCTopParameters {
   gcAop.io.ConfigIO.CardTablePtr := CardTablePtr
   gcAop.io.ConfigIO.ParScanThreadStatePtr := ParScanThreadStatePtr
   gcAop.io.DebugTimeStamp := DebugTimeStamp
-  gcAop.io.NoAopSrc := (gcTaskStack.io.ConfigIO.TaskStackDone || taskStackDone) && gcOopProcess.io.SlotIsEmpty
+  gcAop.io.NoAopSrc := (gcTaskStack.io.ConfigIO.Done || taskStackDone) && gcOopProcess.io.SlotIsEmpty
 
   // gcCopy
   gcCopy.io.readMReq <> gcLocalMMU.io.localMMUIOs(17)
@@ -245,17 +249,63 @@ class GCAccTop extends Module with GCTopParameters {
   // gcLocalMMU
   gcLocalMMU.io.LastLevelCacheTLIO <> io.mmu2llc
 
-  // gcTrace source mux
-  val trace_mux = new GCTraceMux
-  trace_mux.io.In0 <> gcArrayProcess.io.Process2Trace
-  trace_mux.io.In1 <> gcOopCopy2Survivor.io.ToTrace
-  trace_mux.io.Out <> gcTrace.io.ToTrace
+  // gcTrace source arbiter
+  val traceInputs = Seq(
+    gcArrayProcess.io.Process2Trace.cmd,      // source 0
+    gcOopCopy2Survivor.io.ToTrace.cmd         // source 1
+  )
+  val traceArb = StreamArbiterFactory().roundRobin.buildOn(traceInputs)
+  val traceOwner = Reg(UInt(1 bits)) init(0)
 
-  // gcAop source mux
-  val aop_mux = new GCAopMux
-  aop_mux.io.In0 <> gcOopProcess.io.Process2Aop
-  aop_mux.io.In1 <> gcTrace.io.ToAop
-  aop_mux.io.Out <> gcAop.io.Aop
+  gcTrace.io.ToTrace.cmd << traceArb.io.output
+
+  when(traceArb.io.output.fire) {
+    traceOwner := traceArb.io.chosen
+  }
+
+  gcArrayProcess.io.Process2Trace.Done := False
+  gcOopCopy2Survivor.io.ToTrace.Done := False
+
+  when(gcTrace.io.ToTrace.Done) {
+    switch(traceOwner) {
+      is(U(0)) {
+        gcArrayProcess.io.Process2Trace.Done := True
+      }
+
+      is(U(1)) {
+        gcOopCopy2Survivor.io.ToTrace.Done := True
+      }
+    }
+  }
+
+  // gcAop source arbiter
+  val aopInputs = Seq(
+    gcOopProcess.io.Process2Aop.cmd,      // source 0
+    gcTrace.io.ToAop.cmd,                   // source 1
+  )
+  val aopArb = StreamArbiterFactory().roundRobin.buildOn(aopInputs)
+  val aopOwner = Reg(UInt(1 bits)) init(0)
+
+  gcAop.io.Aop.cmd << aopArb.io.output
+
+  when(aopArb.io.output.fire) {
+    aopOwner := aopArb.io.chosen
+  }
+
+  gcOopProcess.io.Process2Aop.Done := False
+  gcTrace.io.ToAop.Done := False
+
+  when(gcAop.io.Aop.Done) {
+    switch(aopOwner) {
+      is(U(0)) {
+        gcOopProcess.io.Process2Aop.Done := True
+      }
+
+      is(U(1)) {
+        gcTrace.io.ToAop.Done := True
+      }
+    }
+  }
 }
 
 object GCAccTopVerilog extends App{

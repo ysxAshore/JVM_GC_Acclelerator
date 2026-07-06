@@ -64,7 +64,7 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
 
   // slot registers
   val slotValid = Vec.fill(2)(RegInit(False))
-  val slotCtx   = Vec.fill(2)(Reg(SlotCtx()) init (SlotCtx().getZero))
+  val slotCtx   = Vec.fill(2)(Reg(SlotCtx()) init SlotCtx().getZero)
 
   io.SlotIsEmpty := !slotValid.orR
 
@@ -143,16 +143,16 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   def allocToSlot(i: Int): Unit = {
     slotValid(i) := True
 
-    slotCtx(i).task      := io.Fetch2Process.Task
-    slotCtx(i).markWord  := io.Fetch2Process.MarkWord
-    slotCtx(i).klassPtr  := io.Fetch2Process.KlassPtr
-    slotCtx(i).srcOopPtr := io.Fetch2Process.SrcOopPtr
-    slotCtx(i).srcLength := io.Fetch2Process.SrcLength
+    slotCtx(i).task      := io.Fetch2Process.cmd.payload.Task
+    slotCtx(i).markWord  := io.Fetch2Process.cmd.payload.MarkWord
+    slotCtx(i).klassPtr  := io.Fetch2Process.cmd.payload.KlassPtr
+    slotCtx(i).srcOopPtr := io.Fetch2Process.cmd.payload.SrcOopPtr
+    slotCtx(i).srcLength := io.Fetch2Process.cmd.payload.SrcLength
 
     clearSlotRuntime(i)
     slotStart(i) := True
 
-    dbg(Seq("Allocate task to slot", i.toString, ", srcOopPtr=", io.Fetch2Process.SrcOopPtr))
+    dbg(Seq("Allocate task to slot", i.toString, ", srcOopPtr=", io.Fetch2Process.cmd.payload.SrcOopPtr))
   }
 
   def finishSlot(i: Int): Unit = {
@@ -224,8 +224,8 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   }
 
   // Process2CopySurvivor done capture
-  when(io.Process2CopySurvivor.isTypeArray) {
-    val isTypeArrayIdx = io.Process2CopySurvivor.DoneOwner
+  when(io.Process2CopySurvivor.done.payload.isTypeArray) {
+    val isTypeArrayIdx = io.Process2CopySurvivor.done.payload.DoneOwner
 
     when(
       slotCopy2SurvivorInflight(isTypeArrayIdx) &&
@@ -237,10 +237,10 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     }
   }
 
-  when(io.Process2CopySurvivor.Done) {
-    val doneOwner = io.Process2CopySurvivor.DoneOwner
+  when(io.Process2CopySurvivor.done.valid) {
+    val doneOwner = io.Process2CopySurvivor.done.payload.DoneOwner
 
-    slotCtx(doneOwner).destOopPtr := io.Process2CopySurvivor.DestOopPtr
+    slotCtx(doneOwner).destOopPtr := io.Process2CopySurvivor.done.payload.DestOopPtr
     slotCopy2SurvivorDone(doneOwner) := True
     slotCopy2SurvivorInflight(doneOwner) := False
 
@@ -254,9 +254,9 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   val pipeEmpty = !slotValid(0) && !slotValid(1)
   val hasFreeSlot = !slotValid(0) || !slotValid(1)
   val fetchReleasePulse = slotReleaseFetch.orR
-  val fetchAccept = io.Fetch2Process.Valid && io.Fetch2Process.Ready
+  val fetchAccept = io.Fetch2Process.cmd.fire
 
-  io.Fetch2Process.Ready := hasFreeSlot && (pipeEmpty || allowSecondInFlight)
+  io.Fetch2Process.cmd.ready := hasFreeSlot && (pipeEmpty || allowSecondInFlight)
   io.Fetch2Process.Done := fetchReleasePulse
 
   when(fetchAccept) {
@@ -270,7 +270,7 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   // 集中更新 allowSecondInFlight，避免多个位置直接写这个寄存器。
   when(fetchReleasePulse) {
     allowSecondInFlight := True
-  } elsewhen(fetchAccept) {
+  } elsewhen fetchAccept {
     allowSecondInFlight := False
   }
 
@@ -454,10 +454,10 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
         when(slotGotoIdle(i)) {
           goto(IDLE)
 
-        } elsewhen(slotStart(i)) {
+        } elsewhen slotStart(i) {
           goto(READ_SRC_ATTR)
 
-        } elsewhen(slotCopyReqAccepted(i)) {
+        } elsewhen slotCopyReqAccepted(i) {
           goto(READ_HEAP_PTR)
         }
       }
@@ -507,18 +507,18 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   val grantCopy1 = !slotWantCopySurvivor(0) && slotWantCopySurvivor(1)
 
   when(grantCopy0 || grantCopy1) {
-    io.Process2CopySurvivor.Valid := True
-    io.Process2CopySurvivor.Owner := Mux(grantCopy0, U(0, 1 bits), U(1, 1 bits))
-    io.Process2CopySurvivor.MarkWord := Mux(grantCopy0, slotCtx(0).markWord, slotCtx(1).markWord)
-    io.Process2CopySurvivor.KlassPtr := Mux(grantCopy0, slotCtx(0).klassPtr, slotCtx(1).klassPtr)
-    io.Process2CopySurvivor.SrcOopPtr := Mux(grantCopy0, slotCtx(0).srcOopPtr, slotCtx(1).srcOopPtr)
-    io.Process2CopySurvivor.SrcLength := Mux(grantCopy0, slotCtx(0).srcLength, slotCtx(1).srcLength)
-    io.Process2CopySurvivor.SrcRegionAttr := Mux(grantCopy0, slotCtx(0).srcRegionAttr, slotCtx(1).srcRegionAttr)
-    io.Process2CopySurvivor.RegionAttrPtr := Mux(grantCopy0,
+    io.Process2CopySurvivor.cmd.valid := True
+    io.Process2CopySurvivor.cmd.payload.Owner := Mux(grantCopy0, U(0, 1 bits), U(1, 1 bits))
+    io.Process2CopySurvivor.cmd.payload.MarkWord := Mux(grantCopy0, slotCtx(0).markWord, slotCtx(1).markWord)
+    io.Process2CopySurvivor.cmd.payload.KlassPtr := Mux(grantCopy0, slotCtx(0).klassPtr, slotCtx(1).klassPtr)
+    io.Process2CopySurvivor.cmd.payload.SrcOopPtr := Mux(grantCopy0, slotCtx(0).srcOopPtr, slotCtx(1).srcOopPtr)
+    io.Process2CopySurvivor.cmd.payload.SrcLength := Mux(grantCopy0, slotCtx(0).srcLength, slotCtx(1).srcLength)
+    io.Process2CopySurvivor.cmd.payload.SrcRegionAttr := Mux(grantCopy0, slotCtx(0).srcRegionAttr, slotCtx(1).srcRegionAttr)
+    io.Process2CopySurvivor.cmd.payload.RegionAttrPtr := Mux(grantCopy0,
         srcRegionAttrAddr(0).resize(GCElementWidth),
         srcRegionAttrAddr(1).resize(GCElementWidth))
 
-    when(io.Process2CopySurvivor.Ready) {
+    when(io.Process2CopySurvivor.cmd.fire) {
       when(grantCopy0) {
         slotCopy2SurvivorInflight(0)      := True
         slotCopy2SurvivorTypeArraySeen(0) := False
@@ -545,11 +545,11 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   val grantAop1 = !slotWantAop(0) && slotWantAop(1)
 
   when(grantAop0 || grantAop1) {
-    io.Process2Aop.Valid := True
-    io.Process2Aop.Task := Mux(grantAop0, slotCtx(0).task, slotCtx(1).task)
-    io.Process2Aop.RegionAttr := Mux(grantAop0, slotCtx(0).destRegionAttr, slotCtx(1).destRegionAttr)
+    io.Process2Aop.cmd.valid := True
+    io.Process2Aop.cmd.payload.Task := Mux(grantAop0, slotCtx(0).task, slotCtx(1).task)
+    io.Process2Aop.cmd.payload.RegionAttr := Mux(grantAop0, slotCtx(0).destRegionAttr, slotCtx(1).destRegionAttr)
 
-    when(io.Process2Aop.Ready) {
+    when(io.Process2Aop.cmd.fire) {
       when(grantAop0) {
         finishSlot(0)
       }

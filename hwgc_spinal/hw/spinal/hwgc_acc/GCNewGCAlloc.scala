@@ -12,7 +12,7 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
   val io = new Bundle {
     val Mreq              = master(new LocalMMUIO)
     val ToNewGCAlloc      = slave(new GCToNewGCAlloc)
-    val ToAllocFreeRegion = master(new GCToAllocFreeRegion)
+    val ToAllocFreeRegion = master(new GCToNewGCAlloc)
     val ConfigIO          = slave(new GCNewGCAllocConfigIO)
   }
 
@@ -77,9 +77,9 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
 
   val againCallAllocRegion = RegInit(False)
 
-  when(io.ToAllocFreeRegion.Done) {
+  when(io.ToAllocFreeRegion.done.valid) {
     allocFreeRegionDone := True
-    allocFreeRegion     := io.ToAllocFreeRegion.newAllocRegion
+    allocFreeRegion     := io.ToAllocFreeRegion.done.payload.NewAllocRegion
   }
 
   // Helper expressions
@@ -117,8 +117,8 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
     val WAIT_IRQ                      = new State
 
     def finish(res: UInt): Unit = {
-      io.ToNewGCAlloc.Done := True
-      io.ToNewGCAlloc.newAllocRegion := res
+      io.ToNewGCAlloc.done.valid := True
+      io.ToNewGCAlloc.done.payload.NewAllocRegion := res
       issued := False
       remsetStateWritten := False
       goto(IDLE)
@@ -135,11 +135,11 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
 
     // IDLE
     IDLE.whenIsActive {
-      io.ToNewGCAlloc.Ready := True
+      io.ToNewGCAlloc.cmd.ready := True
 
-      when(io.ToNewGCAlloc.Valid && io.ToNewGCAlloc.Ready) {
-        regionPtr := io.ToNewGCAlloc.regionPtr
-        heapRegionType := Mux(io.ToNewGCAlloc.regionType === U(1), HEAP_REGION_OLD, HEAP_REGION_YOUNG)
+      when(io.ToNewGCAlloc.cmd.fire) {
+        regionPtr := io.ToNewGCAlloc.cmd.payload.RegionPtr
+        heapRegionType := Mux(io.ToNewGCAlloc.cmd.payload.RegionType === U(1), HEAP_REGION_OLD, HEAP_REGION_YOUNG)
 
         newAllocRegion := zeroPtr
         issued         := False
@@ -164,10 +164,10 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
 
     // Start AllocFreeRegion
     CALL_ALLOC_FREE.whenIsActive {
-      io.ToAllocFreeRegion.Valid := True
-      io.ToAllocFreeRegion.heapRegionType := heapRegionType
+      io.ToAllocFreeRegion.cmd.valid := True
+      io.ToAllocFreeRegion.cmd.payload.RegionType := heapRegionType.resized
 
-      when(io.ToAllocFreeRegion.Valid && io.ToAllocFreeRegion.Ready) {
+      when(io.ToAllocFreeRegion.cmd.fire) {
         goto(WAIT_ALLOC_AND_CONFIG)
       }
     }
@@ -183,8 +183,8 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
     // -----------------------------------------------------------------------
 
     WAIT_ALLOC_AND_CONFIG.whenIsActive {
-      val allocDoneNow = allocFreeRegionDone || io.ToAllocFreeRegion.Done
-      val allocResult  = Mux(allocFreeRegionDone, allocFreeRegion, io.ToAllocFreeRegion.newAllocRegion)
+      val allocDoneNow = allocFreeRegionDone || io.ToAllocFreeRegion.done.valid
+      val allocResult  = Mux(allocFreeRegionDone, allocFreeRegion, io.ToAllocFreeRegion.done.payload.NewAllocRegion)
 
       when(isYoungRegion && !growArrayPtrValid) {
         val addr = io.ConfigIO.G1h + OFF_GROW_ARRAY_PTR

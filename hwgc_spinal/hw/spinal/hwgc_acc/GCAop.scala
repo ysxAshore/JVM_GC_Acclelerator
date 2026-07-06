@@ -106,14 +106,14 @@ class GCAop extends Module with GCTopParameters with HWParameters {
     IDLE.whenIsActive {
       val noAopSeen = noAopSrcPending || noAopSrcRise
 
-      io.Aop.Ready := True
+      io.Aop.cmd.ready := True
 
       // 如果 noAopSeen 和 io.Aop.Valid 同拍有效，优先接收这个已经挂在接口上的 Aop。
-      when(io.Aop.Valid) {
-        dest   := io.Aop.Task
+      when(io.Aop.cmd.valid) {
+        dest   := io.Aop.cmd.payload.Task
         issued := False
 
-        when(io.Aop.RegionAttr(7 downto 0) === U(0, 8 bits)) {
+        when(io.Aop.cmd.payload.RegionAttr(7 downto 0) === U(0, 8 bits)) {
           dbg(Seq("RegionAttr=0, skip directly"))
           io.Aop.Done := True
         } otherwise {
@@ -125,7 +125,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
         }
 
       } elsewhen noAopSeen {
-        io.Aop.Ready := False
+        io.Aop.cmd.ready := False
         issued := False
         goto(WB_FLUSH_BUFFER_WRITE)
       }

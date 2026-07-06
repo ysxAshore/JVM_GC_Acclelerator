@@ -82,7 +82,7 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   val firstReadBeat = RegInit(False)
 
   // task accept / done
-  io.ToCopy.Ready := !task_valid
+  io.ToCopy.cmd.ready := !task_valid
 
   val taskDoneNow = task_valid && (readReqIdx === readBeatCount) && (robCount === 0) &&
       (repackValidBytes === 0) && (bytesAppended === totalSize) && (bytesWritten === totalSize)
@@ -94,13 +94,13 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
     counter := counter + 1
   }
 
-  when(io.ToCopy.Valid && io.ToCopy.Ready) {
-    srcPtr := io.ToCopy.SrcOopPtr
-    dstPtr := io.ToCopy.DestOopPtr
-    totalSize := io.ToCopy.Size
+  when(io.ToCopy.cmd.fire) {
+    srcPtr := io.ToCopy.cmd.payload.SrcOopPtr
+    dstPtr := io.ToCopy.cmd.payload.DestOopPtr
+    totalSize := io.ToCopy.cmd.payload.Size
 
-    srcBase := alignDown(io.ToCopy.SrcOopPtr, GCElementWidth)
-    srcOff  := io.ToCopy.SrcOopPtr(OffBits - 1 downto 0)
+    srcBase := alignDown(io.ToCopy.cmd.payload.SrcOopPtr, GCElementWidth)
+    srcOff  := io.ToCopy.cmd.payload.SrcOopPtr(OffBits - 1 downto 0)
 
     readReqIdx := 0
     bytesAppended := 0
@@ -118,7 +118,7 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
       robRespValid(i) := False
     }
 
-    when(io.ToCopy.Size === 0) {
+    when(io.ToCopy.cmd.payload.Size === 0) {
       task_valid := False
       zeroTaskDone := True
       readBeatCount := 0
@@ -127,7 +127,7 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
       zeroTaskDone := False
 
       // readBeatCount = ceil((srcOff + size) / BeatBytes)
-      readBeatCount := ((io.ToCopy.SrcOopPtr(OffBits - 1 downto 0) + io.ToCopy.Size + U(BeatBytes - 1, 32 bits)) >> OffBits).resize(32)
+      readBeatCount := ((io.ToCopy.cmd.payload.SrcOopPtr(OffBits - 1 downto 0) + io.ToCopy.cmd.payload.Size + U(BeatBytes - 1, 32 bits)) >> OffBits).resize(32)
     }
   } elsewhen zeroTaskDone {
     zeroTaskDone := False

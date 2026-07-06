@@ -78,20 +78,20 @@ class GCArrayProcess extends Module with HWParameters with GCTopParameters with 
     val WAIT_TRACE_DONE = new State
 
     IDLE.whenIsActive {
-      io.Fetch2Process.Ready := True
+      io.Fetch2Process.cmd.ready := True
 
-      when(io.Fetch2Process.Valid && io.Fetch2Process.Ready) {
-        oopType    := io.Fetch2Process.OopType
-        srcOopPtr  := io.Fetch2Process.SrcOopPtr
-        markWord   := io.Fetch2Process.MarkWord
-        destOopPtr := io.Fetch2Process.MarkWord & ~U(3, GCElementWidth bits)
-        srcLength  := io.Fetch2Process.SrcLength
+      when(io.Fetch2Process.cmd.fire) {
+        oopType    := io.Fetch2Process.cmd.payload.OopType
+        srcOopPtr  := io.Fetch2Process.cmd.payload.SrcOopPtr
+        markWord   := io.Fetch2Process.cmd.payload.MarkWord
+        destOopPtr := io.Fetch2Process.cmd.payload.MarkWord & ~U(3, GCElementWidth bits)
+        srcLength  := io.Fetch2Process.cmd.payload.SrcLength
 
         issued := False
 
         goto(READ_DEST_LEN)
 
-        dbg(Seq("Receive task from Fetch Module, the srcOopPtr is ", io.Fetch2Process.SrcOopPtr, ", the markWord is ", io.Fetch2Process.MarkWord))
+        dbg(Seq("Receive task from Fetch Module, the srcOopPtr is ", io.Fetch2Process.cmd.payload.SrcOopPtr, ", the markWord is ", io.Fetch2Process.cmd.payload.MarkWord))
       }
     }
 
@@ -141,18 +141,18 @@ class GCArrayProcess extends Module with HWParameters with GCTopParameters with 
     }
 
     SEND_TRACE.whenIsActive {
-      io.Process2Trace.Valid := True
+      io.Process2Trace.cmd.valid := True
 
-      io.Process2Trace.OopType := oopType
-      io.Process2Trace.SrcOopPtr := srcOopPtr
-      io.Process2Trace.DestOopPtr := destOopPtr
-      io.Process2Trace.ScanningInYoung := heapRegionCache(heapRegionHitIndex)
-      io.Process2Trace.StepIndex := step_index
-      io.Process2Trace.StepNCreate := step_ncreate
-      io.Process2Trace.ArrayLength := dest_length + io.ConfigIO.ChunkSize
-      io.Process2Trace.PartialArrayStart := dest_length
+      io.Process2Trace.cmd.payload.OopType := oopType
+      io.Process2Trace.cmd.payload.SrcOopPtr := srcOopPtr
+      io.Process2Trace.cmd.payload.DestOopPtr := destOopPtr
+      io.Process2Trace.cmd.payload.ScanningInYoung := heapRegionCache(heapRegionHitIndex)
+      io.Process2Trace.cmd.payload.StepIndex := step_index
+      io.Process2Trace.cmd.payload.StepNCreate := step_ncreate
+      io.Process2Trace.cmd.payload.ArrayLength := dest_length + io.ConfigIO.ChunkSize
+      io.Process2Trace.cmd.payload.PartialArrayStart := dest_length
 
-      when(io.Process2Trace.Valid && io.Process2Trace.Ready) {
+      when(io.Process2Trace.cmd.fire) {
         goto(WAIT_TRACE_DONE)
 
         dbg(Seq("This task has sent to Trace Module"))

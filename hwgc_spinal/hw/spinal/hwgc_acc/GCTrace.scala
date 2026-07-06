@@ -281,20 +281,20 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
     }
 
     IDLE.whenIsActive {
-      io.ToTrace.Ready := True
+      io.ToTrace.cmd.ready := True
 
-      when(io.ToTrace.Valid && io.ToTrace.Ready) {
-        Kid             := io.ToTrace.Kid
-        OopType         := io.ToTrace.OopType
-        KlassPtr        := io.ToTrace.KlassPtr
-        SrcOopPtr       := io.ToTrace.SrcOopPtr
-        DestOopPtr      := io.ToTrace.DestOopPtr
-        ScanningInYoung := io.ToTrace.ScanningInYoung
-        StepIndex       := io.ToTrace.StepIndex
-        StepNCreate     := io.ToTrace.StepNCreate
-        ArrayLength     := io.ToTrace.ArrayLength
+      when(io.ToTrace.cmd.fire) {
+        Kid             := io.ToTrace.cmd.payload.Kid
+        OopType         := io.ToTrace.cmd.payload.OopType
+        KlassPtr        := io.ToTrace.cmd.payload.KlassPtr
+        SrcOopPtr       := io.ToTrace.cmd.payload.SrcOopPtr
+        DestOopPtr      := io.ToTrace.cmd.payload.DestOopPtr
+        ScanningInYoung := io.ToTrace.cmd.payload.ScanningInYoung
+        StepIndex       := io.ToTrace.cmd.payload.StepIndex
+        StepNCreate     := io.ToTrace.cmd.payload.StepNCreate
+        ArrayLength     := io.ToTrace.cmd.payload.ArrayLength
 
-        PartialArrayStart := Mux(io.ToTrace.OopType === U(PartialArrayOop), io.ToTrace.PartialArrayStart, U(0))
+        PartialArrayStart := Mux(io.ToTrace.cmd.payload.OopType === U(PartialArrayOop), io.ToTrace.cmd.payload.PartialArrayStart, U(0))
 
         partialTaskCounter := 0
         refFieldIndex := 0
@@ -314,15 +314,15 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
             ", HeapRegionBias = ", io.ConfigIO.HeapRegionBias,
             ", HeapRegionShiftBy = ", io.ConfigIO.HeapRegionShiftBy,
             ", LogOfHRGrainBytes = ", io.ConfigIO.LogOfHRGrainBytes,
-            ", OopType = ", io.ToTrace.OopType,
-            ", KlassPtr = ", io.ToTrace.KlassPtr,
-            ", SrcOopPtr = ", io.ToTrace.SrcOopPtr,
-            ", DestOopPtr = ", io.ToTrace.DestOopPtr,
-            ", Kid = ", io.ToTrace.Kid,
-            ", ArrayLength = ", io.ToTrace.ArrayLength,
-            ", PartialArrayStart = ", io.ToTrace.PartialArrayStart,
-            ", StepIndex = ", io.ToTrace.StepIndex,
-            ", StepNCreate = ", io.ToTrace.StepNCreate
+            ", OopType = ", io.ToTrace.cmd.payload.OopType,
+            ", KlassPtr = ", io.ToTrace.cmd.payload.KlassPtr,
+            ", SrcOopPtr = ", io.ToTrace.cmd.payload.SrcOopPtr,
+            ", DestOopPtr = ", io.ToTrace.cmd.payload.DestOopPtr,
+            ", Kid = ", io.ToTrace.cmd.payload.Kid,
+            ", ArrayLength = ", io.ToTrace.cmd.payload.ArrayLength,
+            ", PartialArrayStart = ", io.ToTrace.cmd.payload.PartialArrayStart,
+            ", StepIndex = ", io.ToTrace.cmd.payload.StepIndex,
+            ", StepNCreate = ", io.ToTrace.cmd.payload.StepNCreate
           )
         )
       }
@@ -642,11 +642,11 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
       when(ScanningInYoung) {
         resumeTraversal()
       } otherwise {
-        io.ToAop.Valid := True
-        io.ToAop.Task := dest
-        io.ToAop.RegionAttr := regionAttr
+        io.ToAop.cmd.valid := True
+        io.ToAop.cmd.payload.Task := dest
+        io.ToAop.cmd.payload.RegionAttr := regionAttr
 
-        when(io.ToAop.Valid && io.ToAop.Ready) {
+        when(io.ToAop.cmd.fire) {
           resumeTraversal()
         }
       }

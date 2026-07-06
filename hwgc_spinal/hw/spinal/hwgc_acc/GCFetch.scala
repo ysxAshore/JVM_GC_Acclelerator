@@ -130,13 +130,13 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     if (DebugEnable) report(Seq("[GCFetch<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
 
   def driveProcessUnit(target: GCToProcessUnit, payload: GcFetchData): Unit = {
-    target.Valid     := True
-    target.Task      := payload.task
-    target.OopType   := payload.oopType
-    target.SrcOopPtr := payload.fromObj
-    target.MarkWord  := payload.markWord
-    target.KlassPtr  := payload.klassPtr
-    target.SrcLength := payload.srcLength
+    target.cmd.valid             := True
+    target.cmd.payload.Task      := payload.task
+    target.cmd.payload.OopType   := payload.oopType
+    target.cmd.payload.SrcOopPtr := payload.fromObj
+    target.cmd.payload.MarkWord  := payload.markWord
+    target.cmd.payload.KlassPtr  := payload.klassPtr
+    target.cmd.payload.SrcLength := payload.srcLength
   }
 
   val oopReadSize = U(8, LineBytesNumBitSize bits)
@@ -250,15 +250,15 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
   val fwdObj   = RegInit(U(0, preBuf(0).fromObj.getWidth bits))
   val fwdValue = RegInit(U(0, GCElementWidth bits))
 
-  when(io.gcWriteSrcOopPtr.valid) {
+  when(io.gcWriteSrcOopPtr.writeForward.valid) {
     fwdValid := True
-    fwdObj   := io.gcWriteSrcOopPtr.srcOopPtr
-    fwdValue := io.gcWriteSrcOopPtr.writeValue
+    fwdObj   := io.gcWriteSrcOopPtr.writeForward.payload.srcOopPtr
+    fwdValue := io.gcWriteSrcOopPtr.writeForward.payload.writeValue
   }
 
   for (i <- 0 until PreFetchBufferNum) {
-    when(io.gcWriteSrcOopPtr.valid && preBufDone(i) && preBuf(i).fromObj === io.gcWriteSrcOopPtr.srcOopPtr) {
-      preBuf(i).markWord := io.gcWriteSrcOopPtr.writeValue
+    when(io.gcWriteSrcOopPtr.writeForward.valid && preBufDone(i) && preBuf(i).fromObj === io.gcWriteSrcOopPtr.writeForward.payload.srcOopPtr) {
+      preBuf(i).markWord := io.gcWriteSrcOopPtr.writeForward.payload.writeValue
       preBufMwHit(i)     := True
     }
   }
@@ -403,10 +403,8 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
         driveProcessUnit(io.Fetch2ArrayProcess, main_data)
       }
 
-      val unitValid = Mux(isOop, io.Fetch2OopProcess.Valid, io.Fetch2ArrayProcess.Valid)
-      val unitReady = Mux(isOop, io.Fetch2OopProcess.Ready, io.Fetch2ArrayProcess.Ready)
-
-      when(unitValid && unitReady) {
+      val unitFire = Mux(isOop, io.Fetch2OopProcess.cmd.fire, io.Fetch2ArrayProcess.cmd.fire)
+      when(unitFire) {
         goto(WAIT_DONE)
 
         dbg(Seq(
@@ -708,15 +706,15 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
         val currentFromObj = preBuf(buf_work).fromObj
 
         val hitFwdNow =
-          (io.gcWriteSrcOopPtr.valid && currentFromObj === io.gcWriteSrcOopPtr.srcOopPtr) ||
+          (io.gcWriteSrcOopPtr.writeForward.valid && currentFromObj === io.gcWriteSrcOopPtr.writeForward.payload.srcOopPtr) ||
             (fwdValid && currentFromObj === fwdObj)
 
         val finalMw = UInt(GCElementWidth bits)
         finalMw := rd(GCElementWidth - 1 downto 0)
 
         when(hitFwdNow) {
-          when(io.gcWriteSrcOopPtr.valid) {
-            finalMw := io.gcWriteSrcOopPtr.writeValue
+          when(io.gcWriteSrcOopPtr.writeForward.valid) {
+            finalMw := io.gcWriteSrcOopPtr.writeForward.payload.writeValue
           }.otherwise {
             finalMw := fwdValue
             fwdValid := False

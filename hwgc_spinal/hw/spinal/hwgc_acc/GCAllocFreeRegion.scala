@@ -11,7 +11,7 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
   val io = new Bundle {
     val Mreq              = master(new LocalMMUIO)
     val ConfigIO          = slave(new GCAllocFreeRegionConfigIO)
-    val ToAllocFreeRegion = slave(new GCToAllocFreeRegion)
+    val ToAllocFreeRegion = slave(new GCToNewGCAlloc)
   }
 
   // Default outputs
@@ -76,8 +76,8 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
     val WRITE_LIST_LENGTH     = new State
 
     def finish(res: UInt): Unit = {
-      io.ToAllocFreeRegion.Done := True
-      io.ToAllocFreeRegion.newAllocRegion := res
+      io.ToAllocFreeRegion.done.valid := True
+      io.ToAllocFreeRegion.done.payload.NewAllocRegion := res
       issued := False
       goto(IDLE)
     }
@@ -100,11 +100,11 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
 
     // IDLE
     IDLE.whenIsActive {
-      io.ToAllocFreeRegion.Ready := True
+      io.ToAllocFreeRegion.cmd.ready := True
 
-      when(io.ToAllocFreeRegion.Valid && io.ToAllocFreeRegion.Ready) {
+      when(io.ToAllocFreeRegion.cmd.fire) {
         freeListPtr := io.ConfigIO.G1h + FREE_LIST_OFFSET
-        fromHead := (io.ToAllocFreeRegion.heapRegionType & U(2, 32 bits)) === U(0, 32 bits)
+        fromHead := (io.ToAllocFreeRegion.cmd.payload.RegionType & U(2, 8 bits)) === U(0, 8 bits)
 
         newAllocRegion := zeroPtr
         neighborPtr := zeroPtr

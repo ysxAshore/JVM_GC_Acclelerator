@@ -90,11 +90,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   io.ToFetch.clearIn()
   io.ToTrace.clearIn()
   io.ToAllocate.clearIn()
-
-  io.ToCopySurvivor.Done := False
-  io.ToCopySurvivor.DoneOwner := U(0)
-  io.ToCopySurvivor.DestOopPtr := U(0)
-  io.ToCopySurvivor.isTypeArray := False
+  io.ToCopySurvivor.done.clearAll()
 
   def slotMreq(i: Int): LocalMMUIO = if (i == 0) io.Mreq0 else io.Mreq1
 
@@ -271,13 +267,13 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   def allocSlot(i: Int): Unit = {
     slotValid(i) := True
 
-    slotCtx(i).owner := io.ToCopySurvivor.Owner
-    slotCtx(i).srcOopPtr := io.ToCopySurvivor.SrcOopPtr
-    slotCtx(i).markWord := io.ToCopySurvivor.MarkWord
-    slotCtx(i).klassPtr := io.ToCopySurvivor.KlassPtr
-    slotCtx(i).srcLength := io.ToCopySurvivor.SrcLength
-    slotCtx(i).srcRegionAttr := io.ToCopySurvivor.SrcRegionAttr
-    slotCtx(i).regionAttrPtr := io.ToCopySurvivor.RegionAttrPtr
+    slotCtx(i).owner := io.ToCopySurvivor.cmd.payload.Owner
+    slotCtx(i).srcOopPtr := io.ToCopySurvivor.cmd.payload.SrcOopPtr
+    slotCtx(i).markWord := io.ToCopySurvivor.cmd.payload.MarkWord
+    slotCtx(i).klassPtr := io.ToCopySurvivor.cmd.payload.KlassPtr
+    slotCtx(i).srcLength := io.ToCopySurvivor.cmd.payload.SrcLength
+    slotCtx(i).srcRegionAttr := io.ToCopySurvivor.cmd.payload.SrcRegionAttr
+    slotCtx(i).regionAttrPtr := io.ToCopySurvivor.cmd.payload.RegionAttrPtr
 
     slotCtx(i).ageThreshold := io.ConfigIO.AgeThreshold
 
@@ -290,7 +286,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
       olderSlot := U(i, 1 bits)
     }
 
-    dbg(Seq("Allocate task to slot", i.toString, ", src=", io.ToCopySurvivor.SrcOopPtr))
+    dbg(Seq("Allocate task to slot", i.toString, ", src=", io.ToCopySurvivor.cmd.payload.SrcOopPtr))
   }
 
   def finishSlot(i: Int): Unit = {
@@ -434,11 +430,11 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
     dbg(Seq("trace done for slot ", traceOwner))
   }
 
-  when(allocBusy && io.ToAllocate.Done) {
+  when(allocBusy && io.ToAllocate.done.valid) {
     allocBusy := False
     slotCtx(allocOwner).allocDone := True
-    slotCtx(allocOwner).destOopPtr := io.ToAllocate.DestObjPtr
-    slotCtx(allocOwner).plab_refill_failed := io.ToAllocate.PlabRefillFailed
+    slotCtx(allocOwner).destOopPtr := io.ToAllocate.done.payload.DestOopPtr
+    slotCtx(allocOwner).plab_refill_failed := io.ToAllocate.done.payload.PlabRefillFailed
 
     dbg(Seq("allocate done for slot ", allocOwner))
   }
@@ -448,9 +444,9 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   // ============================================================================
 
   val hasFreeSlot = !slotValid(0) || !slotValid(1)
-  io.ToCopySurvivor.Ready := hasFreeSlot
+  io.ToCopySurvivor.cmd.ready := hasFreeSlot
 
-  when(io.ToCopySurvivor.Valid && io.ToCopySurvivor.Ready) {
+  when(io.ToCopySurvivor.cmd.fire) {
     when(!slotValid(0)) {
       allocSlot(0)
     } otherwise {
@@ -1009,7 +1005,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
           val words = slotCtx(i).size >> 3
           val headSize = Mux(io.ConfigIO.UseCompressedKlassPointer, U(2), U(3))
           val cond = words >= headSize
-          val temp_klass_ptr = Mux(cond, io.ConfigIO.intArrayKlassObj, io.ConfigIO.objectKlassObj)
+          val temp_klass_ptr = Mux(cond, io.ConfigIO.IntArrayKlassObj, io.ConfigIO.ObjectKlassObj)
 
           val writeOff0 = U(1, 64 bits)
 
@@ -1325,8 +1321,8 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   val grantTypeArray1 = !typeArrayPending(0) && typeArrayPending(1)
 
   when(grantTypeArray0 || grantTypeArray1) {
-    io.ToCopySurvivor.isTypeArray := True
-    io.ToCopySurvivor.DoneOwner := Mux(grantTypeArray0, typeArrayOwner(0), typeArrayOwner(1))
+    io.ToCopySurvivor.done.payload.isTypeArray := True
+    io.ToCopySurvivor.done.payload.DoneOwner := Mux(grantTypeArray0, typeArrayOwner(0), typeArrayOwner(1))
 
     when(grantTypeArray0) {
       typeArrayPending(0) := False
@@ -1343,9 +1339,9 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   val grantDone1 = !survivorDonePending(0) && survivorDonePending(1)
 
   when(grantDone0 || grantDone1) {
-    io.ToCopySurvivor.Done := True
-    io.ToCopySurvivor.DoneOwner := Mux(grantDone0, survivorDoneOwner(0), survivorDoneOwner(1))
-    io.ToCopySurvivor.DestOopPtr := Mux(grantDone0, survivorDoneDest(0), survivorDoneDest(1))
+    io.ToCopySurvivor.done.valid := True
+    io.ToCopySurvivor.done.payload.DoneOwner := Mux(grantDone0, survivorDoneOwner(0), survivorDoneOwner(1))
+    io.ToCopySurvivor.done.payload.DestOopPtr := Mux(grantDone0, survivorDoneDest(0), survivorDoneDest(1))
 
     when(grantDone0) {
       survivorDonePending(0) := False
@@ -1362,10 +1358,10 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   val grantFetch1 = !toFetchPending(0) && toFetchPending(1)
 
   when(grantFetch0 || grantFetch1) {
-    io.ToFetch.valid := True
+    io.ToFetch.writeForward.valid := True
 
-    io.ToFetch.srcOopPtr := Mux(grantFetch0, toFetchSrcOopPtr(0), toFetchSrcOopPtr(1))
-    io.ToFetch.writeValue := Mux(grantFetch0, toFetchWriteValue(0), toFetchWriteValue(1))
+    io.ToFetch.writeForward.payload.srcOopPtr := Mux(grantFetch0, toFetchSrcOopPtr(0), toFetchSrcOopPtr(1))
+    io.ToFetch.writeForward.payload.writeValue := Mux(grantFetch0, toFetchWriteValue(0), toFetchWriteValue(1))
 
     when(grantFetch0) {
       toFetchPending(0) := False
@@ -1392,55 +1388,54 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
       val totalSize = (slotCtx(0).size * U(8)).resize(32)
       val compressedSize = Mux(io.ConfigIO.UseCompressedKlassPointer, U(16), U(20))
 
-      io.ToCopy.Valid := True
-      io.ToCopy.Size := Mux(
+      io.ToCopy.cmd.valid := True
+      io.ToCopy.cmd.payload.Size := Mux(
         slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits),
         totalSize - compressedSize,
         totalSize - U(8)
       )
 
-      io.ToCopy.SrcOopPtr := Mux(
+      io.ToCopy.cmd.payload.SrcOopPtr := Mux(
         slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits),
         slotCtx(0).srcOopPtr + compressedSize,
         slotCtx(0).srcOopPtr + U(8)
       )
 
-      io.ToCopy.DestOopPtr := Mux(
+      io.ToCopy.cmd.payload.DestOopPtr := Mux(
         slotCtx(0).kid === U(ObjectArrayKlassID, 32 bits),
         slotCtx(0).destOopPtr + compressedSize,
         slotCtx(0).destOopPtr + U(8)
       )
 
-      when(io.ToCopy.Ready) {
+      when(io.ToCopy.cmd.fire) {
         slotCtx(0).copyIssued := True
         slotCopyAccept(0) := True
         copyBusy := True
         copyOwner := U(0, 1 bits)
       }
-    } elsewhen(wantCopy(1)) {
+    } elsewhen wantCopy(1) {
       val totalSize = (slotCtx(1).size * U(8)).resize(32)
       val compressedSize = Mux(io.ConfigIO.UseCompressedKlassPointer, U(16), U(20))
 
-      io.ToCopy.Valid := True
-      io.ToCopy.Size := Mux(
+      io.ToCopy.cmd.valid := True
+      io.ToCopy.cmd.payload.Size := Mux(
         slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits),
         totalSize - compressedSize,
         totalSize - U(8)
       )
-
-      io.ToCopy.SrcOopPtr := Mux(
+      io.ToCopy.cmd.payload.SrcOopPtr := Mux(
         slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits),
         slotCtx(1).srcOopPtr + compressedSize,
         slotCtx(1).srcOopPtr + U(8)
       )
 
-      io.ToCopy.DestOopPtr := Mux(
+      io.ToCopy.cmd.payload.DestOopPtr := Mux(
         slotCtx(1).kid === U(ObjectArrayKlassID, 32 bits),
         slotCtx(1).destOopPtr + compressedSize,
         slotCtx(1).destOopPtr + U(8)
       )
 
-      when(io.ToCopy.Ready) {
+      when(io.ToCopy.cmd.fire) {
         slotCtx(1).copyIssued := True
         slotCopyAccept(1) := True
         copyBusy := True
@@ -1465,38 +1460,38 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
 
   when(!traceBusy) {
     when(wantTrace(0)) {
-      io.ToTrace.Valid := True
-      io.ToTrace.OopType := U(NotArrayOop)
-      io.ToTrace.KlassPtr := slotCtx(0).klassPtr
-      io.ToTrace.SrcOopPtr := slotCtx(0).srcOopPtr
-      io.ToTrace.DestOopPtr := slotCtx(0).destOopPtr
-      io.ToTrace.Kid := slotCtx(0).kid
-      io.ToTrace.ScanningInYoung := slotCtx(0).destRegionAttr(15 downto 8) === U(0, 8 bits)
-      io.ToTrace.ArrayLength := slotCtx(0).srcLength
-      io.ToTrace.PartialArrayStart := U(0)
-      io.ToTrace.StepIndex := (slotCtx(0).srcLength % io.ConfigIO.ChunkSize).resize(32)
-      io.ToTrace.StepNCreate := Mux(slotCtx(0).srcLength > (slotCtx(0).srcLength % io.ConfigIO.ChunkSize), U(1), U(0)).resize(32)
+      io.ToTrace.cmd.valid := True
+      io.ToTrace.cmd.payload.OopType := U(NotArrayOop)
+      io.ToTrace.cmd.payload.KlassPtr := slotCtx(0).klassPtr
+      io.ToTrace.cmd.payload.SrcOopPtr := slotCtx(0).srcOopPtr
+      io.ToTrace.cmd.payload.DestOopPtr := slotCtx(0).destOopPtr
+      io.ToTrace.cmd.payload.Kid := slotCtx(0).kid
+      io.ToTrace.cmd.payload.ScanningInYoung := slotCtx(0).destRegionAttr(15 downto 8) === U(0, 8 bits)
+      io.ToTrace.cmd.payload.ArrayLength := slotCtx(0).srcLength
+      io.ToTrace.cmd.payload.PartialArrayStart := U(0)
+      io.ToTrace.cmd.payload.StepIndex := (slotCtx(0).srcLength % io.ConfigIO.ChunkSize).resize(32)
+      io.ToTrace.cmd.payload.StepNCreate := Mux(slotCtx(0).srcLength > (slotCtx(0).srcLength % io.ConfigIO.ChunkSize), U(1), U(0)).resize(32)
 
-      when(io.ToTrace.Ready) {
+      when(io.ToTrace.cmd.fire) {
         slotCtx(0).traceIssued := True
         slotTraceAccept(0) := True
         traceBusy := True
         traceOwner := U(0, 1 bits)
       }
-    } elsewhen(wantTrace(1)) {
-      io.ToTrace.Valid := True
-      io.ToTrace.OopType := U(NotArrayOop)
-      io.ToTrace.KlassPtr := slotCtx(1).klassPtr
-      io.ToTrace.SrcOopPtr := slotCtx(1).srcOopPtr
-      io.ToTrace.DestOopPtr := slotCtx(1).destOopPtr
-      io.ToTrace.Kid := slotCtx(1).kid
-      io.ToTrace.ScanningInYoung := slotCtx(1).destRegionAttr(15 downto 8) === U(0, 8 bits)
-      io.ToTrace.ArrayLength := slotCtx(1).srcLength
-      io.ToTrace.PartialArrayStart := U(0)
-      io.ToTrace.StepIndex := (slotCtx(1).srcLength % io.ConfigIO.ChunkSize).resize(32)
-      io.ToTrace.StepNCreate := Mux(slotCtx(1).srcLength > (slotCtx(1).srcLength % io.ConfigIO.ChunkSize), U(1), U(0)).resize(32)
+    } elsewhen wantTrace(1) {
+      io.ToTrace.cmd.valid := True
+      io.ToTrace.cmd.payload.OopType := U(NotArrayOop)
+      io.ToTrace.cmd.payload.KlassPtr := slotCtx(1).klassPtr
+      io.ToTrace.cmd.payload.SrcOopPtr := slotCtx(1).srcOopPtr
+      io.ToTrace.cmd.payload.DestOopPtr := slotCtx(1).destOopPtr
+      io.ToTrace.cmd.payload.Kid := slotCtx(1).kid
+      io.ToTrace.cmd.payload.ScanningInYoung := slotCtx(1).destRegionAttr(15 downto 8) === U(0, 8 bits)
+      io.ToTrace.cmd.payload.ArrayLength := slotCtx(1).srcLength
+      io.ToTrace.cmd.payload.PartialArrayStart := U(0)
+      io.ToTrace.cmd.payload.StepIndex := (slotCtx(1).srcLength % io.ConfigIO.ChunkSize).resize(32)
+      io.ToTrace.cmd.payload.StepNCreate := Mux(slotCtx(1).srcLength > (slotCtx(1).srcLength % io.ConfigIO.ChunkSize), U(1), U(0)).resize(32)
 
-      when(io.ToTrace.Ready) {
+      when(io.ToTrace.cmd.fire) {
         slotCtx(1).traceIssued := True
         slotTraceAccept(1) := True
         traceBusy := True
@@ -1524,30 +1519,30 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
 
   when(!allocBusy) {
     when(wantAlloc(0)) {
-      io.ToAllocate.Valid := True
-      io.ToAllocate.Size := slotCtx(0).size
-      io.ToAllocate.DestAttrType := Mux(
+      io.ToAllocate.cmd.valid := True
+      io.ToAllocate.cmd.payload.Size := slotCtx(0).size
+      io.ToAllocate.cmd.payload.DestAttrType := Mux(
         slotCtx(0).plabForceOld,
         U(1, 8 bits),
         slotCtx(0).destRegionAttr(15 downto 8)
       )
 
-      when(io.ToAllocate.Ready) {
+      when(io.ToAllocate.cmd.fire) {
         slotCtx(0).allocIssued := True
         slotAllocAccept(0) := True
         allocBusy := True
         allocOwner := U(0, 1 bits)
       }
     } elsewhen(wantAlloc(1)) {
-      io.ToAllocate.Valid := True
-      io.ToAllocate.Size := slotCtx(1).size
-      io.ToAllocate.DestAttrType := Mux(
+      io.ToAllocate.cmd.valid := True
+      io.ToAllocate.cmd.payload.Size := slotCtx(1).size
+      io.ToAllocate.cmd.payload.DestAttrType := Mux(
         slotCtx(1).plabForceOld,
         U(1, 8 bits),
         slotCtx(1).destRegionAttr(15 downto 8)
       )
 
-      when(io.ToAllocate.Ready) {
+      when(io.ToAllocate.cmd.fire) {
         slotCtx(1).allocIssued := True
         slotAllocAccept(1) := True
         allocBusy := True

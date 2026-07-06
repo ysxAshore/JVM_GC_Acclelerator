@@ -8,6 +8,7 @@ import scala.language.postfixOps
 
 object Config {
   def spinal = SpinalConfig(
+    // 指定输出目录 及 复位 有效信号
     targetDirectory = "sim/vsrc",
     defaultConfigForClockDomains = ClockDomainConfig(
       resetActiveLevel = HIGH
@@ -151,46 +152,44 @@ class LocalMMUIO extends Bundle with HWParameters with IMasterSlave {
   }
 }
 
-class Ctrl2Top extends Bundle with GCTopParameters with IMasterSlave {
-  val ChunkSize = in UInt (32 bits)
-  val AgeThreshold = in UInt (32 bits)
-  val HeapRegionBias = in UInt (32 bits)
-  val RegionAttrShiftBy = in UInt (32 bits)
-  val HeapRegionShiftBy = in UInt (32 bits)
-  val LogOfHRGrainBytes = in UInt (32 bits)
-  val StepperOffset = in UInt (GCElementWidth bits)
-  val YoungWordsBase = in UInt (GCElementWidth bits)
-  val RegionAttrBase = in UInt (GCElementWidth bits)
-  val PlabAllocatorPtr = in UInt (GCElementWidth bits)
-  val RegionAttrBiasedBase = in UInt (GCElementWidth bits)
-  val HeapRegionBiasedBase = in UInt (GCElementWidth bits)
-  val ParScanThreadStatePtr = in UInt (GCElementWidth bits)
-  val TaskQueue_Bottom = in UInt (32 bits)
-  val TaskQueue_ElemsBase = in UInt (GCElementWidth bits)
-  val HumongousReclaimCandidatesBoolBase = in UInt (GCElementWidth bits)
-  val CardTablePtr = in UInt (GCElementWidth bits)
-  val G1h = in UInt (GCElementWidth bits)
-  val IntArrayKlassObj = in UInt (GCElementWidth bits)
-  val ObjectKlass = in UInt (GCElementWidth bits)
-  val LockPtr = in UInt (GCElementWidth bits)
-  val Thread = in UInt (GCElementWidth bits)
-  val DummyRegion = in UInt (GCElementWidth bits)
-  val CompressedOopBase = in UInt (GCElementWidth bits)
-  val CompressedKlassPointerBase = in UInt (GCElementWidth bits)
-  val CompressedFlag = in UInt (32 bits)
+case class Ctrl2TopPayload() extends Bundle with GCTopParameters {
+  val ChunkSize = UInt (32 bits)
+  val AgeThreshold = UInt (32 bits)
+  val HeapRegionBias = UInt (32 bits)
+  val HeapRegionShiftBy = UInt (32 bits)
+  val HeapRegionBiasedBase = UInt (GCElementWidth bits)
+  val RegionAttrShiftBy = UInt (32 bits)
+  val RegionAttrBiasedBase = UInt (GCElementWidth bits)
+  val LogOfHRGrainBytes = UInt (32 bits)
+  val StepperOffset = UInt (GCElementWidth bits)
+  val YoungWordsBase = UInt (GCElementWidth bits)
+  val RegionAttrBase = UInt (GCElementWidth bits)
+  val PlabAllocatorPtr = UInt (GCElementWidth bits)
+  val ParScanThreadStatePtr = UInt (GCElementWidth bits)
+  val TaskQueue_Bottom = UInt (32 bits)
+  val TaskQueue_ElemsBase = UInt (GCElementWidth bits)
+  val HumongousReclaimCandidatesBoolBase = UInt (GCElementWidth bits)
+  val CardTablePtr = UInt (GCElementWidth bits)
+  val G1h = UInt (GCElementWidth bits)
+  val Thread = UInt (GCElementWidth bits)
+  val LockPtr = UInt (GCElementWidth bits)
+  val DummyRegion = UInt (GCElementWidth bits)
+  val IntArrayKlassObj = UInt (GCElementWidth bits)
+  val ObjectKlass = UInt (GCElementWidth bits)
+  val CompressedOopBase = UInt (GCElementWidth bits)
+  val CompressedKlassPointerBase = UInt (GCElementWidth bits)
+  val CompressedFlag = UInt (32 bits)
 
-  val Valid = in Bool ()
-  val Ready = out Bool ()
-  val Done = out Bool ()
+
+}
+
+class Ctrl2Top extends Bundle with IMasterSlave {
+  val cmd = Stream(Ctrl2TopPayload())
+  val Done = Bool ()
 
   override def asMaster(): Unit = {
-    out(Valid, ChunkSize, AgeThreshold, HeapRegionBias, RegionAttrShiftBy,
-      HeapRegionShiftBy, LogOfHRGrainBytes, StepperOffset, YoungWordsBase,
-      RegionAttrBase, PlabAllocatorPtr, RegionAttrBiasedBase, HeapRegionBiasedBase,
-      ParScanThreadStatePtr, TaskQueue_Bottom, TaskQueue_ElemsBase, HumongousReclaimCandidatesBoolBase,
-      CardTablePtr, G1h, IntArrayKlassObj, ObjectKlass, LockPtr, Thread, DummyRegion,
-      CompressedOopBase, CompressedKlassPointerBase, CompressedFlag)
-    in(Ready, Done)
+    master(cmd)
+    in(Done)
   }
 }
 

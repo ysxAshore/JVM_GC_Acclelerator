@@ -127,18 +127,18 @@ class GCAllocate extends Module with GCTopParameters with HWParameters {
   }
 
   // Sticky capture for par_allocate result.
-  when(io.ToParAllocate.Done) {
+  when(io.ToParAllocate.done.valid) {
     par_allocate_done     := True
-    par_allocate_destObj  := io.ToParAllocate.DestObjPtr
-    par_allocate_plabSize := io.ToParAllocate.ActualPlabSize
+    par_allocate_destObj  := io.ToParAllocate.done.payload.DestObjPtr
+    par_allocate_plabSize := io.ToParAllocate.done.payload.ActualPlabSize
   }
 
   val fsm = new StateMachine {
 
     def finish(destObj: UInt, failed: Bool): Unit = {
-      io.ToAllocate.Done := True
-      io.ToAllocate.DestObjPtr := destObj
-      io.ToAllocate.PlabRefillFailed := failed
+      io.ToAllocate.done.valid := True
+      io.ToAllocate.done.payload.DestOopPtr := destObj
+      io.ToAllocate.done.payload.PlabRefillFailed := failed
 
       issued := False
       goto(sIdle)
@@ -147,15 +147,14 @@ class GCAllocate extends Module with GCTopParameters with HWParameters {
     }
 
     def sendToParAllocate(nextState: State, minWordSize: UInt, desiredWordSize: UInt): Unit = {
-      io.ToParAllocate.Valid := True
+      io.ToParAllocate.cmd.valid := True
 
-      io.ToParAllocate.NodeIndex := U(0)
-      io.ToParAllocate.MinWordSize := minWordSize
-      io.ToParAllocate.DesiredWordSize := desiredWordSize
-      io.ToParAllocate.DestAttrIdx := Mux(destAttrType === 0, U(0), U(1))
-      io.ToParAllocate.AllocatorPtr := allocator_ptr_cache
+      io.ToParAllocate.cmd.payload.MinWordSize := minWordSize
+      io.ToParAllocate.cmd.payload.DesiredWordSize := desiredWordSize
+      io.ToParAllocate.cmd.payload.DestAttrIdx := Mux(destAttrType === 0, U(0), U(1))
+      io.ToParAllocate.cmd.payload.AllocatorPtr := allocator_ptr_cache
 
-      when(io.ToParAllocate.Valid && io.ToParAllocate.Ready) {
+      when(io.ToParAllocate.cmd.fire) {
         goto(nextState)
       }
     }
@@ -185,17 +184,17 @@ class GCAllocate extends Module with GCTopParameters with HWParameters {
       whenIsActive {
         issued := False
 
-        io.ToAllocate.Ready := True
+        io.ToAllocate.cmd.ready := True
 
-        when(io.ToAllocate.Valid && io.ToAllocate.Ready) {
-          size := io.ToAllocate.Size
-          destAttrType := io.ToAllocate.DestAttrType
+        when(io.ToAllocate.cmd.fire) {
+          size := io.ToAllocate.cmd.payload.Size
+          destAttrType := io.ToAllocate.cmd.payload.DestAttrType
 
           plab_refill_failed := False
           par_allocate_return := False
           par_allocate_done := False
 
-          dbg(Seq("Receive allocation task, size = ", io.ToAllocate.Size, ", destAttrType = ", io.ToAllocate.DestAttrType))
+          dbg(Seq("Receive allocation task, size = ", io.ToAllocate.cmd.payload.Size, ", destAttrType = ", io.ToAllocate.cmd.payload.DestAttrType))
 
           goto(sCheckPlabStats)
         }
@@ -307,7 +306,7 @@ class GCAllocate extends Module with GCTopParameters with HWParameters {
       whenIsActive {
         when(top_ptr < hard_end_ptr) {
           val enoughWords = words >= headSize
-          val klassPtr = Mux(enoughWords, io.ConfigIO.intArrayKlassObj, io.ConfigIO.objectKlassObj)
+          val klassPtr = Mux(enoughWords, io.ConfigIO.IntArrayKlassObj, io.ConfigIO.ObjectKlassObj)
           val writeOff0 = U(1, 64 bits)
           val writeOff8 = Mux(io.ConfigIO.UseCompressedKlassPointers,
             ((klassPtr - io.ConfigIO.CompressedKlassPointerBase) >> io.ConfigIO.CompressedKlassPointerShift).resize(64),
@@ -339,9 +338,9 @@ class GCAllocate extends Module with GCTopParameters with HWParameters {
 
     val sWaitParAllocate: State = new State {
       whenIsActive {
-        val hasParResult = io.ToParAllocate.Done || par_allocate_done
-        val returnObjPtr = Mux(par_allocate_done, par_allocate_destObj, io.ToParAllocate.DestObjPtr)
-        val returnPlabSize = Mux(par_allocate_done, par_allocate_plabSize, io.ToParAllocate.ActualPlabSize)
+        val hasParResult = io.ToParAllocate.done.valid || par_allocate_done
+        val returnObjPtr = Mux(par_allocate_done, par_allocate_destObj, io.ToParAllocate.done.payload.DestObjPtr)
+        val returnPlabSize = Mux(par_allocate_done, par_allocate_plabSize, io.ToParAllocate.done.payload.ActualPlabSize)
 
         when(hasParResult) {
           par_allocate_done := False
@@ -380,9 +379,9 @@ class GCAllocate extends Module with GCTopParameters with HWParameters {
     val sWriteRefillHigh32B: State = new State {
       whenIsActive {
         issueLatchedWriteWithoutResp(sIdle) {
-          io.ToAllocate.Done := True
-          io.ToAllocate.DestObjPtr := destObjPtr
-          io.ToAllocate.PlabRefillFailed := False
+          io.ToAllocate.done.valid := True
+          io.ToAllocate.done.payload.DestOopPtr := destObjPtr
+          io.ToAllocate.done.payload.PlabRefillFailed := False
 
           dbg(Seq("Refill buffer done, destObj = ", destObjPtr))
         }
