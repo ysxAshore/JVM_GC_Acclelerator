@@ -7,6 +7,17 @@ import spinal.lib._
 
 import scala.language.postfixOps
 
+/*
+读请求按顺序发出
+        ↓
+响应乱序回来(第几个 read beat 对应复制流里的第几个字节开始 有多少有效字节 要写到目标地址哪里)
+        ↓
+ROB 任意 ready slot 都可以消费
+        ↓
+根据该 slot 的 readIdx 计算它对应的目标地址
+        ↓
+直接发写请求
+*/
 class GCCopy extends Component with HWParameters with GCParameters with GCTopParameters {
   val io = new Bundle {
     val ToCopy    = slave(new GCToCopy)
@@ -14,30 +25,26 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
     val writeMReq = master(new LocalMMUIO)
   }
 
-  // constants / helpers
-  val BeatBytes    = MMUDataWidth / 8
+  val BeatBytes    = LineBytesNum
   val BeatBytesU32 = U(BeatBytes, 32 bits)
   val OffBits      = log2Up(BeatBytes)
   val RobPtrBits   = log2Up(GCCopyEntry)
   val BeatLenBits  = log2Up(BeatBytes + 1)
 
-  def alignDown(x: UInt, width: Int): UInt = {
-    x & ~U(BeatBytes - 1, width bits)
-  }
+  def alignDown(x: UInt, width: Int): UInt = x & ~U(BeatBytes - 1, width bits)
 
+  // generate write mask for unaligned writes
+  //     byteOffset 表示从当前 beat 的第几个 byte 开始写。
+  //     byteLen 表示写多少 byte。
   def genMask(byteLen: UInt, byteOffset: UInt): UInt = {
     val ret = UInt(BeatBytes bits)
     for (i <- 0 until BeatBytes) {
-      ret(i) := (
-        U(i, BeatLenBits bits) >= byteOffset.resize(BeatLenBits)
-        ) && (
-        U(i, BeatLenBits bits) < (byteOffset.resize(BeatLenBits) + byteLen.resize(BeatLenBits))
-        )
+      ret(i) := (U(i, BeatLenBits bits) >= byteOffset.resize(BeatLenBits)) &&
+        (U(i, BeatLenBits bits) < (byteOffset.resize(BeatLenBits) + byteLen.resize(BeatLenBits)))
     }
     ret
   }
 
-  // task state
   val task_valid   = RegInit(False)
   val zeroTaskDone = RegInit(False)
 
@@ -48,51 +55,48 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   val srcBase = RegInit(U(0, GCElementWidth bits))
   val srcOff  = RegInit(U(0, OffBits bits))
 
-  // aligned read beats total / issued
-  val readBeatCount = RegInit(U(0, 32 bits))
-  val readReqIdx    = RegInit(U(0, 32 bits))
+  // read req status
+  val readBeatCount = RegInit(U(0, 32 bits)) // 一共需要发多少个 aligned read beat
+  val readReqIdx    = RegInit(U(0, 32 bits)) // 已经发出了多少个 read beat
 
-  // logical valid bytes appended into repack buffer
-  val bytesAppended = RegInit(U(0, 32 bits))
+  // inorder consume slot pool
+  val slotBusy = Vec.fill(GCCopyEntry)(RegInit(False))
+  val slotRespValid = Vec.fill(GCCopyEntry)(RegInit(False))
+  val slotReqIdx = Vec.fill(GCCopyEntry)(RegInit(U(0, 32 bits))) // 靠slotReqIdx算这个 beat 对应的逻辑偏移和目标地址
+  val slotData = Vec.fill(GCCopyEntry)(RegInit(U(0, MMUDataWidth bits)))
 
-  // logical bytes already sent to write side
-  val bytesWritten  = RegInit(U(0, 32 bits))
+  val sourceId2RobSlot = Reg(Vec(Seq.fill(LLCSourceMaxNum)(U(0, RobPtrBits bits)))) // SourceID -> ROB slot
 
-  // reorder buffer (ROB) for out-of-order read responses
-  // - request order allocates slots
-  // - response uses SourceID to fill slot
-  // - consume always from robConsumePtr in-order
-  val robAllocPtr   = RegInit(U(0, RobPtrBits bits))
-  val robConsumePtr = RegInit(U(0, RobPtrBits bits))
-  val robCount      = RegInit(U(0, log2Up(GCCopyEntry + 1) bits))
+  // write req status
+  // 一个 read beat 对应的有效数据，写到目标地址时可能跨越目标 beat 边界。
+  // 因此一个 slot 最多拆成两个写请求：
+  //    write0：写当前目标 aligned beat 的尾部
+  //    write1：如果跨界，写下一个 aligned beat 的头部
+  val writeActive = RegInit(False)
+  val writeSecond = RegInit(False)
+  val writeSlot = RegInit(U(0, RobPtrBits bits))
+  val needWrite1 = RegInit(False)
+  val writeAddr0 = RegInit(U(0, MMUAddrWidth bits))
+  val writeAddr1 = RegInit(U(0, MMUAddrWidth bits))
+  val writeData0 = RegInit(U(0, MMUDataWidth bits))
+  val writeData1 = RegInit(U(0, MMUDataWidth bits))
+  val writeStrb0 = RegInit(U(0, BeatBytes bits))
+  val writeStrb1 = RegInit(U(0, BeatBytes bits))
+  val writeSize0 = RegInit(U(0, LineBytesNumBitSize bits))
+  val writeSize1 = RegInit(U(0, LineBytesNumBitSize bits))
 
-  val robData      = Vec.fill(GCCopyEntry)(Reg(UInt(MMUDataWidth bits)) init(0))
-  val robRespValid = Vec.fill(GCCopyEntry)(RegInit(False))
-
-  // SourceID -> ROB slot
-  val sourceId2RobSlot =
-    Reg(Vec(Seq.fill(LLCSourceMaxNum)(U(0, RobPtrBits bits))))
-
-  // repack buffer
-  // - low bytes are always the next logical bytes to write
-  // - width 2 beats is enough for "consume one beat + append one beat"
-  val repackBuf        = RegInit(U(0, (2 * MMUDataWidth) bits))
-  val repackValidBytes = RegInit(U(0, log2Up(2 * BeatBytes + 1) bits))
-
-  val firstReadBeat = RegInit(False)
-
-  // task accept / done
+  // ToCopy 命令接收与 Done
   io.ToCopy.cmd.ready := !task_valid
 
-  val taskDoneNow = task_valid && (readReqIdx === readBeatCount) && (robCount === 0) &&
-      (repackValidBytes === 0) && (bytesAppended === totalSize) && (bytesWritten === totalSize)
+  val anySlotBusy = slotBusy.asBits.orR // ROB 中是否有任何槽位正在使用
 
+  // 乱序消费版本的完成条件： 1. 所有 read 请求已经发完 2. 所有 slot 都已经释放 3. 写侧没有 pending 的拆分写
+  // slotBusy 会覆盖：
+  //   - 已发读请求但响应还没回来
+  //   - 响应已经回来但还没写
+  //   - 正在拆成 write0/write1 写出的 slot
+  val taskDoneNow = task_valid && (readReqIdx === readBeatCount) && !anySlotBusy && !writeActive
   io.ToCopy.Done := zeroTaskDone || taskDoneNow
-
-  val counter = RegInit(U(0, 64 bits))
-  when(task_valid){
-    counter := counter + 1
-  }
 
   when(io.ToCopy.cmd.fire) {
     srcPtr := io.ToCopy.cmd.payload.SrcOopPtr
@@ -103,44 +107,48 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
     srcOff  := io.ToCopy.cmd.payload.SrcOopPtr(OffBits - 1 downto 0)
 
     readReqIdx := 0
-    bytesAppended := 0
-    bytesWritten := 0
+    readBeatCount := 0
 
-    robAllocPtr := 0
-    robConsumePtr := 0
-    robCount := 0
-
-    repackBuf := 0
-    repackValidBytes := 0
-    firstReadBeat := True
+    writeActive := False
+    writeSecond := False
+    needWrite1 := False
 
     for (i <- 0 until GCCopyEntry) {
-      robRespValid(i) := False
+      slotBusy(i)      := False
+      slotRespValid(i) := False
+      slotReqIdx(i)    := 0
+      slotData(i)      := 0
     }
 
-    when(io.ToCopy.cmd.payload.Size === 0) {
-      task_valid := False
-      zeroTaskDone := True
-      readBeatCount := 0
-    } otherwise {
-      task_valid := True
-      zeroTaskDone := False
+    task_valid := True
 
-      // readBeatCount = ceil((srcOff + size) / BeatBytes)
+    when(io.ToCopy.cmd.payload.Size === 0) {
+      zeroTaskDone := True
+    } otherwise {
+      zeroTaskDone := False
+      // 计算读多少个 beat (SrcOff + Size + BeatBytes - 1) / BeatBytes === ceil((SrcOff + Size) / BeatBytes)
       readBeatCount := ((io.ToCopy.cmd.payload.SrcOopPtr(OffBits - 1 downto 0) + io.ToCopy.cmd.payload.Size + U(BeatBytes - 1, 32 bits)) >> OffBits).resize(32)
     }
   } elsewhen zeroTaskDone {
+    task_valid := False
     zeroTaskDone := False
   } elsewhen taskDoneNow {
     task_valid := False
   }
 
-  // aligned read request generator
-  // - always sends aligned full-beat reads
-  // - request order allocates ROB slot
-  val readCanAlloc = task_valid && (readReqIdx =/= readBeatCount) && (robCount =/= U(GCCopyEntry, robCount.getWidth bits))
+  // 空闲 slot 选择
+  val freeMask = Bits(GCCopyEntry bits)
+  for (i <- 0 until GCCopyEntry) {
+    freeMask(i) := !slotBusy(i)
+  }
+  val hasFreeSlot = freeMask.orR
+  val allocOH = OHMasking.first(freeMask)
+  val allocSlot = OHToUInt(allocOH).resize(RobPtrBits)
+
+  // 读请求发送
+  val readCanAlloc = task_valid && (readReqIdx =/= readBeatCount) && hasFreeSlot // 只要： 1. 当前有任务 2. 还有 read beat 没发 3. 有空闲 slot 就继续发 aligned full-beat read。
   val readReqValid = readCanAlloc
-  val curReadAddr = (srcBase + (readReqIdx.resize(GCElementWidth) |<< OffBits)).resize(MMUAddrWidth)
+  val curReadAddr = (srcBase + (readReqIdx.resize(GCElementWidth) |<< OffBits)).resize(MMUAddrWidth) // 读请求的地址总是对齐的(按readReqIdx * BeatBytes对齐)
 
   io.readMReq.Request.valid := readReqValid
   io.readMReq.Request.payload.RequestVirtualAddr := curReadAddr
@@ -156,103 +164,116 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
 
   when(readReqFire) {
     val sid = io.readMReq.ConherentRequsetSourceID.payload.resized
-    sourceId2RobSlot(sid) := robAllocPtr
-    robRespValid(robAllocPtr) := False
 
-    robAllocPtr := WrapInc(robAllocPtr, GCCopyEntry, U(1))
+    sourceId2RobSlot(sid) := allocSlot // soruceID -> rob_index
+
+    slotBusy(allocSlot) := True
+    slotReqIdx(allocSlot) := readReqIdx
+    slotRespValid(allocSlot) := False
+
     readReqIdx := readReqIdx + 1
   }
 
-  // read response handling (out-of-order)
-  // - lookup slot by ResponseSourceID
-  // - fill ROB slot
+  // 读响应接收 用 ResponseSourceID 查 sourceId2RobSlot，填回对应 slot
   val respSid  = io.readMReq.Response.payload.ResponseSourceID.resized
-  val respSlot = sourceId2RobSlot(respSid)
+  val respSlot = sourceId2RobSlot(respSid) // 由Resp ID 查找对应的 ROB slot
 
-  io.readMReq.Response.ready := task_valid && !robRespValid(respSlot)
+  io.readMReq.Response.ready := task_valid && slotBusy(respSlot) && !slotRespValid(respSlot)
 
   when(io.readMReq.Response.fire) {
-    robData(respSlot) := io.readMReq.Response.payload.ResponseData
-    robRespValid(respSlot) := True
+    slotData(respSlot) := io.readMReq.Response.payload.ResponseData
+    slotRespValid(respSlot) := True
   }
 
-  // write side
-  // - write address always aligned
-  // - low bytes of repackBuf are the next logical bytes to send
-  val curWriteByteAddr = (dstPtr + bytesWritten.resize(GCElementWidth)).resize(GCElementWidth)
-  val curWriteAddrAligned = alignDown(curWriteByteAddr, GCElementWidth).resize(MMUAddrWidth)
-  val curDstOff = curWriteByteAddr(OffBits - 1 downto 0)
-  val remainWriteBytes = totalSize - bytesWritten
-  val spaceThisBeat = BeatBytesU32 - curDstOff.resize(32)
-  val thisBeatWriteLen32 = Mux(remainWriteBytes <= spaceThisBeat, remainWriteBytes, spaceThisBeat)
-  val thisBeatWriteLen = thisBeatWriteLen32.resize(BeatLenBits)
-  val repackLowBeat = repackBuf(MMUDataWidth - 1 downto 0)
-  val writeReqValid = task_valid && (bytesWritten =/= totalSize) && (thisBeatWriteLen32 =/= 0) &&
-      (repackValidBytes.resize(32) >= thisBeatWriteLen32)
+  // 消费 slot 选择
+  val consumeMask = Bits(GCCopyEntry bits)
+  for (i <- 0 until GCCopyEntry) {
+    consumeMask(i) := slotBusy(i) && slotRespValid(i)
+  }
+  val hasConsumeSlot = consumeMask.orR
+  val consumeOH = OHMasking.first(consumeMask)
+  val consumeSlot = OHToUInt(consumeOH).resize(RobPtrBits)
 
-  io.writeMReq.Request.valid := writeReqValid
-  io.writeMReq.Request.payload.RequestVirtualAddr := curWriteAddrAligned
+  // 将 consume slot 转换成写请求
+  //
+  // 当写侧没有 pending 任务时，选择一个已经返回的 slot。
+  // 根据 its slotReqIdx 计算：
+  //   1. 这个 read beat 对应 copy 流中的逻辑偏移
+  //   2. 这个 beat 有多少有效 byte
+  //   3. 目标地址在哪里
+  //   4. 是否需要拆成两个 masked write
+  when(task_valid && hasConsumeSlot && !writeActive){
+    val idx = slotReqIdx(consumeSlot)
+    val data = slotData(consumeSlot)
+
+    val logicalOffset = (idx.resize(32) << OffBits).resize(32) // 当前 read beat 相对 srcBase 的 byte 起点
+    val logicalStart32 = Mux(idx === 0, U(0, 32 bits), logicalOffset - srcOff.resize(32)) // 当前 beat 对应 copy 逻辑流中的起点 (dstAddr + logicalStart32)
+
+    val validStartInBeat = Mux(idx === 0, srcOff.resize(32), U(0, 32 bits)) // 当前 beat 的有效数据在 beat 内的起点
+    val maxValidBytesThisBeat32 = BeatBytesU32 - validStartInBeat // 当前 beat 理论上最多能贡献多少有效 byte
+    val remainBytes32 = totalSize - logicalStart32 // copy 任务还剩多少 byte 没覆盖
+    val validBytes32 = Mux(remainBytes32 <= maxValidBytesThisBeat32, remainBytes32, maxValidBytesThisBeat32) // 当前 beat 实际贡献多少有效 byte
+
+    // 把第一拍的无效前缀丢掉 之后 shiftedData 的低 byte 就是当前 slot 的第一个有效 byte
+    val shiftedData = data |>> (validStartInBeat << 3)
+
+    val dstByteAddr = dstPtr + logicalStart32.resize(GCElementWidth)
+    val dstAddrAligned = alignDown(dstByteAddr, GCElementWidth).resize(MMUAddrWidth) // 目标地址向下对齐到 beat
+    val dstOff = dstByteAddr(OffBits - 1 downto 0) // 目标地址在 beat 内的偏移
+    val space0 = BeatBytesU32 - dstOff.resize(32) // 当前目标 beat 还能写多少 byte
+    val len0 = Mux(validBytes32 <= space0, validBytes32, space0)// 第一个写请求写多少 byte
+    val len1 = validBytes32 - len0 // 如果跨越目标 beat 边界，第二个写请求写剩余 byte
+
+    writeSlot := consumeSlot
+    writeAddr0 := dstAddrAligned // write0：写当前 aligned beat
+    writeData0 := (shiftedData |<< (dstOff << 3)).resized
+    writeStrb0 := genMask(len0.resize(BeatLenBits), dstOff)
+    writeSize0 := len0.resize(LineBytesNumBitSize)
+
+    // write1：如果跨界，写下一个 aligned beat
+    writeAddr1 := (dstAddrAligned + U(BeatBytes, MMUAddrWidth bits)).resized
+    writeData1 := (shiftedData |>> (len0.resize(BeatLenBits) << 3)).resized
+    writeStrb1 := genMask(len1.resize(BeatLenBits), U(0, OffBits bits))
+    writeSize1 := len1.resize(LineBytesNumBitSize)
+
+    needWrite1 := len1 =/= 0
+    writeActive := True
+    writeSecond := False
+
+    // 这个 slot 已经被写侧拿走，防止下一拍重复选择 slotBusy 仍然保持 True，直到 write0/write1 全部完成。
+    slotRespValid(consumeSlot) := False
+  }
+
+  io.writeMReq.Request.valid := writeActive
+  io.writeMReq.Request.payload.RequestVirtualAddr := Mux(writeSecond, writeAddr1, writeAddr0)
   io.writeMReq.Request.payload.RequestSourceID := io.writeMReq.ConherentRequsetSourceID.payload
   io.writeMReq.Request.payload.RequestType_isWrite := True
-  io.writeMReq.Request.payload.RequestWStrb := genMask(thisBeatWriteLen, curDstOff)
-  io.writeMReq.Request.payload.RequestData := (repackLowBeat |<< (curDstOff << 3)).resized
-  io.writeMReq.Request.payload.RequestSize := thisBeatWriteLen.resize(LineBytesNumBitSize)
+  io.writeMReq.Request.payload.RequestWStrb := Mux(writeSecond, writeStrb1, writeStrb0)
+  io.writeMReq.Request.payload.RequestData := Mux(writeSecond, writeData1, writeData0)
+  io.writeMReq.Request.payload.RequestSize := Mux(writeSecond, writeSize1, writeSize0)
   io.writeMReq.Request.payload.NeedResponse := False
   io.writeMReq.Request.payload.NeedDoCmpxChg := False
 
   val writeFire = io.writeMReq.Request.fire
 
   when(writeFire) {
-    bytesWritten := bytesWritten + thisBeatWriteLen32
-  }
-
-  // consume from ROB head in-order, append into repackBuf
-  // - only append logical valid bytes
-  // - no tail garbage bytes are appended
-  val consumeBytes32 = Mux(writeFire, thisBeatWriteLen32, U(0, 32 bits))
-  val repackValidAfterConsume32 = repackValidBytes.resize(32) - consumeBytes32
-  val repackBufAfterConsume = repackBuf |>> (consumeBytes32 << 3)
-  val robHeadValid = (robCount =/= 0) && robRespValid(robConsumePtr)
-  val robHeadData = robData(robConsumePtr)
-  val firstAppendBytes32 = Mux(srcOff === 0, BeatBytesU32, BeatBytesU32 - srcOff.resize(32))
-  val rawAppendBytes32 = Mux(firstReadBeat, firstAppendBytes32, BeatBytesU32)
-  val remainToAppend32 = totalSize - bytesAppended
-  val appendBytes32 = Mux(remainToAppend32 <= rawAppendBytes32, remainToAppend32, rawAppendBytes32)
-  val appendData = Mux(firstReadBeat, robHeadData |>> (srcOff << 3), robHeadData)
-  val robPopFire = task_valid && robHeadValid && (appendBytes32 =/= 0) &&
-      ((repackValidAfterConsume32 + appendBytes32) <= U(2 * BeatBytes, 32 bits))
-
-  when(robPopFire) {
-    repackBuf := repackBufAfterConsume |
-        (appendData.resize(2 * MMUDataWidth bits) |<< (repackValidAfterConsume32 << 3))
-
-    repackValidBytes := (repackValidAfterConsume32 + appendBytes32).resize(repackValidBytes.getWidth)
-    bytesAppended := bytesAppended + appendBytes32
-    robRespValid(robConsumePtr) := False
-    robConsumePtr := WrapInc(robConsumePtr, GCCopyEntry, U(1))
-
-    when(firstReadBeat) {
-      firstReadBeat := False
-    }
-  } elsewhen writeFire {
-    repackBuf := repackBufAfterConsume
-    repackValidBytes := repackValidAfterConsume32.resize(repackValidBytes.getWidth)
-  }
-
-  // robCount bookkeeping
-  // - request alloc increments
-  // - in-order consume decrements
-  switch(Cat(readReqFire, robPopFire)) {
-    is(B"10") {
-      robCount := robCount + 1
-    }
-    is(B"01") {
-      robCount := robCount - 1
+    when(!writeSecond && needWrite1) {
+      writeSecond := True
+    } otherwise {
+      // 当前 slot 的所有写请求都完成，释放 slot
+      writeActive := False
+      writeSecond := False
+      needWrite1 := False
+      slotBusy(writeSlot) := False
     }
   }
 
-  // write response is ignored
   io.writeMReq.Response.ready := True
+
+  val counter = RegInit(U(0, 64 bits))
+  when(task_valid){
+    counter := counter + 1
+  }
 }
 
 object GCCopy2Verilog extends App {

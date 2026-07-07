@@ -16,16 +16,13 @@ class GCNewGCAlloc extends Module with GCTopParameters with HWParameters {
     val ConfigIO          = slave(new GCNewGCAllocConfigIO)
   }
 
-  // Default outputs
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
-
   io.Mreq.Response.ready := True
 
-  io.ToNewGCAlloc.clearOut()
-  io.ToAllocFreeRegion.clearIn()
+  io.ToNewGCAlloc.clearIn()
+  io.ToAllocFreeRegion.clearOut()
 
-  // Constants
   private def ptrConst(v: Int): UInt = U(v, GCElementWidth bits)
   private def zeroPtr: UInt          = U(0, GCElementWidth bits)
 

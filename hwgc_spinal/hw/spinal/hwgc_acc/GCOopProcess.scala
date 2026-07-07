@@ -51,8 +51,8 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   clearMreq(io.Mreq0)
   clearMreq(io.Mreq1)
 
-  io.Process2CopySurvivor.clearIn()
-  io.Process2Aop.clearIn()
+  io.Process2CopySurvivor.clearOut()
+  io.Process2Aop.clearOut()
 
   def slotMreq(i: Int): LocalMMUIO =
     if (i == 0) io.Mreq0 else io.Mreq1

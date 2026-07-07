@@ -8,7 +8,6 @@ import spinal.lib.fsm._
 
 import scala.language.postfixOps
 
-// Data bundle for a single fetch task
 case class GcFetchData() extends Bundle with GCTopParameters with GCParameters {
   val task      = UInt(GCElementWidth bits)
   val oopType   = UInt(GCOopTypeWidth bits)
@@ -26,22 +25,6 @@ case class GcFetchData() extends Bundle with GCTopParameters with GCParameters {
 //   MainMreq — used by mainFsm
 //   PushMreq — used by pushFsm
 //   PreMreq  — used by preFsm
-//
-// No MMU arbitration inside GCFetch.
-//
-// Notes for the new GCTaskStack:
-//
-//   1. TaskStack Pop / PrePop may come from recentPushBuf or sync RAM.
-//      GCFetch only sees Stream semantics, so it does not need to care about
-//      the internal source.
-//
-//   2. TaskStack exposes PushCount to request push-follow PrePop.
-//      During push-follow, GCFetch should keep Pop.ready low and let preFsm
-//      consume PrePop first.
-//
-//   3. Push-follow may request up to PreFetchBufferNum entries.
-//      Therefore preBuf uses explicit buf_count and allows full capacity,
-//      instead of sacrificing one entry.
 // ============================================================================
 class GCFetch extends Module with HWParameters with GCTopParameters with GCParameters {
   val io = new Bundle {
@@ -50,19 +33,15 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     val PreMreq            = master(new LocalMMUIO)
 
     val toFetch            = slave(new GCToFetch)
-    val gcWriteSrcOopPtr   = slave(new GCWriteSrcOopPtr)
-    val Trace2Fetch        = slave Stream UInt(GCElementWidth bits)
-    val CopyDone           = in Bool()
+    val gcWriteSrcOopPtr   = slave(new GCWriteSrcOopPtr) // srcOopPtr updated MarkWord forward Path
+    val Trace2Fetch        = slave Stream UInt(GCElementWidth bits) // LastPush forward Path
+    val CopyDone           = in Bool() // 在CopyDone之后Push的才可以读，以确保读到的是新数据
 
     val Fetch2ArrayProcess = master(new GCToProcessUnit)
     val Fetch2OopProcess   = master(new GCToProcessUnit)
     val ConfigIO           = slave(new GCFetchConfigIO)
     val DebugTimeStamp     = in UInt(64 bits)
   }
-
-  // ============================================================================
-  // MMU helper functions
-  // ============================================================================
 
   def clearMreq(m: LocalMMUIO): Unit = {
     m.Request.valid  := False
@@ -91,12 +70,8 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
   io.toFetch.PrePop.ready := False
   io.Trace2Fetch.ready    := False
 
-  io.Fetch2ArrayProcess.clearIn()
-  io.Fetch2OopProcess.clearIn()
-
-  // ============================================================================
-  // Decode / fill helpers
-  // ============================================================================
+  io.Fetch2ArrayProcess.clearOut()
+  io.Fetch2OopProcess.clearOut()
 
   def receiveTask(payload: UInt, data: GcFetchData): Unit = {
     when(payload(GCOopTagWidth - 1 downto 0) === U(PartialArrayTag, GCOopTagWidth bits)) {
@@ -108,12 +83,11 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     }
   }
 
-  def decodeReadOopResp(rd: UInt): UInt =
-    Mux(
-      io.ConfigIO.UseCompressedOop,
-      (io.ConfigIO.CompressedOopBase + (rd(31 downto 0) << io.ConfigIO.CompressedOopShift)).resize(GCElementWidth),
-      rd(GCElementWidth - 1 downto 0)
-    )
+  def decodeReadOopResp(rd: UInt): UInt = Mux(
+    io.ConfigIO.UseCompressedOop,
+    (io.ConfigIO.CompressedOopBase + (rd(31 downto 0).resize(GCElementWidth) << io.ConfigIO.CompressedOopShift)).resize(GCElementWidth),
+    rd(GCElementWidth - 1 downto 0)
+  )
 
   def fillMwKlassLen(rd: UInt, data: GcFetchData): Unit = {
     data.markWord := rd(GCElementWidth - 1 downto 0)
@@ -142,32 +116,10 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
   val oopReadSize = U(8, LineBytesNumBitSize bits)
   val mwReadSize  = Mux(io.ConfigIO.UseCompressedKlassPointers, U(16), U(20)).resize(LineBytesNumBitSize)
 
-  // ============================================================================
-  // Data registers
-  // ============================================================================
-
   val main_data = RegInit(GcFetchData().getZero)
   val push_data = RegInit(GcFetchData().getZero)
 
-  // ============================================================================
   // PreFetch ring buffer
-  //
-  // Changed for the new TaskStack:
-  //
-  //   Old style:
-  //     buf_free = PreFetchBufferNum - 1 - buf_count
-  //
-  //   New style:
-  //     buf_free = PreFetchBufferNum - buf_count
-  //
-  // Reason:
-  //   GCFetch already has explicit buf_count, so it can distinguish full/empty
-  //   even when buf_top == buf_bottom.
-  //
-  //   New GCTaskStack may send up to PreFetchBufferNum push-follow PrePop
-  //   entries, so Fetch should be able to store all PreFetchBufferNum entries.
-  // ============================================================================
-
   val preBuf      = Vec.fill(PreFetchBufferNum)(RegInit(GcFetchData().getZero))
   val preBufDone  = Vec.fill(PreFetchBufferNum)(RegInit(False))
   val preBufMwHit = Vec.fill(PreFetchBufferNum)(RegInit(False))
@@ -181,43 +133,28 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
 
   val buf_work = RegInit(U(0, PreFetchBufferWidth bits))
 
-  // pushFollowRem mirrors the remaining push-follow PrePop count inside Fetch.
-  // TaskStack owns the actual PrePop generation; Fetch uses this register to
-  // place those PrePop results before normal prefetch entries in preBuf.
+  // pushFollowRem 反映 Fetch 内部剩余的 push-follow PrePop 计数
+  // Fetch 使用此寄存器将这些 PrePop 结果放置在 preBuf 中普通预取条目之前
   val pushFollowRem = RegInit(U(0, 32 bits))
 
-  def bufInc(ptr: UInt, step: UInt): UInt =
-    WrapInc(ptr, PreFetchBufferNum, step).resize(PreFetchBufferWidth)
-
-  def bufDec(ptr: UInt, step: UInt): UInt =
-    WrapDec(ptr, PreFetchBufferNum, step).resize(PreFetchBufferWidth)
+  def bufInc(ptr: UInt, step: UInt): UInt = WrapInc(ptr, PreFetchBufferNum, step).resize(PreFetchBufferWidth)
+  def bufDec(ptr: UInt, step: UInt): UInt = WrapDec(ptr, PreFetchBufferNum, step).resize(PreFetchBufferWidth)
 
   def resetSlot(idx: UInt): Unit = {
     preBufDone(idx)  := False
     preBufMwHit(idx) := False
   }
 
-  // ============================================================================
-  // State visibility wires
-  // ============================================================================
-
   val mainIsIdle     = Bool()
   val mainIsWaitDone = Bool()
 
   val pushIsIdle     = Bool()
 
-  // Cross-FSM command pulses
-  val mainGotoIdle    = Bool()
   val mainGotoReadOop = Bool()
   val mainGotoSend    = Bool()
 
-  mainGotoIdle    := False
   mainGotoReadOop := False
   mainGotoSend    := False
-
-  // ============================================================================
-  // Cross-pipeline signals
-  // ============================================================================
 
   val targetDone = Mux(
     main_data.oopType === U(NotArrayOop),
@@ -235,17 +172,10 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     copyDoneSeen := True
   }
 
-  // mainFsm has popped a task whose PreFetch entry exists but is not done yet.
-  // In this case mainFsm waits for preFsm to finish that exact buf_bottom slot.
+  // mainFsm 弹出了一个任务，该任务的 PreFetch 条目存在但尚未完成 在这种情况下，mainFsm 会等待 preFsm 完成该 buf_bottom 槽位
   val waitForPrefetch = RegInit(False)
 
-  // ============================================================================
   // MarkWord forwarding
-  //
-  // If OopProcess writes back srcOopPtr while prefetch has already fetched or is
-  // fetching the same object, forward the new MarkWord into preBuf.
-  // ============================================================================
-
   val fwdValid = RegInit(False)
   val fwdObj   = RegInit(U(0, preBuf(0).fromObj.getWidth bits))
   val fwdValue = RegInit(U(0, GCElementWidth bits))
@@ -263,23 +193,7 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     }
   }
 
-  // ============================================================================
   // Main StateMachine
-  //
-  // mainFsm handles normal Pop tasks from TaskStack.
-  //
-  // Important changes for the new TaskStack:
-  //
-  //   1. Pop.ready is disabled while TaskStack reports PushCount != 0.
-  //      During push-follow, PrePop should run before normal Pop.
-  //
-  //   2. preBuf hit requires buf_count != 0.
-  //      This avoids stale preBuf entries being matched after the buffer is empty.
-  //
-  //   3. waitForPrefetch completion now consumes the preBuf slot.
-  //      The old code loaded main_data but forgot to update buf_bottom/buf_count.
-  // ============================================================================
-
   val mainFsm = new StateMachine {
     val IDLE          = new State with EntryPoint
     val READ_OOP_REQ  = new State
@@ -290,34 +204,15 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     val WAIT_DONE     = new State
 
     IDLE.whenIsActive {
-      // 注意：
-      // Pop.ready 不能组合依赖 io.toFetch.PushCount。
-      //
-      // 原因：
-      //   io.toFetch.PushCount 在 TaskStack 中由 pushCountForFetch 产生，
-      //   而 pushCountForFetch 组合依赖 io.toFetch.Pop.fire，
-      //   Pop.fire 又依赖 Fetch 输出的 Pop.ready。
-      //
-      // 如果这里用 PushCount 控制 Pop.ready，会形成：
-      //
-      //   Pop.ready -> Pop.fire -> PushCount -> Pop.ready
-      //
-      // 的组合逻辑环。
-      //
-      // TaskStack 内部已经会用 push_count / pushPrePopRem 阻止
-      // push-follow 阶段启动 Pop，所以 Fetch 侧不需要再用 PushCount 禁 Pop。
-      val fetchPushFollowActive = pushFollowRem =/= U(0, 32 bits)
+      val fetchPushFollowActive = pushFollowRem =/= U(0, 32 bits) // pushFollowRem != 0 表示 preFsm 正在处理 push-follow PrePop 条目 prohibit the pop
 
-      io.toFetch.Pop.ready :=
-        pushIsIdle &&
-          !io.Trace2Fetch.valid &&
-          !waitForPrefetch &&
-          !fetchPushFollowActive
+      // Push状态机空闲且不存在新的Push,Main任务也不在等待PrePop做完，且没有未处理完的PrePop
+      io.toFetch.Pop.ready := pushIsIdle && !io.Trace2Fetch.valid && !waitForPrefetch && !fetchPushFollowActive
 
       when(io.toFetch.Pop.fire) {
         val popBase = io.toFetch.Pop.payload - io.toFetch.Pop.payload(GCOopTagWidth - 1 downto 0)
         val bottomValid = buf_count =/= U(0, buf_count.getWidth bits)
-        val bottomHit   = bottomValid && preBuf(buf_bottom).task === popBase
+        val bottomHit   = bottomValid && preBuf(buf_bottom).task === popBase // prePop hit
 
         when(bottomHit && preBufDone(buf_bottom)) {
           main_data := preBuf(buf_bottom)
@@ -340,8 +235,6 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
         }
 
       }.elsewhen(waitForPrefetch && buf_count =/= U(0, buf_count.getWidth bits) && preBufDone(buf_bottom)) {
-        // Handles the case where Pop.fire saw the preBuf entry before preFsm's
-        // completion was visible. Now the entry is done, so consume it.
         waitForPrefetch := False
         main_data       := preBuf(buf_bottom)
 
@@ -427,9 +320,7 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     }
 
     always {
-      when(mainGotoIdle) {
-        goto(IDLE)
-      }.elsewhen(mainGotoSend) {
+      when(mainGotoSend) {
         goto(SEND)
       }.elsewhen(mainGotoReadOop) {
         goto(READ_OOP_REQ)
@@ -437,15 +328,9 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     }
   }
 
-  // ============================================================================
   // Push StateMachine
-  //
-  // pushFsm handles Trace2Fetch tasks.
-  //
   // If mainFsm is idle, Trace2Fetch task can directly enter main_data.
   // Otherwise it is processed in push_data and later handed to mainFsm.
-  // ============================================================================
-
   val pushFsm = new StateMachine {
     val IDLE          = new State with EntryPoint
     val READ_OOP_REQ  = new State
@@ -454,8 +339,7 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     val READ_MW_RESP  = new State
     val SEND          = new State
 
-    def pushYieldOk: Bool =
-      main_data.oopType === U(PartialArrayOop) || io.CopyDone || copyDoneSeen
+    def pushYieldOk: Bool = main_data.oopType === U(PartialArrayOop) || io.CopyDone || copyDoneSeen
 
     IDLE.whenIsActive {
       io.Trace2Fetch.ready := True
@@ -482,7 +366,7 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
         goto(READ_MW_REQ)
 
       }.otherwise {
-        when(pushYieldOk) {
+        when(pushYieldOk) { // Push状态机在等待CopyDone时不发起OOP读取请求 and main_data is PartialArrayOop 不需要复制
           driveReadReq(io.PushMreq, push_data.task, oopReadSize)
 
           when(io.PushMreq.Request.fire) {
@@ -548,24 +432,11 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
 
   // ============================================================================
   // PreFetch StateMachine
-  //
-  // preFsm consumes TaskStack.PrePop and fills preBuf.
-  //
-  // Normal mode:
-  //   PushCount == 0 and pushFollowRem == 0
-  //   New PrePop entries are appended at buf_top.
-  //
-  // Push-follow mode:
-  //   PushCount != 0 or pushFollowRem != 0
-  //   New pushed tasks should be consumed before old prefetched tasks.
-  //   Therefore the first entry of a push-follow group is inserted before
-  //   current buf_bottom, and buf_bottom is moved backward.
-  //
-  // If there is not enough free space:
-  //   Drop older tail entries by moving buf_top backward.
-  //   This is acceptable because they are only speculative prefetched entries.
+  // Normal mode: PushCount == 0 且 pushFollowRem == 0 新的 PrePop 表项追加到 buf_top 位置。
+  // Push-follow mode: PushCount != 0 或 pushFollowRem != 0 新压入的任务应当优先于旧的预取任务被处理。
+  //                   因此，一个 push-follow 组中的第一个表项会插入到 当前 buf_bottom 之前，同时 buf_bottom 向后移动。
+  // 如果剩余空间不足, 通过将 buf_top 向后移动，丢弃较旧的尾部表项
   // ============================================================================
-
   val preFsm = new StateMachine {
     val IDLE          = new State with EntryPoint
     val READ_OOP_REQ  = new State
@@ -579,9 +450,7 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
 
       when(!stackPushFollowActive && !fetchPushFollowActive) {
         // Normal PrePop mode: append at buf_top.
-        io.toFetch.PrePop.ready :=
-          !waitForPrefetch &&
-            buf_free =/= U(0, buf_free.getWidth bits)
+        io.toFetch.PrePop.ready := !waitForPrefetch && buf_free =/= U(0, buf_free.getWidth bits)
 
         when(io.toFetch.PrePop.fire) {
           buf_work := buf_top
@@ -596,8 +465,6 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
 
       }.otherwise {
         // Push-follow mode:
-        // Ready can stay high even when preBuf is full, because we can discard
-        // older speculative entries to make room for newly pushed tasks.
         io.toFetch.PrePop.ready := !waitForPrefetch
 
         when(io.toFetch.PrePop.fire) {
@@ -616,9 +483,6 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
 
           }.otherwise {
             // Start a new push-follow group.
-            //
-            // TaskStack may request up to PreFetchBufferNum entries.
-            // Fetch mirrors that limit.
             val pushCount = Mux(
               io.toFetch.PushCount > U(PreFetchBufferNum, 32 bits),
               U(PreFetchBufferNum, 32 bits),
@@ -629,15 +493,10 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
             val idx = bufDec(buf_bottom, pushCountSmall)
 
             when(buf_free >= pushCountSmall) {
-              // Enough free slots for the whole push-follow group.
-              // This cycle inserts the first entry.
               buf_count := buf_count + U(1, buf_count.getWidth bits)
 
             }.otherwise {
               // Not enough room:
-              // Drop old speculative tail entries by moving buf_top backward.
-              //
-              // dropNum = pushCount - buf_free
               val dropNum = pushCountSmall - buf_free
               buf_top := bufDec(buf_top, dropNum)
 
@@ -705,9 +564,8 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
         val rd = io.PreMreq.Response.payload.ResponseData
         val currentFromObj = preBuf(buf_work).fromObj
 
-        val hitFwdNow =
-          (io.gcWriteSrcOopPtr.writeForward.valid && currentFromObj === io.gcWriteSrcOopPtr.writeForward.payload.srcOopPtr) ||
-            (fwdValid && currentFromObj === fwdObj)
+        val hitFwdNow = (fwdValid && currentFromObj === fwdObj) ||
+          (io.gcWriteSrcOopPtr.writeForward.valid && currentFromObj === io.gcWriteSrcOopPtr.writeForward.payload.srcOopPtr)
 
         val finalMw = UInt(GCElementWidth bits)
         finalMw := rd(GCElementWidth - 1 downto 0)
@@ -763,10 +621,6 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
       }
     }
   }
-
-  // ============================================================================
-  // State visibility assignments
-  // ============================================================================
 
   mainIsIdle     := mainFsm.isActive(mainFsm.IDLE)
   mainIsWaitDone := mainFsm.isActive(mainFsm.WAIT_DONE)

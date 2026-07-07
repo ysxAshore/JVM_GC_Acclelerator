@@ -11,7 +11,7 @@ trait GCParameters {
   val GCTaskStack_SpillNeed = 56
   val GCTaskStack_ReadNeed = 8
 
-  val GCCopyEntry = 64
+  val GCCopyEntry = 8
 
   /* ----------------- ScannerTask Tag ----------------- */
   val PartialArrayTag = 2
@@ -74,12 +74,12 @@ case class GCToProcessUnit() extends Bundle with IMasterSlave {
     in(Done)
   }
 
-  def clearIn(): Unit = {
+  def clearOut(): Unit = {
     cmd.valid := False
     cmd.payload.clearAll()
   }
 
-  def clearOut(): Unit = {
+  def clearIn(): Unit = {
     cmd.ready := False
     Done := False
   }
@@ -111,12 +111,12 @@ case class GCToSurvivor() extends Bundle with IMasterSlave {
     slave(done)
   }
 
-  def clearIn(): Unit = {
+  def clearOut(): Unit = {
     cmd.valid := False
     cmd.payload.clearAll()
   }
 
-  def clearOut(): Unit = {
+  def clearIn(): Unit = {
     cmd.ready := False
     done.valid := False
     done.payload.clearAll()
@@ -135,7 +135,7 @@ case class GCWriteSrcOopPtr() extends Bundle with IMasterSlave {
     master(writeForward)
   }
 
-  def clearIn(): Unit = {
+  def clearOut(): Unit = {
     writeForward.clearAll()
   }
 }
@@ -159,12 +159,12 @@ case class GCToAllocate() extends Bundle with IMasterSlave {
     slave(done)
   }
 
-  def clearIn(): Unit = {
+  def clearOut(): Unit = {
     cmd.valid := False
     cmd.payload.clearAll()
   }
 
-  def clearOut(): Unit = {
+  def clearIn(): Unit = {
     cmd.ready := False
     done.clearAll()
   }
@@ -191,12 +191,12 @@ case class GCToParAllocate() extends Bundle with IMasterSlave {
     slave(done)
   }
 
-  def clearIn(): Unit = {
+  def clearOut(): Unit = {
     cmd.valid := False
     cmd.payload.clearAll()
   }
 
-  def clearOut(): Unit = {
+  def clearIn(): Unit = {
     cmd.ready := False
     done.clearAll()
   }
@@ -225,12 +225,12 @@ case class GCToTrace() extends Bundle with IMasterSlave {
     in(Done)
   }
 
-  def clearIn(): Unit = {
+  def clearOut(): Unit = {
     cmd.valid := False
     cmd.payload.clearAll()
   }
 
-  def clearOut(): Unit = {
+  def clearIn(): Unit = {
     cmd.ready := False
     Done := False
   }
@@ -251,12 +251,12 @@ case class GCToCopy() extends Bundle with IMasterSlave {
     in(Done)
   }
 
-  def clearIn(): Unit = {
+  def clearOut(): Unit = {
     cmd.valid := False
     cmd.payload.clearAll()
   }
 
-  def clearOut(): Unit = {
+  def clearIn(): Unit = {
     cmd.ready := False
     Done := False
   }
@@ -276,12 +276,12 @@ case class GCToAop() extends Bundle with GCTopParameters with IMasterSlave {
     master(cmd)
   }
 
-  def clearIn(): Unit = {
+  def clearOut(): Unit = {
     cmd.valid := False
     cmd.payload.clearAll()
   }
 
-  def clearOut(): Unit = {
+  def clearIn(): Unit = {
     cmd.ready := False
     Done := False
   }
@@ -305,12 +305,12 @@ case class GCToNewGCAlloc() extends Bundle with GCTopParameters with IMasterSlav
     slave(done)
   }
 
-  def clearIn(): Unit = {
+  def clearOut(): Unit = {
     cmd.valid := False
     cmd.payload.clearAll()
   }
 
-  def clearOut(): Unit = {
+  def clearIn(): Unit = {
     cmd.ready := False
     done.clearAll()
   }
@@ -460,7 +460,6 @@ case class GCAllocFreeRegionConfigIO() extends Bundle with GCTopParameters with 
     out(G1h)
   }
 }
-
 
 class GCAccTopIO extends Bundle {
   val mmu2llc = master(new LocalMMUIO)

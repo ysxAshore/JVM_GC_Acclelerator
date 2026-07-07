@@ -14,7 +14,6 @@ class GCLocalMMU(count: Int) extends Module with HWParameters {
     localMMUIOs.foreach(_.asSlave())
   }
 
-  // defaults
   io.LastLevelCacheTLIO.Request.payload.clearAll()
   io.LastLevelCacheTLIO.Response.ready := False
 
@@ -34,7 +33,6 @@ class GCLocalMMU(count: Int) extends Module with HWParameters {
 
   val allValid = Vec(Bool(), count)
   for (i <- 0 until count) {
-    // 这里把 Request 和 RequestSize 绑在一起看
     allValid(i) := io.localMMUIOs(i).Request.valid
   }
 

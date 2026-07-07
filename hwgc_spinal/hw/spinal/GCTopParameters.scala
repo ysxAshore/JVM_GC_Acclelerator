@@ -3,6 +3,7 @@ package hwgc_top
 import spinal.core._
 import spinal.core.sim.SimConfig
 import spinal.lib._
+import spinal.lib.fsm.{State, StateMachine}
 
 import scala.language.postfixOps
 
@@ -119,6 +120,44 @@ trait HWParameters {
 
 trait GCTopParameters {
   val GCElementWidth = 64 // 和MMUAddrWidth一样
+  val GCIRQ_BITS     = 8
+  val IRQ_TLB_MISS = 0x1
+  val IRQ_DONE = 0x2
+  val IRQ_GROW = 0x4
+  val IRQ_EXPAND = 0x8
+  val IRQ_ALLOCATE = 0x10
+  val IRQ_WAKE = 0x20
+}
+
+case class GCInterruptsReq() extends Bundle with GCTopParameters {
+  val par0 = UInt(GCElementWidth bits)
+  val par1 = UInt(GCElementWidth bits)
+  val cmd = UInt(GCIRQ_BITS bits)
+}
+
+case class GCInterruptsResp() extends Bundle with GCTopParameters {
+  val res0 = UInt(GCElementWidth bits)
+  val res1 = UInt(GCElementWidth bits)
+}
+
+case class GCInterruptsIO() extends Bundle with IMasterSlave {
+  val req = Stream(GCInterruptsReq())
+  val resp = Flow(GCInterruptsResp())
+
+  override def asMaster(): Unit = {
+    master(req)
+    slave(resp)
+  }
+
+  def clearOut(): Unit = {
+    req.valid := False
+    req.payload.clearAll()
+  }
+
+  def clearIn(): Unit = {
+    req.ready := False
+    resp.clearAll()
+  }
 }
 
 class GCAllocCacheUpdate extends Bundle with GCTopParameters with HWParameters {
@@ -150,6 +189,28 @@ class LocalMMUIO extends Bundle with HWParameters with IMasterSlave {
     master(Request)
     slave(Response, ConherentRequsetSourceID)
   }
+}
+
+class MyStateMachine extends StateMachine with HWParameters {
+  val issued = RegInit(False)
+
+  def issueDirectRead(mreq: LocalMMUIO, addr: UInt, sizeBytes: UInt, nextState: State)(onRead: UInt => Unit): Unit = {
+    issueReq(mreq, addr, False, sizeBytes.resize(LineBytesNumBitSize), U(0), True, False, issued) { rd =>
+      onRead(rd)
+      goto(nextState)
+    }
+  }
+
+  def issueDirectWriteWithoutResp(mreq: LocalMMUIO, addr: UInt, sizeBytes: UInt, data: UInt, nextState: State)(onAccepted: => Unit = {}): Unit = {
+    issueReq(mreq, addr, True, sizeBytes.resize(LineBytesNumBitSize), data.resize(MMUDataWidth), False, False, issued) { _ =>}
+
+    when(issued) {
+      issued := False
+      onAccepted
+      goto(nextState)
+    }
+  }
+
 }
 
 case class Ctrl2TopPayload() extends Bundle with GCTopParameters {

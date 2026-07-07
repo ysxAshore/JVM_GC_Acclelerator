@@ -1,6 +1,6 @@
 package hwgc_acc
 
-import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO}
+import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO, MyStateMachine}
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
@@ -14,15 +14,12 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
     val ToAllocFreeRegion = slave(new GCToNewGCAlloc)
   }
 
-  // Default outputs
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
-
   io.Mreq.Response.ready := True
 
-  io.ToAllocFreeRegion.clearOut()
+  io.ToAllocFreeRegion.clearIn()
 
-  // Constants
   private def ptrConst(v: Int): UInt = U(v, GCElementWidth bits)
   private def zeroPtr: UInt          = U(0, GCElementWidth bits)
 
@@ -43,9 +40,6 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
   private val SZ_24 = U(24)
   private val SZ_32 = U(32)
 
-  // Registers
-  val issued = RegInit(False)
-
   val fromHead       = RegInit(False)
   val freeListPtr    = RegInit(zeroPtr)
 
@@ -57,15 +51,13 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
   val newAllocRegion = RegInit(zeroPtr)
   val neighborPtr    = RegInit(zeroPtr)
 
-  // Common helpers
   private def listBaseAddr: UInt = freeListPtr + OFF_LIST_BASE
   private def listBaseAligned: Bool = listBaseAddr(4 downto 0) === 0
   private def selectedRegion: UInt = Mux(fromHead, listHeadPtr, listTailPtr)
   private def selectedLinkOffset: UInt = Mux(fromHead, OFF_REGION_NEXT, OFF_REGION_PREV)
   private def neighborBackLinkOffset: UInt = Mux(fromHead, OFF_REGION_PREV, OFF_REGION_NEXT)
 
-  // FSM
-  val fsm = new StateMachine {
+  val fsm = new MyStateMachine {
     val IDLE                  = new State with EntryPoint
     val READ_LIST_META_0      = new State
     val READ_LIST_META_1      = new State
@@ -80,22 +72,6 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
       io.ToAllocFreeRegion.done.payload.NewAllocRegion := res
       issued := False
       goto(IDLE)
-    }
-
-    def readReqGo(addr: UInt, size: UInt, next: State)(body: UInt => Unit): Unit = {
-      issueReq(io.Mreq, addr, False, size, U(0), True, False, issued) { rd =>
-        body(rd)
-        goto(next)
-      }
-    }
-
-    def writeReqIssuedGo(addr: UInt, size: UInt, data: UInt, next: State): Unit = {
-      issueReq(io.Mreq, addr, True, size, data, False, False, issued) { _ => }
-
-      when(issued) {
-        issued := False
-        goto(next)
-      }
     }
 
     // IDLE
@@ -118,7 +94,7 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
     READ_LIST_META_0.whenIsActive {
       val readSize = Mux(listBaseAligned, SZ_32, U(4))
 
-      readReqGo(listBaseAddr, readSize, READ_LIST_META_1) { rd =>
+      issueDirectRead(io.Mreq, listBaseAddr, readSize, READ_LIST_META_1) { rd =>
         listLength := rd(31 downto 0)
 
         when(listBaseAligned) {
@@ -153,11 +129,9 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
       val candidate = selectedRegion
       val addr = candidate + selectedLinkOffset
 
-      issueReq(io.Mreq, addr, False, SZ_8, U(0), True, False, issued) { rd =>
+      issueDirectRead(io.Mreq, addr, SZ_8, UPDATE_LIST_HEAD_TAIL) { rd =>
         newAllocRegion := candidate
         neighborPtr := rd(GCElementWidth - 1 downto 0)
-
-        goto(UPDATE_LIST_HEAD_TAIL)
       }
     }
 
@@ -168,46 +142,38 @@ class GCAllocFreeRegion extends Module with GCTopParameters with HWParameters {
       when(noNeighbor && isLast) {
         val addr = freeListPtr + OFF_LIST_PATCH_0
         val data = Cat(zeroPtr, zeroPtr, zeroPtr).asUInt
+        issueDirectWriteWithoutResp(io.Mreq, addr, SZ_24, data, CLEAR_REMOVED_LINK)()
 
-        // list becomes empty: clear head / tail / last
-        writeReqIssuedGo(addr, SZ_24, data, CLEAR_REMOVED_LINK)
       } elsewhen noNeighbor {
         val addr = freeListPtr + OFF_LIST_PATCH_0
         val data = Cat(zeroPtr, zeroPtr).asUInt
-
-        writeReqIssuedGo(addr, SZ_16, data, CLEAR_REMOVED_LINK)
+        issueDirectWriteWithoutResp(io.Mreq, addr, SZ_16, data, CLEAR_REMOVED_LINK)()
 
       } elsewhen isLast {
         val addr = freeListPtr + Mux(fromHead, OFF_LIST_PATCH_0, OFF_LIST_PATCH_1)
         val size = Mux(fromHead, SZ_24, SZ_16)
         val data = Mux(fromHead, Cat(zeroPtr, listTailPtr, neighborPtr), Cat(zeroPtr, zeroPtr, neighborPtr)).asUInt
-
-        writeReqIssuedGo(addr, size, data, CLEAR_NEIGHBOR_LINK)
+        issueDirectWriteWithoutResp(io.Mreq, addr, size, data, CLEAR_NEIGHBOR_LINK)()
 
       } otherwise {
         val addr = freeListPtr + Mux(fromHead, OFF_LIST_PATCH_0, OFF_LIST_PATCH_1)
-
-        writeReqIssuedGo(addr, SZ_8, neighborPtr, CLEAR_NEIGHBOR_LINK)
+        issueDirectWriteWithoutResp(io.Mreq, addr, SZ_8, neighborPtr, CLEAR_NEIGHBOR_LINK)()
       }
     }
 
     CLEAR_NEIGHBOR_LINK.whenIsActive {
       val addr = neighborPtr + neighborBackLinkOffset
-
-      writeReqIssuedGo(addr, SZ_8, zeroPtr, CLEAR_REMOVED_LINK)
+      issueDirectWriteWithoutResp(io.Mreq, addr, SZ_8, zeroPtr, CLEAR_REMOVED_LINK)()
     }
 
     CLEAR_REMOVED_LINK.whenIsActive {
       val addr = newAllocRegion + selectedLinkOffset
-
-      listLength := listLength - 1
-
-      writeReqIssuedGo(addr, SZ_8, zeroPtr, WRITE_LIST_LENGTH)
+      listLength := listLength - U(1)
+      issueDirectWriteWithoutResp(io.Mreq, addr, SZ_8, zeroPtr, WRITE_LIST_LENGTH)()
     }
 
     WRITE_LIST_LENGTH.whenIsActive {
       val addr = freeListPtr + OFF_LIST_BASE
-
       issueReq(io.Mreq, addr, True, SZ_8, listLength, False, False, issued) { _ => }
 
       when(issued) {

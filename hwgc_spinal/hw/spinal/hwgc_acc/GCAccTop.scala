@@ -240,6 +240,7 @@ class GCAccTop extends Module with GCTopParameters {
   gcAop.io.ConfigIO.ParScanThreadStatePtr := ParScanThreadStatePtr
   gcAop.io.DebugTimeStamp := DebugTimeStamp
   gcAop.io.NoAopSrc := (gcTaskStack.io.ConfigIO.Done || taskStackDone) && gcOopProcess.io.SlotIsEmpty
+  gcAop.io.Irq.clearIn()
 
   // gcCopy
   gcCopy.io.readMReq <> gcLocalMMU.io.localMMUIOs(17)

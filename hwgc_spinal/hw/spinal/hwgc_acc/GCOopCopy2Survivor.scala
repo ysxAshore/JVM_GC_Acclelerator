@@ -86,10 +86,10 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   clearMreq(io.Mreq0)
   clearMreq(io.Mreq1)
 
-  io.ToCopy.clearIn()
-  io.ToFetch.clearIn()
-  io.ToTrace.clearIn()
-  io.ToAllocate.clearIn()
+  io.ToCopy.clearOut()
+  io.ToFetch.clearOut()
+  io.ToTrace.clearOut()
+  io.ToAllocate.clearOut()
   io.ToCopySurvivor.done.clearAll()
 
   def slotMreq(i: Int): LocalMMUIO = if (i == 0) io.Mreq0 else io.Mreq1

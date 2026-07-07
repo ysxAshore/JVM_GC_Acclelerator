@@ -25,8 +25,8 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
   io.Mreq.Request.payload.clearAll()
   io.Mreq.Response.ready := True
 
-  io.ToAop.clearIn()
-  io.ToTrace.clearOut()
+  io.ToAop.clearOut()
+  io.ToTrace.clearIn()
 
   io.ToStack.Push.valid := False
   io.ToStack.Push.payload.clearAll()

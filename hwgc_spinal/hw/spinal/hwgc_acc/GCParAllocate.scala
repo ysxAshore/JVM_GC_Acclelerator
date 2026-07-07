@@ -36,8 +36,8 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
   clearMreq(io.MreqPar)
   clearMreq(io.MreqAttempt)
 
-  io.ToNewGCAlloc.clearIn()
-  io.ToParAllocate.clearOut()
+  io.ToNewGCAlloc.clearOut()
+  io.ToParAllocate.clearIn()
 
   val issuedMainIml = RegInit(False)
   val issuedPar = RegInit(False)

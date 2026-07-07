@@ -1,7 +1,6 @@
 package hwgc_acc
 
-import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO}
-
+import hwgc_top.{Config, GCInterruptsIO, GCTopParameters, HWParameters, LocalMMUIO, MyStateMachine}
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
@@ -12,13 +11,14 @@ class GCAop extends Module with GCTopParameters with HWParameters {
   val io = new Bundle {
     val Aop            = slave(new GCToAop)
     val Mreq           = master(new LocalMMUIO)
+    val Irq            = master(new GCInterruptsIO)
     val ConfigIO       = slave(new GCAopConfigIO)
     val NoAopSrc       = in(Bool())
     val DebugTimeStamp = in(UInt(64 bits))
   }
 
-  // Defaults
-  io.Aop.clearOut()
+  io.Aop.clearIn()
+  io.Irq.clearOut()
 
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
@@ -32,19 +32,13 @@ class GCAop extends Module with GCTopParameters with HWParameters {
 
   def pssAddr(offset: UInt): UInt = (io.ConfigIO.ParScanThreadStatePtr + offset).resize(MMUAddrWidth)
 
-  // MMU Request state
-  val issued = RegInit(False)
-
-  // Task context
   val dest       = RegInit(U(0, GCElementWidth bits))
   val res        = RegInit(U(0, GCElementWidth bits))
   val card_index = RegInit(U(0, GCElementWidth bits))
 
-  // Buffer-node allocation context
   val old_node = RegInit(U(0, GCElementWidth bits))
   val new_top  = RegInit(U(0, GCElementWidth bits))
 
-  // Local caches
   val byte_about_valid    = RegInit(False)
   val byte_map_cache      = RegInit(U(0, GCElementWidth bits))
   val byte_map_base_cache = RegInit(U(0, GCElementWidth bits))
@@ -67,7 +61,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
   val writeBufferData = RegInit(U(0, MMUDataWidth bits)) // 先得到高位数据 再得到低位数据
 
   // NoAopSrc handling
-  // NoAopSrc 和 Aop.Ready 可能不同拍有效。 所以这里锁存 NoAopSrc。
+  // NoAopSrc 和 Aop.Ready 可能不同拍有效。 所以制作上升沿锁存 NoAopSrc。
   // 等 FSM 回到 IDLE，并且 io.Aop.Valid 也没有挂起时，再执行 writeback。
   val noAopSrcLast    = RegNext(io.NoAopSrc) init False
   val noAopSrcRise    = io.NoAopSrc && !noAopSrcLast
@@ -77,7 +71,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
   clearNoAopSrcPending := False
 
   // Main FSM
-  val fsm = new StateMachine {
+  val fsm = new MyStateMachine {
     val IDLE = new State with EntryPoint
 
     val READ_BYTE_MAP    = new State
@@ -90,18 +84,26 @@ class GCAop extends Module with GCTopParameters with HWParameters {
 
     val ALLOC_READ_FREE_LIST = new State
     val ALLOC_READ_NEW_TOP   = new State
+    val ALLOC_WRITE_NEW_TOP  = new State
     val ALLOC_WRITE_FREE_TOP = new State
-    val ALLOC_CLEAR_NEXT     = new State
+
     val ALLOC_SLOW_RETRY     = new State
+    val ALLOC_IRQ_WAKE       = new State
+
     val READ_NODE_CAPACITY   = new State
 
     val ENQUEUE_RES = new State
+    val WRITE_BUFFER_CACHE = new State
 
     val WB_FLUSH_BUFFER_WRITE = new State
     val WB_WRITE_INDEX_BUFFER = new State
     val WB_WRITE_OFFSET30_38  = new State
     val WB_WRITE_LAST_INDEX   = new State
     val WB_CLEAR_CACHE        = new State
+
+    val writeSizeReg = RegInit(U(0, 32 bits))
+    val writeAddrReg = RegInit(U(0, MMUAddrWidth bits))
+    val writeValueReg = RegInit(U(0, MMUDataWidth bits))
 
     IDLE.whenIsActive {
       val noAopSeen = noAopSrcPending || noAopSrcRise
@@ -134,13 +136,12 @@ class GCAop extends Module with GCTopParameters with HWParameters {
     READ_BYTE_MAP.whenIsActive {
       val addr = (io.ConfigIO.CardTablePtr + U"x38").resize(MMUAddrWidth)
 
-      issueReq(io.Mreq, addr, False, U(16), U(0), True, False, issued) { rd =>
+      issueDirectRead(io.Mreq, addr, U(16), CALC_CARD) { rd =>
         byte_about_valid    := True
         byte_map_cache      := rd(GCElementWidth - 1 downto 0)
         byte_map_base_cache := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
 
         dbg(Seq("read byte map cache"))
-        goto(CALC_CARD)
       }
     }
 
@@ -152,12 +153,11 @@ class GCAop extends Module with GCTopParameters with HWParameters {
       when(!last_index_valid) {
         val addr = pssAddr(U"x1b0")
 
-        issueReq(io.Mreq, addr, False, U(8), U(0), True, False, issued) { rd =>
+        issueDirectRead(io.Mreq, addr, U(8), CHECK_LAST_INDEX) { rd =>
           last_index_valid := True
           last_index_cache := rd(GCElementWidth - 1 downto 0)
 
           dbg(Seq("read last_index_cache"))
-          goto(CHECK_LAST_INDEX)
         }
       } otherwise {
         goto(CHECK_LAST_INDEX)
@@ -173,7 +173,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
         when(!parScanOff40_valid) {
           val addr = pssAddr(U"x48")
 
-          issueReq(io.Mreq, addr, False, U(24), U(0), True, False, issued) { rd =>
+          issueDirectRead(io.Mreq, addr, U(24), CHECK_INDEX) { rd =>
             index_cache := rd(GCElementWidth - 1 downto 0)
             temp_cache := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
             buffer_cache := rd(GCElementWidth * 3  - 1 downto GCElementWidth * 2)
@@ -181,7 +181,6 @@ class GCAop extends Module with GCTopParameters with HWParameters {
             parScanOff40_valid := True
 
             dbg(Seq("read parScan offset40/index/buffer cache"))
-            goto(CHECK_INDEX)
           }
         } otherwise {
           goto(CHECK_INDEX)
@@ -227,19 +226,15 @@ class GCAop extends Module with GCTopParameters with HWParameters {
       val addr       = old_node.resize(MMUAddrWidth)
       val writeValue = Cat(offset30_cache, U(0, GCElementWidth bits)).asUInt.resize(MMUDataWidth)
 
-      issueReq(io.Mreq, addr, True, U(16), writeValue, False, False, issued) { _ => }
-
-      when(issued) {
-        issued := False
+      issueDirectWriteWithoutResp(io.Mreq, addr, U(16), writeValue, ALLOC_READ_FREE_LIST) {
         offset30_cache := old_node
-
         dbg(Seq("write old buffer node link"))
-        goto(ALLOC_READ_FREE_LIST)
       }
     }
 
     ALLOC_READ_FREE_LIST.whenIsActive {
       new_top := U(0)
+
       val addr = (node_allocator_ptr_cache + U"x80").resize(MMUAddrWidth)
       issueReq(io.Mreq, addr, False, U(8), U(0), True, False, issued) { rd =>
         old_node := rd(GCElementWidth - 1 downto 0)
@@ -257,12 +252,15 @@ class GCAop extends Module with GCTopParameters with HWParameters {
     ALLOC_READ_NEW_TOP.whenIsActive {
       val addr = (old_node + U(8)).resize(MMUAddrWidth)
 
-      issueReq(io.Mreq, addr, False, U(8), U(0), True, False, issued) { rd =>
+      issueDirectRead(io.Mreq, addr, U(8), ALLOC_WRITE_FREE_TOP) { rd =>
         new_top := rd(GCElementWidth - 1 downto 0)
-
         dbg(Seq("buffer_node_allocate: read new_top"))
-        goto(ALLOC_WRITE_FREE_TOP)
       }
+    }
+
+    ALLOC_WRITE_NEW_TOP.whenIsActive {
+      val addr = (old_node + U(8)).resize(MMUAddrWidth)
+      issueDirectWriteWithoutResp(io.Mreq, addr, U(8), U(0), ALLOC_WRITE_FREE_TOP) ()
     }
 
     ALLOC_WRITE_FREE_TOP.whenIsActive {
@@ -278,40 +276,37 @@ class GCAop extends Module with GCTopParameters with HWParameters {
         when(old_node === U(0)) {
           goto(ALLOC_SLOW_RETRY)
         }.otherwise{
-          goto(ALLOC_CLEAR_NEXT)
+          buffer_cache := old_node + U"x10"
+          goto(READ_NODE_CAPACITY)
         }
       }
     }
 
-    ALLOC_CLEAR_NEXT.whenIsActive {
-      val addr = (old_node + U(8)).resize(MMUAddrWidth)
+    ALLOC_SLOW_RETRY.whenIsActive {
+      // @notice: interrupt to call BufferNode::allocate to return old_node
+      io.Irq.req.valid := True
+      io.Irq.req.par0  := node_allocator_ptr_cache
+      io.Irq.req.cmd   := IRQ_ALLOCATE
 
-      // *(uintptr_t *)(node + 0x8) = 0
-      issueReq(io.Mreq, addr, True, U(8), U(0), False, False, issued) { _ => }
+      when(io.Irq.req.fire){
+        goto(ALLOC_IRQ_WAKE)
+      }
+    }
 
-      when(issued) {
-        issued := False
-
-        buffer_cache := old_node + U"x10"
-
-        dbg(Seq("buffer_node_allocate: clear node next"))
+    ALLOC_IRQ_WAKE.whenIsActive {
+      // @notice: interrupt to wake BufferNode::allocate to return old_node
+      when(io.Irq.resp.valid){
+        buffer_cache := io.Irq.resp.payload.res0 + U"x10"
         goto(READ_NODE_CAPACITY)
       }
     }
 
-    ALLOC_SLOW_RETRY.whenIsActive {
-      // @todo interrupt to call BufferNode::allocate to return old_node
-      goto(ALLOC_READ_FREE_LIST)
-    }
-
     READ_NODE_CAPACITY.whenIsActive {
       val addr = node_allocator_ptr_cache.resize(MMUAddrWidth)
-
-      issueReq(io.Mreq, addr, False, U(8), U(0), True, False, issued) { rd =>
-        index_cache := (rd(GCElementWidth - 1 downto 0) << 3).resize(GCElementWidth)
+      issueDirectRead(io.Mreq, addr, U(8), ENQUEUE_RES) { rd =>
+        res := (rd(GCElementWidth - 1 downto 0) << 3).resize(GCElementWidth bits)
 
         dbg(Seq("read node capacity"))
-        goto(ENQUEUE_RES)
       }
     }
 
@@ -329,21 +324,12 @@ class GCAop extends Module with GCTopParameters with HWParameters {
       val nextWriteValue = ((writeBufferData << 64).resize(MMUDataWidth) | res.resize(MMUDataWidth)).resize(MMUDataWidth)
       val writeSize      = nextWrcnt * U(8)
 
+      writeAddrReg  := addr
+      writeSizeReg  := writeSize.resized
+      writeValueReg := nextWriteValue
+
       when(shouldFlush) {
-        issueReq(io.Mreq, addr, True, writeSize, nextWriteValue, False, False, issued) { _ => }
-
-        when(issued) {
-          issued := False
-          index_cache     := index_cache - U(8)
-          wrcnt           := U(0)
-          wraddr          := U(0)
-          writeBufferData := U(0)
-
-          dbg(Seq("enqueue res and flush aligned write"))
-          io.Aop.Done := True
-          goto(IDLE)
-        }
-
+        goto(WRITE_BUFFER_CACHE)
       } otherwise {
         index_cache     := index_cache - U(8)
         wrcnt           := nextWrcnt
@@ -356,38 +342,36 @@ class GCAop extends Module with GCTopParameters with HWParameters {
       }
     }
 
+    WRITE_BUFFER_CACHE.whenIsActive {
+      issueDirectWriteWithoutResp(io.Mreq, writeAddrReg, writeSizeReg, writeValueReg, IDLE) {
+        index_cache     := index_cache - U(8)
+        wrcnt           := U(0)
+        wraddr          := U(0)
+        writeBufferData := U(0)
+
+        dbg(Seq("enqueue res and flush aligned write"))
+        io.Aop.Done := True
+      }
+    }
+
     WB_FLUSH_BUFFER_WRITE.whenIsActive {
       when(wrcnt =/= U(0)) {
         val addr       = wraddr.resize(MMUAddrWidth)
         val writeSize  = wrcnt * U(8)
         val writeValue = writeBufferData
 
-        issueReq(io.Mreq, addr, True, writeSize, writeValue, False, False, issued) { _ => }
-
-        when(issued) {
-          issued := False
-
-          wrcnt           := U(0)
-          wraddr          := U(0)
-          writeBufferData := U(0)
-
-          dbg(Seq("NoAopSrc: flush pending buffer write"))
-          goto(WB_WRITE_INDEX_BUFFER)
-        }
+        issueDirectWriteWithoutResp(io.Mreq, addr, writeSize, writeValue, WB_WRITE_INDEX_BUFFER) ()
       } otherwise {
         goto(WB_WRITE_INDEX_BUFFER)
       }
     }
 
     WB_WRITE_INDEX_BUFFER.whenIsActive {
-      val addr       = pssAddr(U"x48")
-      val writeValue = Cat(buffer_cache, temp_cache, index_cache).asUInt
-
-      issueReq(io.Mreq, addr, True, U(24), writeValue, False, False, issued) { _ => }
-
-      when(issued) {
-        issued := False
-        dbg(Seq("NoAopSrc: write index_cache"))
+      when(parScanOff40_valid) {
+        val addr = pssAddr(U"x48")
+        val writeValue = Cat(buffer_cache, temp_cache, index_cache).asUInt
+        issueDirectWriteWithoutResp(io.Mreq, addr, U(24), writeValue, WB_WRITE_OFFSET30_38)()
+      }.otherwise{
         goto(WB_WRITE_OFFSET30_38)
       }
     }
@@ -396,15 +380,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
       when(parScanOff20_valid) {
         val addr       = pssAddr(U"x30")
         val writeValue = Cat(offset38_cache, offset30_cache).asUInt.resize(MMUDataWidth)
-
-        issueReq(io.Mreq, addr, True, U(16), writeValue, False, False, issued) { _ => }
-
-        when(issued) {
-          issued := False
-
-          dbg(Seq("NoAopSrc: write offset30_cache and offset38_cache"))
-          goto(WB_WRITE_LAST_INDEX)
-        }
+        issueDirectWriteWithoutResp(io.Mreq, addr, U(16), writeValue, WB_WRITE_LAST_INDEX) ()
       } otherwise {
         goto(WB_WRITE_LAST_INDEX)
       }
@@ -414,15 +390,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
       when(last_index_valid) {
         val addr       = pssAddr(U"x1b0")
         val writeValue = last_index_cache.resize(MMUDataWidth)
-
-        issueReq(io.Mreq, addr, True, U(8), writeValue, False, False, issued) { _ => }
-
-        when(issued) {
-          issued := False
-
-          dbg(Seq("NoAopSrc: write last_index_cache"))
-          goto(WB_CLEAR_CACHE)
-        }
+        issueDirectWriteWithoutResp(io.Mreq, addr, U(8), writeValue, WB_CLEAR_CACHE) ()
       } otherwise {
         goto(WB_CLEAR_CACHE)
       }
@@ -440,20 +408,16 @@ class GCAop extends Module with GCTopParameters with HWParameters {
 
       clearNoAopSrcPending := True
 
-      issued := False
-
       dbg(Seq("NoAopSrc: writeback done, clear cache valid"))
       goto(IDLE)
     }
   }
 
-  // NoAopSrc latch update
-  // clear 和 rise 同拍时，rise 优先，避免丢事件。
-  when(clearNoAopSrcPending && !noAopSrcRise) {
-    noAopSrcPending := False
-  }
-  when(noAopSrcRise) {
+  // NoAopSrc latch update: clear 和 rise 同拍时，rise 优先，避免丢事件
+  when(noAopSrcRise){
     noAopSrcPending := True
+  }.elsewhen(clearNoAopSrcPending) {
+    noAopSrcPending := False
   }
 }
 
