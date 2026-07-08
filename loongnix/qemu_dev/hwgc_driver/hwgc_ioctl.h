@@ -167,7 +167,8 @@ struct pinned_page
 
 struct hwgc
 {
-    struct pci_dev *pdev;
+    //   struct pci_dev *pdev;
+    struct device *dev;
     void __iomem *bar0;
     int irq;
 

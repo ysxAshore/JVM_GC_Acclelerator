@@ -111,6 +111,10 @@ class GCAccTop extends Module with GCTopParameters {
     CompressedFlag                    := io.config.cmd.payload.CompressedFlag
   }
 
+  when(gcOopCopy2Survivor.io.UpdateAgeThreshold.valid){
+    AgeThreshold := gcOopCopy2Survivor.io.UpdateAgeThreshold.payload.resized
+  }
+
   when(gcTaskStack.io.ConfigIO.config.fire){
     taskStackStart := False
   }
@@ -167,7 +171,6 @@ class GCAccTop extends Module with GCTopParameters {
   gcOopCopy2Survivor.io.Mreq1 <> gcUnalignedMMUAdapter(8).io.in
   gcOopCopy2Survivor.io.ToCopy <> gcCopy.io.ToCopy
   gcOopCopy2Survivor.io.ToAllocate <> gcAllocate.io.ToAllocate
-  gcOopCopy2Survivor.io.TaskDone := io.config.Done
   gcOopCopy2Survivor.io.ConfigIO.ChunkSize := ChunkSize
   gcOopCopy2Survivor.io.ConfigIO.AgeThreshold := AgeThreshold
   gcOopCopy2Survivor.io.ConfigIO.YoungWordsBase := YoungWordsBase
@@ -210,6 +213,7 @@ class GCAccTop extends Module with GCTopParameters {
   // gcNewAlloc
   gcNewGCAlloc.io.Mreq <> gcUnalignedMMUAdapter(13).io.in
   gcNewGCAlloc.io.ToAllocFreeRegion <> gcAllocFreeRegion.io.ToAllocFreeRegion
+  gcNewGCAlloc.io.Irq.clearIn()
   gcNewGCAlloc.io.ConfigIO.G1h := G1h
   gcNewGCAlloc.io.ConfigIO.DummyRegion := DummyRegion
 
@@ -281,7 +285,7 @@ class GCAccTop extends Module with GCTopParameters {
 
   // gcAop source arbiter
   val aopInputs = Seq(
-    gcOopProcess.io.Process2Aop.cmd,      // source 0
+    gcOopProcess.io.Process2Aop.cmd,        // source 0
     gcTrace.io.ToAop.cmd,                   // source 1
   )
   val aopArb = StreamArbiterFactory().roundRobin.buildOn(aopInputs)

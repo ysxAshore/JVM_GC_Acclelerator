@@ -285,8 +285,8 @@ class GCAop extends Module with GCTopParameters with HWParameters {
     ALLOC_SLOW_RETRY.whenIsActive {
       // @notice: interrupt to call BufferNode::allocate to return old_node
       io.Irq.req.valid := True
-      io.Irq.req.par0  := node_allocator_ptr_cache
-      io.Irq.req.cmd   := IRQ_ALLOCATE
+      io.Irq.req.payload.par0  := node_allocator_ptr_cache
+      io.Irq.req.payload.cmd   := IRQ_ALLOCATE
 
       when(io.Irq.req.fire){
         goto(ALLOC_IRQ_WAKE)
