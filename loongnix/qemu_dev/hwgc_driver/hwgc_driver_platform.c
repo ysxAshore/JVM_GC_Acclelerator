@@ -207,16 +207,24 @@ static DEFINE_IDA(hwgc_ida);
 
 static unsigned long mmio_base[HWGC_MAX_DEVS];
 static int num_devs;
+
 static unsigned int mmio_size = 0x1000;
-static int irq = -1;
+
+static int gsi[HWGC_MAX_DEVS];
+static int num_gsis;
+
+static int linux_irq[HWGC_MAX_DEVS];
+
+static struct platform_device *hwgc_pdevs[HWGC_MAX_DEVS];
 
 module_param_array(mmio_base, ulong, &num_devs, 0444);
-module_param(mmio_size, uint, 0444);
-module_param(irq, int, 0444);
-
 MODULE_PARM_DESC(mmio_base, "HWGC MMIO base array");
+
+module_param(mmio_size, uint, 0444);
 MODULE_PARM_DESC(mmio_size, "HWGC MMIO size");
-MODULE_PARM_DESC(irq, "Shared HWGC IRQ number");
+
+module_param_array(gsi, int, &num_gsis, 0444);
+MODULE_PARM_DESC(gsi, "HWGC ACPI GSI array");
 
 static struct platform_device *hwgc_pdevs[HWGC_MAX_DEVS];
 
@@ -894,16 +902,15 @@ static int hwgc_platform_probe(struct platform_device *pdev)
         goto err_free;
     }
 
-    d->irq = acpi_register_gsi(NULL,
-                               irq,
-                               ACPI_LEVEL_SENSITIVE,
-                               ACPI_ACTIVE_HIGH);
-    if (d->irq < 0)
+    res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
+    if (!res)
     {
-        ret = d->irq;
-        dev_err(&pdev->dev, "no IRQ resource: %d\n", ret);
+        dev_err(&pdev->dev, "no IRQ resource\n");
+        ret = -ENODEV;
         goto err_free;
     }
+
+    d->irq = (int)res->start;
 
     spin_lock_init(&d->irq_lock);
     spin_lock_init(&d->event_lock);
@@ -924,7 +931,7 @@ static int hwgc_platform_probe(struct platform_device *pdev)
     ret = request_threaded_irq(d->irq,
                                hwgc_irq_top,
                                hwgc_irq_thread,
-                               IRQF_ONESHOT | IRQF_SHARED,
+                               IRQF_ONESHOT,
                                dev_name(&pdev->dev),
                                d);
     if (ret)
@@ -1040,10 +1047,17 @@ static int __init hwgc_module_init(void)
         return -EINVAL;
     }
 
-    if (irq < 0)
+    if (num_gsis != num_devs)
     {
-        pr_err("hwgc: irq is required\n");
+        pr_err("hwgc: num_gsis=%d must match num_devs=%d\n",
+               num_gsis, num_devs);
         return -EINVAL;
+    }
+
+    for (i = 0; i < HWGC_MAX_DEVS; i++)
+    {
+        linux_irq[i] = -1;
+        hwgc_pdevs[i] = NULL;
     }
 
     ret = platform_driver_register(&hwgc_platform_driver);
@@ -1055,6 +1069,21 @@ static int __init hwgc_module_init(void)
 
     for (i = 0; i < num_devs; i++)
     {
+        linux_irq[i] = acpi_register_gsi(NULL,
+                                         gsi[i],
+                                         ACPI_LEVEL_SENSITIVE,
+                                         ACPI_ACTIVE_HIGH);
+        if (linux_irq[i] < 0)
+        {
+            ret = linux_irq[i];
+            pr_err("hwgc: acpi_register_gsi failed: gsi=%d ret=%d\n",
+                   gsi[i], ret);
+            goto err_unregister_devices;
+        }
+
+        pr_info("hwgc: dev%d mmio=0x%lx gsi=%d linux_irq=%d\n",
+                i, mmio_base[i], gsi[i], linux_irq[i]);
+
         memset(res, 0, sizeof(res));
 
         res[0].start = mmio_base[i];
@@ -1062,13 +1091,13 @@ static int __init hwgc_module_init(void)
         res[0].flags = IORESOURCE_MEM;
         res[0].name = "hwgc-mmio";
 
-        res[1].start = irq;
-        res[1].end = irq;
+        res[1].start = linux_irq[i];
+        res[1].end = linux_irq[i];
         res[1].flags = IORESOURCE_IRQ;
         res[1].name = "hwgc-irq";
 
         pr_info("hwgc: register pdev%d mmio=0x%lx size=0x%x irq=%d\n",
-                i, mmio_base[i], mmio_size, irq);
+                i, mmio_base[i], mmio_size, gsi[i]);
 
         hwgc_pdevs[i] = platform_device_register_simple(DRV_NAME,
                                                         i,
@@ -1092,6 +1121,12 @@ err_unregister_devices:
             platform_device_unregister(hwgc_pdevs[i]);
             hwgc_pdevs[i] = NULL;
         }
+
+        if (gsi[i] >= 0)
+        {
+            acpi_unregister_gsi(gsi[i]);
+            linux_irq[i] = -1;
+        }
     }
 
     platform_driver_unregister(&hwgc_platform_driver);
@@ -1108,6 +1143,12 @@ static void __exit hwgc_module_exit(void)
         {
             platform_device_unregister(hwgc_pdevs[i]);
             hwgc_pdevs[i] = NULL;
+        }
+
+        if (gsi[i] >= 0)
+        {
+            acpi_unregister_gsi(gsi[i]);
+            linux_irq[i] = -1;
         }
     }
 
