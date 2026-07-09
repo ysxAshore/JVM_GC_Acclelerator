@@ -203,19 +203,22 @@ struct hwgc
 
 static DEFINE_IDA(hwgc_ida);
 
-static unsigned long mmio_base;
+#define HWGC_MAX_DEVS 2
+
+static unsigned long mmio_base[HWGC_MAX_DEVS];
+static int num_devs;
 static unsigned int mmio_size = 0x1000;
 static int irq = -1;
 
-module_param(mmio_base, ulong, 0444);
+module_param_array(mmio_base, ulong, &num_devs, 0444);
 module_param(mmio_size, uint, 0444);
 module_param(irq, int, 0444);
 
-MODULE_PARM_DESC(mmio_base, "HWGC platform MMIO physical base");
-MODULE_PARM_DESC(mmio_size, "HWGC platform MMIO size");
-MODULE_PARM_DESC(irq, "HWGC platform IRQ number");
+MODULE_PARM_DESC(mmio_base, "HWGC MMIO base array");
+MODULE_PARM_DESC(mmio_size, "HWGC MMIO size");
+MODULE_PARM_DESC(irq, "Shared HWGC IRQ number");
 
-static struct platform_device *hwgc_platform_pdev;
+static struct platform_device *hwgc_pdevs[HWGC_MAX_DEVS];
 
 static inline u32 reg_read32(struct hwgc *d, u32 off)
 {
@@ -873,8 +876,6 @@ static int hwgc_platform_probe(struct platform_device *pdev)
         return -ENOMEM;
 
     d->dev = &pdev->dev;
-    d->dev_id = -1;
-
     platform_set_drvdata(pdev, d);
 
     res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -923,8 +924,8 @@ static int hwgc_platform_probe(struct platform_device *pdev)
     ret = request_threaded_irq(d->irq,
                                hwgc_irq_top,
                                hwgc_irq_thread,
-                               IRQF_ONESHOT,
-                               DRV_NAME,
+                               IRQF_ONESHOT | IRQF_SHARED,
+                               dev_name(&pdev->dev),
                                d);
     if (ret)
     {
@@ -954,11 +955,6 @@ static int hwgc_platform_probe(struct platform_device *pdev)
              "hwgc platform driver loaded: /dev/%s resource=%pR irq=%d\n",
              d->miscdev.name, res, d->irq);
 
-    /*
-     * 可选验证：触发一次 MMIO read。
-     * 如果 QEMU hwgc_platform 的 mmio_read 里加了 printf，
-     * 加载驱动时宿主机 QEMU 终端应该能看到 read。
-     */
     dev_info(&pdev->dev, "initial irq_status=0x%x\n",
              reg_read32(d, REG_IRQ_STATUS));
 
@@ -1035,17 +1031,12 @@ static struct platform_driver hwgc_platform_driver = {
 static int __init hwgc_module_init(void)
 {
     struct resource res[2];
+    int i;
     int ret;
 
-    if (!mmio_base)
+    if (num_devs <= 0 || num_devs > HWGC_MAX_DEVS)
     {
-        pr_err("hwgc: mmio_base is required\n");
-        return -EINVAL;
-    }
-
-    if (!mmio_size)
-    {
-        pr_err("hwgc: mmio_size is invalid\n");
+        pr_err("hwgc: invalid num_devs=%d\n", num_devs);
         return -EINVAL;
     }
 
@@ -1055,21 +1046,6 @@ static int __init hwgc_module_init(void)
         return -EINVAL;
     }
 
-    memset(res, 0, sizeof(res));
-
-    res[0].start = mmio_base;
-    res[0].end = mmio_base + mmio_size - 1;
-    res[0].flags = IORESOURCE_MEM;
-    res[0].name = "hwgc-mmio";
-
-    res[1].start = irq;
-    res[1].end = irq;
-    res[1].flags = IORESOURCE_IRQ;
-    res[1].name = "hwgc-irq";
-
-    pr_info("hwgc: registering platform device mmio=0x%lx size=0x%x irq=%d\n",
-            mmio_base, mmio_size, irq);
-
     ret = platform_driver_register(&hwgc_platform_driver);
     if (ret)
     {
@@ -1077,29 +1053,65 @@ static int __init hwgc_module_init(void)
         return ret;
     }
 
-    hwgc_platform_pdev = platform_device_register_simple(DRV_NAME,
-                                                         PLATFORM_DEVID_NONE,
-                                                         res,
-                                                         ARRAY_SIZE(res));
-    if (IS_ERR(hwgc_platform_pdev))
+    for (i = 0; i < num_devs; i++)
     {
-        ret = PTR_ERR(hwgc_platform_pdev);
-        hwgc_platform_pdev = NULL;
-        pr_err("hwgc: platform_device_register_simple failed: %d\n", ret);
-        platform_driver_unregister(&hwgc_platform_driver);
-        return ret;
+        memset(res, 0, sizeof(res));
+
+        res[0].start = mmio_base[i];
+        res[0].end = mmio_base[i] + mmio_size - 1;
+        res[0].flags = IORESOURCE_MEM;
+        res[0].name = "hwgc-mmio";
+
+        res[1].start = irq;
+        res[1].end = irq;
+        res[1].flags = IORESOURCE_IRQ;
+        res[1].name = "hwgc-irq";
+
+        pr_info("hwgc: register pdev%d mmio=0x%lx size=0x%x irq=%d\n",
+                i, mmio_base[i], mmio_size, irq);
+
+        hwgc_pdevs[i] = platform_device_register_simple(DRV_NAME,
+                                                        i,
+                                                        res,
+                                                        ARRAY_SIZE(res));
+        if (IS_ERR(hwgc_pdevs[i]))
+        {
+            ret = PTR_ERR(hwgc_pdevs[i]);
+            hwgc_pdevs[i] = NULL;
+            goto err_unregister_devices;
+        }
     }
 
     return 0;
+
+err_unregister_devices:
+    while (--i >= 0)
+    {
+        if (hwgc_pdevs[i])
+        {
+            platform_device_unregister(hwgc_pdevs[i]);
+            hwgc_pdevs[i] = NULL;
+        }
+    }
+
+    platform_driver_unregister(&hwgc_platform_driver);
+    return ret;
 }
 
 static void __exit hwgc_module_exit(void)
 {
-    if (hwgc_platform_pdev)
-        platform_device_unregister(hwgc_platform_pdev);
+    int i;
+
+    for (i = 0; i < HWGC_MAX_DEVS; i++)
+    {
+        if (hwgc_pdevs[i])
+        {
+            platform_device_unregister(hwgc_pdevs[i]);
+            hwgc_pdevs[i] = NULL;
+        }
+    }
 
     platform_driver_unregister(&hwgc_platform_driver);
-
     ida_destroy(&hwgc_ida);
 
     pr_info("hwgc: module unloaded\n");
