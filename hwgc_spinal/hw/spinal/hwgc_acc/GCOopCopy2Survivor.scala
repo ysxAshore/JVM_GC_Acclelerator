@@ -626,7 +626,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
 
       READ_PLAB_TOPEND.whenIsActive {
         val idx = slotCtx(i).runtime.plabTargetIdx
-        val addr = (plabCacheBuffer(idx) + U"x30").resize(MMUAddrWidth)
+        val addr = (slotCtx(i).runtime.plabBuffer + U"x30").resize(MMUAddrWidth)
 
         issueDirectRead(m, addr, U(16),  PLAB_SELECT) { rd =>
           plabTopEndFillValid(i) := True
@@ -724,6 +724,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
       }
 
       DECIDE_FORWARD_PTR.whenIsActive {
+        // @notice: atomic-cas
         val newMw = forwardingMarkOf(slotCtx(i).runtime.destOopPtr)
         casForwardPtr(slotCtx(i).configs.srcOopPtr, slotCtx(i).configs.markWord, newMw, SEND_WORK, READ_BOTTOM_HARD_END)
       }

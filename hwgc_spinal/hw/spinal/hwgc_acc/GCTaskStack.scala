@@ -7,26 +7,6 @@ import spinal.lib.fsm._
 
 import scala.language.postfixOps
 
-/* GCTaskStack
- *
- * readSync + TopCache version
- *
- * 设计目标：
- *   1. stack_data 使用同步读，利于 BRAM / SRAM 推断和时序收敛。
- *   2. Pop / PrePop 不直接等待 readSync，而是从栈顶寄存器缓存 TopCache 中返回。
- *   3. readSync 在后台 refill TopCache，把同步读 1 拍延迟隐藏起来。
- *
- * 关键修复：
- *   旧版本带 refillHold，TopCache 满后如果发生 Push，旧 refill response
- *   可能被 hold 住，之后错误 append，导致像 BF10 被 BCE8 替换这种错序。
- *
- *   现在取消 refillHold：
- *     - refill response 当拍能 append 就 append
- *     - 不能 append 就直接丢弃
- *     - Push 发生时清掉 in-flight refill response
- *
- *   这样 Push 改变 TopCache offset 后，不会再插入旧 offset 下读回来的错误数据。
- */
 class GCTaskStack extends Module with GCTopParameters with GCParameters with HWParameters {
   val io = new Bundle {
     val toFetch        = master(new GCToFetch)
@@ -36,7 +16,6 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
     val DebugTimeStamp = in UInt(64 bits)
   }
 
-  // Default outputs
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
   io.Mreq.Response.ready := True
@@ -44,9 +23,8 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   io.ConfigIO.Done := False
   io.ConfigIO.config.ready := False
 
-  // Stack / Queue pointers
-  val stackPtrWidth = log2Up(GCTaskStack_Entry)
   val queuePtrWidth = 32
+  val stackPtrWidth = log2Up(GCTaskStack_Entry)
 
   val stack_top    = RegInit(U(0, stackPtrWidth bits))
   val stack_bottom = RegInit(U(0, stackPtrWidth bits))
@@ -60,7 +38,6 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   // 全局 prefetched 标记 表示某个物理 stack entry 是否已经被 PrePop 过
   val prefetched = Vec.fill(GCTaskStack_Entry)(RegInit(False))
 
-  // Helper functions
   def stkInc(ptr: UInt, step: UInt): UInt = WrapInc(ptr, GCTaskStack_Entry, step)
   def stkDec(ptr: UInt, step: UInt): UInt = WrapDec(ptr, GCTaskStack_Entry, step)
   def queInc(ptr: UInt, step: UInt): UInt = WrapInc(ptr, GCTaskQueue_Size, step).resize(queuePtrWidth)
@@ -82,7 +59,7 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   //    topCacheData(0) = 当前 stack_top 对应的数据
   //    topCacheData(1) = stack_top - 1
   //    topCacheData(2) = stack_top - 2
-  // topCacheIdx 用于记录每个 cache entry 对应的物理 stack index。
+  // topCacheIdx 用于记录每个 cache entry 对应的 hardware_stack index。
   val TopCacheDepth = PreFetchScanWindow << 1
 
   val topCacheCountWidth  = log2Up(TopCacheDepth + 1)
@@ -124,7 +101,6 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   val pushFire = io.toStack.Push.fire
   val popFire  = io.toFetch.Pop.fire
 
-  // PushCount 给 GCFetch 使用 Fetch 的 Pop.ready 不能组合依赖 PushCount，否则会形成组合环。
   val pushCountForFetch = Mux(popFire && push_count =/= U(0, 32 bits), push_count - U(1, 32 bits), push_count)
   io.toFetch.PushCount := pushCountForFetch
 
@@ -136,6 +112,7 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
 
   for (i <- 1 until PreFetchScanWindow + 1) {
     val off = U(i, topCacheOffsetWidth bits)
+    // topCache entry 有效 且 没有被 PrePop过(topCache and hardware_stack)
     normalCandidates(i - 1) := cacheOffsetValid(off) && !topCachePrefetched(off) && !prefetched(topCacheIdx(off))
     normalCandidateOffs(i - 1) := off
   }

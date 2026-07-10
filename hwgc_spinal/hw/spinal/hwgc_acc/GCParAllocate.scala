@@ -1,6 +1,6 @@
 package hwgc_acc
 
-import hwgc_top.{Config, GCAllocCacheUpdate, GCTopParameters, HWParameters, LocalMMUIO}
+import hwgc_top.{Config, GCAllocCacheUpdate, GCInterruptsIO, GCTopParameters, HWParameters, LocalMMUIO, MyStateMachine}
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
@@ -15,11 +15,13 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
 
     val ToParAllocate = slave(new GCToParAllocate)
     val ToNewGCAlloc = master(new GCToNewGCAlloc)
-    val ConfigIO = slave(new GCDoAllocateConfigIO)
 
     val CacheUpdateOut = master(Stream(new GCAllocCacheUpdate))
     val CacheUpdateIn = slave(Flow(new GCAllocCacheUpdate))
 
+    val Irq = master(new GCInterruptsIO)
+
+    val ConfigIO = slave(new GCDoAllocateConfigIO)
     val DebugTimeStamp = in UInt(64 bits)
   }
 
@@ -38,10 +40,7 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
 
   io.ToNewGCAlloc.clearOut()
   io.ToParAllocate.clearIn()
-
-  val issuedMainIml = RegInit(False)
-  val issuedPar = RegInit(False)
-  val issuedAttempt = RegInit(False)
+  io.Irq.clearOut()
 
   val destAttrIdx = RegInit(U(0, 1 bits))
   val regionPtr = RegInit(U(0, GCElementWidth bits))
@@ -52,11 +51,6 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
 
   val destObjPtr = RegInit(U(0, GCElementWidth bits))
   val actualWordSize = RegInit(U(0, GCElementWidth bits))
-
-  val allocRegionLockPtr = RegInit(U(0, GCElementWidth bits))
-  val freelistLockPtr = RegInit(U(0, GCElementWidth bits))
-
-  val lockValue = RegInit(U(0, 32 bits))
 
   val attemptNewRegionDone = RegInit(False)
 
@@ -108,7 +102,6 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
     updateLocalAllocRegionCache(io.CacheUpdateIn.payload.regionPtr, io.CacheUpdateIn.payload.region)
   }
 
-
   val parAllocateIml = new Area {
     val start = False
     val busy = RegInit(False)
@@ -124,11 +117,7 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
 
     done := False
 
-    def fire(
-              min_word_size: UInt,
-              desired_word_size: UInt,
-              alloc_region: UInt
-            ): Unit = {
+    def fire(min_word_size: UInt, desired_word_size: UInt, alloc_region: UInt): Unit = {
       when(!busy) {
         start := True
         alloc_region_r := alloc_region
@@ -137,7 +126,7 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       }
     }
 
-    val fsm = new StateMachine {
+    val fsm = new MyStateMachine {
       val IDLE = new State with EntryPoint
       val READ_TOP_END = new State
       val WRITE_TOP = new State
@@ -150,9 +139,10 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       READ_TOP_END.whenIsActive {
-        issueReq(io.MreqMainIml, alloc_region_r + U"x8", False, U(16), U(0), True, False, issuedMainIml) { rd =>
+        issueReq(io.MreqMainIml, alloc_region_r + U"x8", False, U(16), U(0), True, False, issued) { rd =>
           val rd_alloc_end = rd(GCElementWidth - 1 downto 0)
           val rd_alloc_top = rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+
           val available = ((rd_alloc_end - rd_alloc_top) >> 3).resize(GCElementWidth)
           val want_to_allocate = Mux(available > desired_word_size_r, desired_word_size_r, available)
 
@@ -173,17 +163,23 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       WRITE_TOP.whenIsActive {
-        val new_top = (alloc_top + (want_to_allocate_r << 3)).resize(GCElementWidth)
+        // @notice: atomic-cas
+        val addr = alloc_region_r + U"x10"
+        val desired = (alloc_top + (want_to_allocate_r << 3)).resize(GCElementWidth)
+        val expected = alloc_top
 
-        /*
-         * 这里仍然对应你原来的 TODO：atomic cmpxchg。
-         * 如果 issueReq 的写请求 rd 能返回旧值，可以用 rd 判断是否抢占成功。
-         * 如果你的 issueReq 当前不返回旧值，则这里可以先保持为直接成功。
-         */
-        issueReq(io.MreqMainIml, alloc_region_r + U"x10", True, U(8), new_top, True, True, issuedMainIml) { rd =>
-          // TODO: atomic cmpxchg old_top == alloc_top
-          // when(rd(GCElementWidth - 1 downto 0) === alloc_top) {
-          when(True) {
+        // 128bits 对齐的访问 64bits
+        // val casData = Mux(
+        //   addr(3),
+        //   Cat(desired.resize(128) << 64, expected.resize(128) << 64),
+        //   Cat(desired.resize(128), expected.resize(128))
+        // ).asUInt.resize(MMUDataWidth)
+        val casData = desired
+
+        issueReq(io.MreqMainIml, addr, True, U(8), casData, True, True, issued) { rd =>
+          // val observerd = rd(GCElementWidth - 1 downto 0)
+          // when(observed === expected) {
+          when(expected === expected) {
             destObjPtr := alloc_top
             actualWordSize := want_to_allocate_r
             busy := False
@@ -224,12 +220,7 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
 
     done := False
 
-    def fire(
-              min_word_size: UInt,
-              desired_word_size: UInt,
-              bot_updates: Bool,
-              alloc_region: UInt
-            ): Unit = {
+    def fire(min_word_size: UInt, desired_word_size: UInt, bot_updates: Bool, alloc_region: UInt): Unit = {
       when(!busy) {
         start := True
         bot_updates_r := bot_updates
@@ -245,7 +236,7 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       par_allocate_iml_done_reg := True
     }
 
-    val fsm = new StateMachine {
+    val fsm = new MyStateMachine {
       val IDLE = new State with EntryPoint
       val START_IML_AND_READ_REGION = new State
       val READ_BOT = new State
@@ -265,19 +256,17 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       START_IML_AND_READ_REGION.whenIsActive {
         parAllocateIml.fire(min_word_size_r, desired_word_size_r, alloc_region_r)
 
-        issueReq(io.MreqPar, alloc_region_r + U"x20", False, U(24), U(0), True, False, issuedPar) { rd =>
+        issueDirectRead(io.MreqPar, alloc_region_r + U"x20", U(24), READ_BOT) { rd =>
           next_offset_threshold := rd(GCElementWidth - 1 downto 0)
           index := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
           bot_ptr := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
-          goto(READ_BOT)
         }
       }
 
       READ_BOT.whenIsActive {
-        issueReq(io.MreqPar, bot_ptr, False, U(24), U(0), True, False, issuedPar) { rd =>
+        issueDirectRead(io.MreqPar, bot_ptr, U(24), WAIT_IML_DONE) { rd =>
           reserved_start := rd(GCElementWidth - 1 downto 0)
           array_ptr := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
-          goto(WAIT_IML_DONE)
         }
       }
 
@@ -300,12 +289,13 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       WRITE_FIRST_CARD_AND_PREPARE_FILL.whenIsActive {
+        val addr = array_ptr + index
         val writeValue = ((next_offset_threshold - blk_start) >> 3).resize(8)
 
-        issueReq(io.MreqPar, array_ptr, True, U(1), writeValue, False, False, issuedPar) { _ => }
+        issueReq(io.MreqPar, addr, True, U(1), writeValue, False, False, issued) { _ => }
 
-        when(issuedPar) {
-          issuedPar := False
+        when(issued) {
+          issued := False
 
           val end_index_value = ((blk_end - 8 - reserved_start) >> 9).resize(GCElementWidth)
           val rem_st = (reserved_start + ((index + 1) << 6) << 3).resize(GCElementWidth)
@@ -341,7 +331,7 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       FILL_CARDS_DATA.whenIsActive {
-        val lanes = MMUDataWidth / 8
+        val lanes = LineBytesNum
 
         val beatBytes = Mux(
           cardBytesLeft < U(lanes, GCElementWidth bits),
@@ -358,11 +348,10 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
 
         val writeValue = writeBytes.asBits.asUInt
 
-        issueReq(io.MreqPar, begin, True, beatBytes, writeValue, False, False, issuedPar) { _ => }
+        issueReq(io.MreqPar, begin, True, beatBytes, writeValue, False, False, issued) { _ => }
 
-        when(issuedPar) {
-          issuedPar := False
-
+        when(issued) {
+          issued := False
           begin := begin + beatBytes
 
           when(cardBytesLeft === beatBytes) {
@@ -382,10 +371,10 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
         val write_threshold = (reserved_start + ((end_index << 6) + 64) << 3).resize(GCElementWidth)
         val writeData = Cat(write_index, write_threshold).asUInt
 
-        issueReq(io.MreqPar, alloc_region_r + U"x20", True, U(16), writeData, False, False, issuedPar) { _ => }
+        issueReq(io.MreqPar, alloc_region_r + U"x20", True, U(16), writeData, False, False, issued) { _ => }
 
-        when(issuedPar) {
-          issuedPar := False
+        when(issued) {
+          issued := False
           busy := False
           done := True
           goto(IDLE)
@@ -395,8 +384,7 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
   }
 
   val attemptAlloc = new Area {
-    val start = Bool()
-    start := False
+    val start = False
 
     val busy = RegInit(False)
     val done = RegInit(False)
@@ -429,11 +417,7 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
 
     done := False
 
-    def fire(
-              region_ptr: UInt,
-              alloc_region: UInt,
-              desired_word_size: UInt
-            ): Unit = {
+    def fire(region_ptr: UInt, alloc_region: UInt, desired_word_size: UInt): Unit = {
       when(!busy) {
         start := True
         region_ptr_r := region_ptr
@@ -448,7 +432,7 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       par_allocate_done_reg := True
     }
 
-    val fsm = new StateMachine {
+    val fsm = new MyStateMachine {
       val IDLE = new State with EntryPoint
       val READ_REGION_TYPE = new State
       val NEW_ALLOC_REQ = new State
@@ -480,9 +464,8 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       READ_REGION_TYPE.whenIsActive {
-        issueReq(io.MreqAttempt, region_ptr_r + U"x40", False, U(1), U(0), True, False, issuedAttempt) { rd =>
+        issueDirectRead(io.MreqAttempt, region_ptr_r + U"x40", U(1), NEW_ALLOC_REQ) { rd =>
           region_ptr_type := rd(7 downto 0)
-          goto(NEW_ALLOC_REQ)
         }
       }
 
@@ -498,10 +481,9 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
 
       READ_ALLOC_REGION.whenIsActive {
         when(alloc_region_r =/= io.ConfigIO.DummyRegion) {
-          issueReq(io.MreqAttempt, alloc_region_r, False, U(24), U(0), True, False, issuedAttempt) { rd =>
+          issueDirectRead(io.MreqAttempt, alloc_region_r, U(24), READ_REGION_INFO) { rd =>
             alloc_bottom := rd(GCElementWidth - 1 downto 0)
             alloc_top := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
-            goto(READ_REGION_INFO)
           }
         }.otherwise {
           goto(WAIT_NEW_ALLOC_REGION)
@@ -509,73 +491,57 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       READ_REGION_INFO.whenIsActive {
-        issueReq(io.MreqAttempt, region_ptr_r + U"x10", False, U(24), U(0), True, False, issuedAttempt) { rd =>
+        issueReq(io.MreqAttempt, region_ptr_r + U"x10", False, U(24), U(0), True, False, issued) { rd =>
           region_ptr_off10 := rd(GCElementWidth - 1 downto 0)
           bot_updates_r := rd(GCElementWidth * 2)
           allocated_bytes := alloc_top - alloc_bottom - rd(GCElementWidth * 2 - 1 downto GCElementWidth)
 
-          when(region_ptr_type === U(1, 8 bits)) {
+          when(region_ptr_type === U(1)){
             goto(READ_OLD_SET)
-          }.otherwise {
+          }.otherwise{
             goto(READ_SURVIVOR)
           }
         }
       }
 
       READ_OLD_SET.whenIsActive {
-        val old_set = io.ConfigIO.G1h + U"xa0"
-
-        issueReq(io.MreqAttempt, old_set + U"x10", False, U(4), U(0), True, False, issuedAttempt) { rd =>
+        val addr = io.ConfigIO.G1h + U"xb0"
+        issueDirectRead(io.MreqAttempt, addr, U(4), WRITE_OLD_SET) { rd =>
           old_set_cnt_r := rd(31 downto 0)
-          goto(WRITE_OLD_SET)
         }
       }
 
       WRITE_OLD_SET.whenIsActive {
-        val old_set = io.ConfigIO.G1h + U"xa0"
-
-        issueReq(io.MreqAttempt, old_set + U"x10", True, U(4), old_set_cnt_r + 1, False, False, issuedAttempt) { _ => }
-
-        when(issuedAttempt) {
-          issuedAttempt := False
-          goto(READ_DURING_IM)
-        }
+        val addr = io.ConfigIO.G1h + U"xb0"
+        issueDirectWriteWithoutResp(io.MreqAttempt, addr, U(4), old_set_cnt_r + U(1), READ_DURING_IM)()
       }
 
       READ_SURVIVOR.whenIsActive {
-        val survivor_ptr = io.ConfigIO.G1h + U"x3f8"
-
-        issueReq(io.MreqAttempt, survivor_ptr + U"x10", False, U(8), U(0), True, False, issuedAttempt) { rd =>
+        val addr = io.ConfigIO.G1h + U"x408"
+        issueDirectRead(io.MreqAttempt, addr, U(8), WRITE_SURVIVOR) { rd =>
           survivor_bytes_r := rd(GCElementWidth - 1 downto 0)
-          goto(WRITE_SURVIVOR)
         }
       }
 
       WRITE_SURVIVOR.whenIsActive {
-        val survivor_ptr = io.ConfigIO.G1h + U"x3f8"
-
-        issueReq(io.MreqAttempt, survivor_ptr + U"x10", True, U(8), survivor_bytes_r + allocated_bytes, False, False, issuedAttempt) { _ => }
-
-        when(issuedAttempt) {
-          issuedAttempt := False
-          goto(READ_DURING_IM)
-        }
+        val addr = io.ConfigIO.G1h + U"x408"
+        issueDirectWriteWithoutResp(io.MreqAttempt, addr, U(8), survivor_bytes_r + allocated_bytes, READ_DURING_IM)()
       }
 
       READ_DURING_IM.whenIsActive {
         when(!during_im_valid) {
-          issueReq(io.MreqAttempt, io.ConfigIO.G1h + U"x3c1", False, U(1), U(0), True, False, issuedAttempt) { rd =>
+          issueReq(io.MreqAttempt, io.ConfigIO.G1h + U"x3c1", False, U(1), U(0), True, False, issued) { rd =>
             during_im_r := rd(0)
             during_im_valid := True
 
-            when(rd(0) && allocated_bytes =/= 0) {
+            when(rd(0) && allocated_bytes > 0) {
               goto(READ_CM)
             }.otherwise {
               goto(WRITE_REGION_TO_DUMMY)
             }
           }
         }.otherwise {
-          when(during_im_r && allocated_bytes =/= 0) {
+          when(during_im_r && allocated_bytes > 0) {
             goto(READ_CM)
           }.otherwise {
             goto(WRITE_REGION_TO_DUMMY)
@@ -585,10 +551,9 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
 
       READ_CM.whenIsActive {
         when(!cm_valid) {
-          issueReq(io.MreqAttempt, io.ConfigIO.G1h + U"x4e8", False, U(8), U(0), True, False, issuedAttempt) { rd =>
+          issueDirectRead(io.MreqAttempt, io.ConfigIO.G1h + U"x4e8",  U(8), READ_ROOT_START) { rd =>
             cm_r := rd(GCElementWidth - 1 downto 0)
             cm_valid := True
-            goto(READ_ROOT_START)
           }
         }.otherwise {
           goto(READ_ROOT_START)
@@ -596,58 +561,38 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       }
 
       READ_ROOT_START.whenIsActive {
-        issueReq(io.MreqAttempt, alloc_region_r + U"xe8", False, U(8), U(0), True, False, issuedAttempt) { rd =>
+        issueDirectRead(io.MreqAttempt, alloc_region_r + U"xe8", U(8), READ_ROOT_REGIONS) { rd =>
           root_start_r := rd(GCElementWidth - 1 downto 0)
-          goto(READ_ROOT_REGIONS)
         }
       }
 
       READ_ROOT_REGIONS.whenIsActive {
         val root_regions_ptr = cm_r + U"xb0"
 
-        issueReq(io.MreqAttempt, root_regions_ptr, False, U(24), U(0), True, False, issuedAttempt) { rd =>
+        issueDirectRead(io.MreqAttempt, root_regions_ptr, U(24), WRITE_ROOT_REGION) { rd =>
           root_regions_array_r := rd(GCElementWidth - 1 downto 0)
           root_regions_idx_r := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
-          goto(WRITE_ROOT_REGION)
         }
       }
 
       WRITE_ROOT_REGION.whenIsActive {
         val mem_region = (root_regions_array_r + (root_regions_idx_r << 4)).resize(MMUAddrWidth)
         val word_len = (alloc_top - root_start_r) >> 3
-
         val write_data = Cat(word_len.asBits, root_start_r.asBits).asUInt
 
-        issueReq(io.MreqAttempt, mem_region, True, U(16), write_data, False, False, issuedAttempt) { _ => }
-
-        when(issuedAttempt) {
-          issuedAttempt := False
-          goto(WRITE_ROOT_INDEX)
-        }
+        issueDirectWriteWithoutResp(io.MreqAttempt, mem_region, U(16), write_data, WRITE_ROOT_INDEX) ()
       }
 
       WRITE_ROOT_INDEX.whenIsActive {
-        val root_regions_ptr = cm_r + U"xb0"
-
-        issueReq(io.MreqAttempt, root_regions_ptr + U"x10", True, U(8), root_regions_idx_r + 1, False, False, issuedAttempt) { _ => }
-
-        when(issuedAttempt) {
-          issuedAttempt := False
-          goto(WRITE_REGION_TO_DUMMY)
-        }
+        val addr = cm_r + U"xc0"
+        issueDirectWriteWithoutResp(io.MreqAttempt, addr, U(8), root_regions_idx_r + 1, WRITE_REGION_TO_DUMMY)()
       }
 
       WRITE_REGION_TO_DUMMY.whenIsActive {
         val writeData = Cat(U(0), region_ptr_off10, io.ConfigIO.DummyRegion).asUInt
 
-        issueReq(io.MreqAttempt, region_ptr_r + U"x8", True, U(24), writeData, False, False, issuedAttempt) { _ => }
-
-        when(issuedAttempt) {
-          issuedAttempt := False
-
+        issueDirectWriteWithoutResp(io.MreqAttempt, region_ptr_r + U"x8", U(24), writeData, WAIT_NEW_ALLOC_REGION) {
           emitCacheUpdate(region_ptr_r, io.ConfigIO.DummyRegion)
-
-          goto(WAIT_NEW_ALLOC_REGION)
         }
       }
 
@@ -673,7 +618,7 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
         when(alloc_region_r === io.ConfigIO.DummyRegion) {
           goto(START_PAR_AND_CLEAR_NEW_REGION)
         }.otherwise {
-          issueReq(io.MreqAttempt, region_ptr_r + U"x10", False, U(24), U(0), True, False, issuedAttempt) { rd =>
+          issueDirectRead(io.MreqAttempt, region_ptr_r + U"x10", U(24), START_PAR_AND_CLEAR_NEW_REGION) { rd =>
             region_ptr_off10 := rd(GCElementWidth - 1 downto 0)
             bot_updates_r := rd(GCElementWidth * 3)
             goto(START_PAR_AND_CLEAR_NEW_REGION)
@@ -683,20 +628,13 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
 
       START_PAR_AND_CLEAR_NEW_REGION.whenIsActive {
         parAllocate.fire(desired_word_size_r, desired_word_size_r, bot_updates_r, new_alloc_region_r)
-
-        issueReq(io.MreqAttempt, new_alloc_region_r + U"xa8", True, U(8), U(0), False, False, issuedAttempt) { _ => }
-
-        when(issuedAttempt) {
-          issuedAttempt := False
-          goto(READ_NEW_ALLOC_REGION)
-        }
+        issueDirectWriteWithoutResp(io.MreqAttempt, new_alloc_region_r + U"xa8", U(8), U(0), READ_NEW_ALLOC_REGION)()
       }
 
       READ_NEW_ALLOC_REGION.whenIsActive {
-        issueReq(io.MreqAttempt, new_alloc_region_r, False, U(24), U(0), True, False, issuedAttempt) { rd =>
+        issueDirectRead(io.MreqAttempt, new_alloc_region_r, U(24), WRITE_REGION_TO_NEW) { rd =>
           alloc_bottom := rd(GCElementWidth - 1 downto 0)
           alloc_top := rd(GCElementWidth * 3 - 1 downto GCElementWidth * 2)
-          goto(WRITE_REGION_TO_NEW)
         }
       }
 
@@ -706,14 +644,8 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
         val writeOff8 = new_alloc_region_r
         val writeData = Cat(writeOff18, writeOff10, writeOff8).asUInt
 
-        issueReq(io.MreqAttempt, region_ptr_r + U"x8", True, U(24), writeData, False, False, issuedAttempt) { _ => }
-
-        when(issuedAttempt) {
-          issuedAttempt := False
-
+        issueDirectWriteWithoutResp(io.MreqAttempt, region_ptr_r + U"x8", U(24), writeData, WAIT_PAR_DONE){
           emitCacheUpdate(region_ptr_r, new_alloc_region_r)
-
-          goto(WAIT_PAR_DONE)
         }
       }
 
@@ -735,36 +667,72 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
 
   val selectAllocate = RegInit(False)
 
-  val mainFsm = new StateMachine {
+  val lockPtr = RegInit(U(0, GCElementWidth bits))
+  val wakeUpSel = RegInit(U(0, 2 bits))
+  val mainFsm = new MyStateMachine {
     val IDLE = new State with EntryPoint
-
-    /*
-     * 这两个状态来自原 GCParAllocate.s1/s2。
-     * 作用是先通过 cache 找 regionPtr / allocRegion。
-     */
     val LOAD_REGION_PTR = new State
     val LOAD_ALLOC_REGION = new State
-
     val FIRST_ALLOC = new State
     val WAIT_IML_DONE = new State
     val START_PAR_ALLOC = new State
     val WAIT_PAR_ALLOC = new State
-    val READ_ALLOC_REGION_LOCK = new State
     val UNLOCK_ALLOC_REGION = new State
+    val WAKE_LOCK_PTR_IRQ = new State
+    val WAKE_IRQ_DONE = new State
     val CHECK_ALLOC_RESULT = new State
     val LOCK_FREELIST = new State
     val WRITE_FREELIST_OWNER = new State
     val START_ATTEMPT = new State
     val WAIT_ATTEMPT = new State
     val MARK_ALLOCATOR_FULL = new State
-    val READ_FREELIST_LOCK = new State
     val UNLOCK_FREELIST = new State
 
+    def U32(v: Int): UInt = U(v, 32 bits)
+
+    def allocRegionLockAddr: UInt = allocRegion + U"x48"
+    def freeListLockAddr: UInt = io.ConfigIO.LockPtr + U"x8"
+    def allocatorFullFlagAddr: UInt = allocatorPtr + Mux(destAttrIdx === U(0), U"x10", U"x11")
+    def allocatorFullFlagBit(rd: UInt): Bool = Mux(destAttrIdx === U(0), rd(0), rd(1))
     def resetState(): Unit = {
       io.ToParAllocate.done.valid := True
       io.ToParAllocate.done.payload.DestObjPtr := destObjPtr
       io.ToParAllocate.done.payload.ActualPlabSize := actualWordSize
       goto(IDLE)
+    }
+    def casData32(addr: UInt, expected: UInt, desired: UInt): UInt = {
+      val laneShift = addr(3 downto 2) << 5
+      val desiredAligned = (desired.resize(128) << laneShift).resize(128)
+      val expectedAligned = (expected.resize(128) << laneShift).resize(128)
+      Cat(desiredAligned, expectedAligned).asUInt.resize(MMUDataWidth)
+    }
+    def tryLock32(addr: UInt, successState: State) : Unit = {
+      val casData = casData32(addr, U32(0), U32(1))
+      issueReq(io.MreqMainIml, addr, True, U(4), casData, True, True, issued) { rd =>
+        when(rd(31 downto 0) === U32(0)) {
+          goto(successState)
+        }
+      }
+    }
+    def wakeLockPtr(ptr: UInt, sel: UInt): Unit = {
+      lockPtr := ptr
+      wakeUpSel := sel
+      goto(WAKE_LOCK_PTR_IRQ)
+    }
+    def tryUnlock32(addr: UInt, successState: State, wakeSel: UInt): Unit = {
+      val casData = casData32(addr, U32(1), U32(0))
+
+      issueReq(io.MreqMainIml, addr, True, U(4), casData, True, True, issued) { rd =>
+        when(rd(31 downto 0) === U32(1)) {
+          when(wakeSel === U(1)){
+            resetState()
+          }.otherwise{
+            goto(successState)
+          }
+        }.otherwise{
+          wakeLockPtr(addr - U"x8", wakeSel)
+        }
+      }
     }
 
     IDLE.whenIsActive {
@@ -778,12 +746,12 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
 
         regionPtr := 0
         allocRegion := 0
-
         destObjPtr := 0
         actualWordSize := 0
-
         attemptNewRegionDone := False
         selectAllocate := False
+        lockPtr := U(0)
+        wakeUpSel := U(0)
 
         goto(LOAD_REGION_PTR)
       }
@@ -794,14 +762,12 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
         when(destAttrIdx === U(0)) {
           val addr = allocatorPtr + U"x28"
 
-          issueReq(io.MreqMainIml, addr, False, U(0), U(0), True, False, issuedMainIml) { rd =>
+          issueDirectRead(io.MreqMainIml, addr, U(8), LOAD_ALLOC_REGION) { rd =>
             val rp = rd(GCElementWidth - 1 downto 0)
 
             region_ptr_valid(destAttrIdx) := True
             region_ptr_cache(destAttrIdx) := rp
             regionPtr := rp
-
-            goto(LOAD_ALLOC_REGION)
           }
         }.otherwise {
           val rp = allocatorPtr + U"x30"
@@ -822,14 +788,12 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       when(!alloc_region_valid(destAttrIdx)) {
         val addr = region_ptr_cache(destAttrIdx) + U"x8"
 
-        issueReq(io.MreqMainIml, addr, False, U(8), U(0), True, False, issuedMainIml) { rd =>
+        issueDirectRead(io.MreqMainIml, addr, U(8), FIRST_ALLOC) { rd =>
           val ar = rd(GCElementWidth - 1 downto 0)
 
           alloc_region_valid(destAttrIdx) := True
           alloc_region_cache(destAttrIdx) := ar
           allocRegion := ar
-
-          goto(FIRST_ALLOC)
         }
       }.otherwise {
         allocRegion := alloc_region_cache(destAttrIdx)
@@ -842,19 +806,9 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
         parAllocateIml.fire(minWordSize, desiredWordSize, allocRegion)
         goto(WAIT_IML_DONE)
       }.otherwise {
-        allocRegionLockPtr := allocRegion + U"x40"
-        val addr = allocRegion + U"x48"
-
-        /*
-         * 原代码这里是 TODO cmpxchg。
-         * 这里保持你的原行为：发写锁请求，然后看返回/旧值。
-         * 如果 issueReq 的 rd 返回旧 lock 值，可以改成判断 rd。
-         */
-        issueReq(io.MreqMainIml, addr, True, U(4), U(1, 32 bits), True, True, issuedMainIml) { rd =>
-          // 推荐：when(rd(31 downto 0) === U(0, 32 bits)) {
-          when(lockValue === U(0, 32 bits)) {
-            goto(START_PAR_ALLOC)
-          }
+        // tryLock32(allocRegionLockAddr, START_PAR_ALLOC)
+        issueReq(io.MreqMainIml, allocRegionLockAddr, True, U(4), U(1), True, True, issued) { _ =>
+          goto(START_PAR_ALLOC)
         }
       }
     }
@@ -872,24 +826,31 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
 
     WAIT_PAR_ALLOC.whenIsActive {
       when(parAllocate.done) {
-        goto(READ_ALLOC_REGION_LOCK)
-      }
-    }
-
-    READ_ALLOC_REGION_LOCK.whenIsActive {
-      issueReq(io.MreqMainIml, allocRegionLockPtr + U"x8", False, U(4), U(0), True, False, issuedMainIml) { rd =>
-        lockValue := rd(31 downto 0)
         goto(UNLOCK_ALLOC_REGION)
       }
     }
 
     UNLOCK_ALLOC_REGION.whenIsActive {
-      issueReq(io.MreqMainIml, allocRegionLockPtr + U"x8", True, U(4), U(0, 32 bits), False, False, issuedMainIml) { _ => }
+      // tryUnlock32(allocRegionLockAddr, CHECK_ALLOC_RESULT, U(0))
+      issueDirectWriteWithoutResp(io.MreqMainIml, allocRegionLockAddr, U(4), U(0), CHECK_ALLOC_RESULT) {}
+    }
 
-      when(issuedMainIml) {
-        issuedMainIml := False
-        lockValue := 0
-        goto(CHECK_ALLOC_RESULT)
+    WAKE_LOCK_PTR_IRQ.whenIsActive {
+      io.Irq.req.valid := True
+      io.Irq.req.payload.par0 := lockPtr
+      io.Irq.req.payload.cmd := IRQ_WAKE
+      when(io.Irq.req.fire){
+        goto(WAKE_IRQ_DONE)
+      }
+    }
+
+    WAKE_IRQ_DONE.whenIsActive {
+      when(io.Irq.resp.valid){
+        when(wakeUpSel === U(0)){
+          goto(CHECK_ALLOC_RESULT)
+        }.otherwise{
+          resetState()
+        }
       }
     }
 
@@ -897,11 +858,10 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
       when(destObjPtr === 0) {
         when(selectAllocate) {
           selectAllocate := False
-          freelistLockPtr := io.ConfigIO.LockPtr
           goto(LOCK_FREELIST)
         }.otherwise {
-          issueReq(io.MreqMainIml, allocatorPtr + U"x10", False, U(1), U(0), True, False, issuedMainIml) { rd =>
-            val isFull = Mux(destAttrIdx === U(0), rd(0), rd(1))
+          issueReq(io.MreqMainIml, allocatorPtr + U"x10", False, U(1), U(0), True, False, issued) { rd =>
+            val isFull = allocatorFullFlagBit(rd)
 
             when(!isFull) {
               selectAllocate := True
@@ -917,23 +877,14 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
     }
 
     LOCK_FREELIST.whenIsActive {
-      issueReq(io.MreqMainIml, freelistLockPtr + U"x8", True, U(4), U(1, 32 bits), True, True, issuedMainIml) { rd =>
-        // 推荐：when(rd(31 downto 0) === U(0, 32 bits)) {
-        when(lockValue === U(0, 32 bits)) {
-          goto(WRITE_FREELIST_OWNER)
-        }.otherwise {
-          goto(LOCK_FREELIST)
-        }
+      // tryLock32(freeListLockAddr, WRITE_FREELIST_OWNER)
+      issueReq(io.MreqMainIml, freeListLockAddr, True, U(4), U(1), True, True, issued) { rd =>
+        goto(WRITE_FREELIST_OWNER)
       }
     }
 
     WRITE_FREELIST_OWNER.whenIsActive {
-      issueReq(io.MreqMainIml, freelistLockPtr, True, U(8), io.ConfigIO.Thread, False, False, issuedMainIml) { _ => }
-
-      when(issuedMainIml) {
-        issuedMainIml := False
-        goto(START_ATTEMPT)
-      }
+      issueDirectWriteWithoutResp(io.MreqMainIml, io.ConfigIO.G1h, U(8), io.ConfigIO.Thread, START_ATTEMPT)()
     }
 
     START_ATTEMPT.whenIsActive {
@@ -948,37 +899,20 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
         when(destObjPtr === 0) {
           goto(MARK_ALLOCATOR_FULL)
         }.otherwise {
-          goto(READ_FREELIST_LOCK)
+          goto(UNLOCK_FREELIST)
         }
       }
     }
 
     MARK_ALLOCATOR_FULL.whenIsActive {
-      when(destAttrIdx === U(0)) {
-        issueReq(io.MreqMainIml, allocatorPtr + U"x10", True, U(1), U(1, 8 bits), False, False, issuedMainIml) { _ => }
-      }.otherwise {
-        issueReq(io.MreqMainIml, allocatorPtr + U"x11", True, U(1), U(1, 8 bits), False, False, issuedMainIml) { _ => }
-      }
-
-      when(issuedMainIml) {
-        issuedMainIml := False
-        goto(READ_FREELIST_LOCK)
-      }
-    }
-
-    READ_FREELIST_LOCK.whenIsActive {
-      issueReq(io.MreqMainIml, freelistLockPtr + U"x8", False, U(4), U(0), True, False, issuedMainIml) { rd =>
-        lockValue := rd(31 downto 0)
-        goto(UNLOCK_FREELIST)
-      }
+      issueDirectWriteWithoutResp(io.MreqMainIml, allocatorFullFlagAddr, U(1), U(1), UNLOCK_FREELIST)()
     }
 
     UNLOCK_FREELIST.whenIsActive {
-      issueReq(io.MreqMainIml, freelistLockPtr + U"x8", True, U(4), U(0, 32 bits), False, False, issuedMainIml) { _ => }
-
-      when(issuedMainIml) {
-        issuedMainIml := False
-        lockValue := 0
+      // tryUnlock32(freeListLockAddr, IDLE, U(1))
+      issueReq(io.MreqMainIml, freeListLockAddr, True, U(4), U(0, 32 bits), False, False, issued) { _ => }
+      when(issued) {
+        issued := False
         resetState()
       }
     }

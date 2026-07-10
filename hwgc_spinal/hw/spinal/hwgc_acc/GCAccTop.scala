@@ -204,6 +204,7 @@ class GCAccTop extends Module with GCTopParameters {
   gcParAllocate.io.ToNewGCAlloc <> gcNewGCAlloc.io.ToNewGCAlloc
   gcParAllocate.io.CacheUpdateOut <> io.CacheUpdateOut
   gcParAllocate.io.CacheUpdateIn <> io.CacheUpdateIn
+  gcParAllocate.io.Irq.clearIn()
   gcParAllocate.io.ConfigIO.G1h := G1h
   gcParAllocate.io.ConfigIO.Thread := Thread
   gcParAllocate.io.ConfigIO.LockPtr := LockPtr
@@ -236,7 +237,6 @@ class GCAccTop extends Module with GCTopParameters {
   gcTrace.io.ConfigIO.UseCompressedKlassPointers       := CompressedFlag(1)
   gcTrace.io.ConfigIO.HumongousReclaimCandidatesBoolBase := HumongousReclaimCandidatesBoolBase
   gcTrace.io.DebugTimeStamp := DebugTimeStamp
-  gcTrace.io.TaskDone := io.config.Done
 
   // gcAop
   gcAop.io.Mreq <> gcUnalignedMMUAdapter(16).io.in

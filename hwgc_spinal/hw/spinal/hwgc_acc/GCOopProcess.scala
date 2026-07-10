@@ -1,7 +1,6 @@
 package hwgc_acc
 
-import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO}
-
+import hwgc_top.{Config, GCTopParameters, HWParameters, LocalMMUIO, MyStateMachine}
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
@@ -40,11 +39,9 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     val SlotIsEmpty          = out Bool()
   }
 
-  // defaults
   def clearMreq(m: LocalMMUIO): Unit = {
     m.Request.valid := False
     m.Request.payload.clearAll()
-
     m.Response.ready := True
   }
 
@@ -54,31 +51,78 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   io.Process2CopySurvivor.clearOut()
   io.Process2Aop.clearOut()
 
-  def slotMreq(i: Int): LocalMMUIO =
-    if (i == 0) io.Mreq0 else io.Mreq1
+  // slot 状态 放前面 不然 会报错NullPointer
+  val slotValid = Vec.fill(2)(RegInit(False))
+  val slotCtx   = Vec.fill(2)(Reg(SlotCtx()) init SlotCtx().getZero)
 
+  val slotStart           = Vec.fill(2)(Bool())
+  val slotGotoIdle        = Vec.fill(2)(Bool())
+  val slotCopyReqAccepted = Vec.fill(2)(Bool())
+  val slotReleaseFetch    = Vec.fill(2)(Bool()) // 当前Slot 允许前级 Fetch 释放任务
+  // 这个默认赋值放条件赋值前面 不然会 和条件 冲突 ASSIGN OVERFLEAP
+  for (i <- 0 until 2) {
+    slotStart(i)           := False
+    slotGotoIdle(i)        := False
+    slotCopyReqAccepted(i) := False
+    slotReleaseFetch(i)    := False
+  }
+
+
+  def slotMreq(i: Int): LocalMMUIO = if (i == 0) io.Mreq0 else io.Mreq1
   def dbg(msg: Seq[Any]): Unit =
     if (DebugEnable) {
       report(Seq("[GCOopProcess<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
     }
+  def regionAttrAddrOf(i: Int): UInt = (io.ConfigIO.RegionAttrBiasedBase + (slotCtx(i).srcOopPtr >> io.ConfigIO.RegionAttrShiftBy) << U(1)).resize(MMUAddrWidth)
+  def destRegionAttrAddrOf(i: Int): UInt = (io.ConfigIO.RegionAttrBiasedBase + (slotCtx(i).destOopPtr >> io.ConfigIO.RegionAttrShiftBy) << U(1)).resize(MMUAddrWidth)
+  def heapRegionLookupAddrOf(i: Int): UInt = (io.ConfigIO.HeapRegionBiasedBase + (slotCtx(i).task >> io.ConfigIO.HeapRegionShiftBy) << U(3)).resize(MMUAddrWidth)
+  def writeBackObjOf(i: Int): UInt = {
+    Mux(io.ConfigIO.UseCompressedOop,
+      ((slotCtx(i).destOopPtr - io.ConfigIO.CompressedOopBase) >> io.ConfigIO.CompressedOopShift).resize(GCElementWidth),
+      slotCtx(i).destOopPtr)
+  }
+  def writeBackSize(): UInt = Mux(io.ConfigIO.UseCompressedOop, U(4), U(8))
+  def clearSlotRuntime(i: Int): Unit = {
+    slotCtx(i).srcRegionAttr        := 0
+    slotCtx(i).destOopPtr           := 0
+    slotCtx(i).heapRegion           := 0
+    slotCtx(i).heapRegionHumongous  := False
+    slotCtx(i).fromMarkWord         := False
+    slotCtx(i).accessDestRegionAttr := False
+    slotCtx(i).destRegionAttr       := 0
 
-  // slot registers
-  val slotValid = Vec.fill(2)(RegInit(False))
-  val slotCtx   = Vec.fill(2)(Reg(SlotCtx()) init SlotCtx().getZero)
+    slotCopy2SurvivorDone(i)          := False
+    slotCopy2SurvivorInflight(i)      := False
+    slotCopy2SurvivorBypassGranted(i) := False
+  }
+  def allocToSlot(i: Int): Unit = {
+    slotValid(i) := True
 
-  io.SlotIsEmpty := !slotValid.orR
+    slotCtx(i).task      := io.Fetch2Process.cmd.payload.Task
+    slotCtx(i).markWord  := io.Fetch2Process.cmd.payload.MarkWord
+    slotCtx(i).klassPtr  := io.Fetch2Process.cmd.payload.KlassPtr
+    slotCtx(i).srcOopPtr := io.Fetch2Process.cmd.payload.SrcOopPtr
+    slotCtx(i).srcLength := io.Fetch2Process.cmd.payload.SrcLength
 
-  // issueReq 内部使用的 per-slot request 状态
-  val slotIssued = Vec.fill(2)(RegInit(False))
+    clearSlotRuntime(i)
+    slotStart(i) := True
 
-  // copy return bookkeeping
-  val slotCopy2SurvivorDone          = Vec.fill(2)(RegInit(False))
-  val slotCopy2SurvivorInflight      = Vec.fill(2)(RegInit(False))
-  val slotCopy2SurvivorTypeArraySeen = Vec.fill(2)(RegInit(False))
-  val slotCopy2SurvivorBypassGranted = Vec.fill(2)(RegInit(False))
+    dbg(Seq("Allocate task to slot", i.toString, ", srcOopPtr=", io.Fetch2Process.cmd.payload.SrcOopPtr))
+  }
+  def finishSlot(i: Int): Unit = {
+    slotValid(i) := False
+    clearSlotRuntime(i)
+    slotGotoIdle(i) := True
 
-  // allowSecondInFlight = True 表示： 已经有某个 slot 提前对 Fetch 发过 Done， 因此允许 Fetch 再送一个任务进入另一个空 slot。
-  val allowSecondInFlight = RegInit(False)
+    dbg(Seq("Finish slot", i.toString))
+  }
+  def releaseFetchFromSlotDyn(i: UInt): Unit = {
+    when(i === U(0)) {
+      slotReleaseFetch(0) := True
+    } otherwise {
+      slotReleaseFetch(1) := True
+    }
+  }
 
   // shared small caches
   // 两个 slot 共用一份 cache。 cache fill 写口采用固定优先级：slot0 > slot1。
@@ -95,87 +139,9 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   val heapRegionCache        = Vec.fill(heapRegionCacheEntries)(RegInit(False))
   val heapRegionCacheReplacePtr = RegInit(U(0, log2Up(heapRegionCacheEntries) bits))
 
-  // helpers
-  def regionAttrAddrOf(i: Int): UInt = (io.ConfigIO.RegionAttrBiasedBase + (slotCtx(i).srcOopPtr >> io.ConfigIO.RegionAttrShiftBy) * U(2)).resize(MMUAddrWidth)
-
-  def destRegionAttrAddrOf(i: Int): UInt = (io.ConfigIO.RegionAttrBiasedBase + (slotCtx(i).destOopPtr >> io.ConfigIO.RegionAttrShiftBy) * U(2)).resize(MMUAddrWidth)
-
-  def heapRegionLookupAddrOf(i: Int): UInt = (io.ConfigIO.HeapRegionBiasedBase + (slotCtx(i).task >> io.ConfigIO.HeapRegionShiftBy) * U(8)).resize(MMUAddrWidth)
-
-  def writeBackObjOf(i: Int): UInt = {
-    Mux(io.ConfigIO.UseCompressedOop,
-      ((slotCtx(i).destOopPtr - io.ConfigIO.CompressedOopBase) >> io.ConfigIO.CompressedOopShift).resize(GCElementWidth),
-      slotCtx(i).destOopPtr)
-  }
-
-  def writeBackSize(): UInt = Mux(io.ConfigIO.UseCompressedOop, U(4), U(8))
-
-  // cross-FSM pulses
-  val slotStart           = Vec.fill(2)(Bool())
-  val slotGotoIdle        = Vec.fill(2)(Bool())
-  val slotCopyReqAccepted = Vec.fill(2)(Bool())
-  val slotReleaseFetch    = Vec.fill(2)(Bool())
-
-  for (i <- 0 until 2) {
-    slotStart(i)           := False
-    slotGotoIdle(i)        := False
-    slotCopyReqAccepted(i) := False
-    slotReleaseFetch(i)    := False
-  }
-
-  def clearSlotRuntime(i: Int): Unit = {
-    slotCtx(i).srcRegionAttr        := 0
-    slotCtx(i).destOopPtr           := 0
-    slotCtx(i).heapRegion           := 0
-    slotCtx(i).heapRegionHumongous  := False
-    slotCtx(i).fromMarkWord         := False
-    slotCtx(i).accessDestRegionAttr := False
-    slotCtx(i).destRegionAttr       := 0
-
-    slotIssued(i) := False
-
-    slotCopy2SurvivorDone(i)          := False
-    slotCopy2SurvivorInflight(i)      := False
-    slotCopy2SurvivorTypeArraySeen(i) := False
-    slotCopy2SurvivorBypassGranted(i) := False
-  }
-
-  def allocToSlot(i: Int): Unit = {
-    slotValid(i) := True
-
-    slotCtx(i).task      := io.Fetch2Process.cmd.payload.Task
-    slotCtx(i).markWord  := io.Fetch2Process.cmd.payload.MarkWord
-    slotCtx(i).klassPtr  := io.Fetch2Process.cmd.payload.KlassPtr
-    slotCtx(i).srcOopPtr := io.Fetch2Process.cmd.payload.SrcOopPtr
-    slotCtx(i).srcLength := io.Fetch2Process.cmd.payload.SrcLength
-
-    clearSlotRuntime(i)
-    slotStart(i) := True
-
-    dbg(Seq("Allocate task to slot", i.toString, ", srcOopPtr=", io.Fetch2Process.cmd.payload.SrcOopPtr))
-  }
-
-  def finishSlot(i: Int): Unit = {
-    slotValid(i) := False
-    clearSlotRuntime(i)
-    slotGotoIdle(i) := True
-
-    dbg(Seq("Finish slot", i.toString))
-  }
-
-  def releaseFetchFromSlotDyn(i: UInt): Unit = {
-    when(i === U(0)) {
-      slotReleaseFetch(0) := True
-    } otherwise {
-      slotReleaseFetch(1) := True
-    }
-  }
-
-  // cache lookup wires
   val srcRegionAttrAddr     = Vec.fill(2)(UInt(MMUAddrWidth bits))
   val destRegionAttrAddr    = Vec.fill(2)(UInt(MMUAddrWidth bits))
   val heapRegionLookupAddr  = Vec.fill(2)(UInt(MMUAddrWidth bits))
-
   val srcRegionAttrHit      = Vec.fill(2)(Bool())
   val srcRegionAttrHitIndex = Vec.fill(2)(UInt(log2Up(regionAttrCacheEntries) bits))
 
@@ -204,7 +170,6 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     heapRegionHitIndex(i) := OHToUInt(heapHitVec.asBits)
   }
 
-  // shared cache fill requests
   val regionAttrFillValid = Vec.fill(2)(Bool())
   val regionAttrFillAddr  = Vec.fill(2)(UInt(MMUAddrWidth bits))
   val regionAttrFillData  = Vec.fill(2)(UInt(16 bits))
@@ -223,20 +188,34 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     heapRegionFillData(i)  := False
   }
 
-  // Process2CopySurvivor done capture
+  val slotCopy2SurvivorDone          = Vec.fill(2)(RegInit(False)) // CopySurvivor 已经返回 最终的 destOopPtr
+  val slotCopy2SurvivorInflight      = Vec.fill(2)(RegInit(False)) // 已经向 CopySurvivor 发出请求，正在等待返回
+  val slotCopy2SurvivorBypassGranted = Vec.fill(2)(RegInit(False)) // 某些 type array 可以提前释放 Fetch，避免阻塞前级
+
+  // allowSecondInFlight = True 表示已经有某个 slot 提前对 Fetch 发过 Done， 因此允许 Fetch 再送一个任务进入另一个空 slot
+  val allowSecondInFlight = RegInit(False)
+
+  val pipeEmpty = !slotValid.orR
+  val hasFreeSlot = !slotValid.andR
+  val fetchReleasePulse = slotReleaseFetch.orR
+  val fetchAccept = io.Fetch2Process.cmd.fire
+
+  // 如果两个 slot 都空，直接 ready; 如果 pipeline 非空, 必须 allowSecondInFlight=True， 才允许 Fetch 再发一个任务进来
+  io.SlotIsEmpty := pipeEmpty
+  io.Fetch2Process.cmd.ready := hasFreeSlot && (pipeEmpty || allowSecondInFlight)
+  io.Fetch2Process.Done := fetchReleasePulse
+
+  // Process2CopySurvivor isTypeArray capture (不需要复制 可以提前释放)
   when(io.Process2CopySurvivor.done.payload.isTypeArray) {
     val isTypeArrayIdx = io.Process2CopySurvivor.done.payload.DoneOwner
 
-    when(
-      slotCopy2SurvivorInflight(isTypeArrayIdx) &&
-      !slotCopy2SurvivorBypassGranted(isTypeArrayIdx)
-    ) {
+    when(slotCopy2SurvivorInflight(isTypeArrayIdx) && !slotCopy2SurvivorBypassGranted(isTypeArrayIdx)) {
       releaseFetchFromSlotDyn(isTypeArrayIdx)
-
       slotCopy2SurvivorBypassGranted(isTypeArrayIdx) := True
     }
   }
 
+  // Process2CopySurvivor Done capture
   when(io.Process2CopySurvivor.done.valid) {
     val doneOwner = io.Process2CopySurvivor.done.payload.DoneOwner
 
@@ -247,17 +226,6 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     dbg(Seq("Copy2Survivor done for slot", doneOwner))
   }
 
-  // admission by one global token
-  // pipeline 空：可以直接接收第一个任务。
-  // pipeline 非空：必须 allowSecondInFlight=True 才能接收第二个任务。
-  // 接收任务后清掉 allowSecondInFlight。 如果同周期又有新的 slotReleaseFetch，则重新置位。
-  val pipeEmpty = !slotValid(0) && !slotValid(1)
-  val hasFreeSlot = !slotValid(0) || !slotValid(1)
-  val fetchReleasePulse = slotReleaseFetch.orR
-  val fetchAccept = io.Fetch2Process.cmd.fire
-
-  io.Fetch2Process.cmd.ready := hasFreeSlot && (pipeEmpty || allowSecondInFlight)
-  io.Fetch2Process.Done := fetchReleasePulse
 
   when(fetchAccept) {
     when(!slotValid(0)) {
@@ -267,7 +235,9 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     }
   }
 
-  // 集中更新 allowSecondInFlight，避免多个位置直接写这个寄存器。
+  // allowSecondInFlight 的集中更新 (应该不会有同周期的 fetchReleasePulse 和 fetchAccept 均有效)
+  // 如果本周期有 slotReleaseFetch，则允许 Fetch 后续再发一个任务
+  // 如果本周期只是 Fetch 被接收，则消耗这个 token
   when(fetchReleasePulse) {
     allowSecondInFlight := True
   } elsewhen fetchAccept {
@@ -278,11 +248,10 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   val slotIsCopyReq = Vec.fill(2)(Bool())
   val slotIsWaitAop = Vec.fill(2)(Bool())
 
-  // Per-slot StateMachines
   for (i <- 0 until 2) {
     val m = slotMreq(i)
 
-    val slotFsm = new StateMachine {
+    val slotFsm = new MyStateMachine {
       val IDLE              = new State with EntryPoint
       val READ_SRC_ATTR     = new State
       val DECIDE            = new State
@@ -292,10 +261,18 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
       val WAIT_COPY_OR_MARK = new State
       val WRITE_BACK        = new State
       val READ_DEST_ATTR    = new State
-      val WAIT_AOP          = new State
+      val SEND_AOP          = new State
 
-      IDLE.whenIsActive {
-        // wait for slotStart(i)
+      always {
+        when(slotGotoIdle(i)) {
+          goto(IDLE)
+
+        }.elsewhen(slotStart(i)) {
+          goto(READ_SRC_ATTR)
+
+        }.elsewhen(slotCopyReqAccepted(i)) {
+          goto(READ_HEAP_PTR)
+        }
       }
 
       READ_SRC_ATTR.whenIsActive {
@@ -304,14 +281,12 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
           goto(DECIDE)
 
         } otherwise {
-          issueReq(m, srcRegionAttrAddr(i), False, U(2), U(0), True, False, slotIssued(i)) { rd =>
+          issueDirectRead(m, srcRegionAttrAddr(i), U(2), DECIDE) { rd =>
             slotCtx(i).srcRegionAttr := rd(15 downto 0)
 
             regionAttrFillValid(i) := True
             regionAttrFillAddr(i)  := srcRegionAttrAddr(i)
             regionAttrFillData(i)  := rd(15 downto 0)
-
-            goto(DECIDE)
           }
         }
       }
@@ -320,23 +295,23 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
         val srcRegionAttrType = slotCtx(i).srcRegionAttr(15 downto 8).asSInt
 
         when(srcRegionAttrType < S(0, 8 bits)) {
-          slotReleaseFetch(i) := True
+          releaseFetchFromSlotDyn(i)
           finishSlot(i)
 
         } otherwise {
           val doCopy2Survivor = (slotCtx(i).markWord & U(3, GCElementWidth bits)) =/= U(3, GCElementWidth bits)
 
-          when(!doCopy2Survivor) {
+          when(!doCopy2Survivor) { // 不需要复制 可以提前结束
             slotCtx(i).destOopPtr   := slotCtx(i).markWord & ~U(3, GCElementWidth bits)
             slotCtx(i).fromMarkWord := True
 
-            slotReleaseFetch(i) := True
+            releaseFetchFromSlotDyn(i)
 
             goto(WRITE_BACK)
 
             dbg(Seq("slot", i.toString, " use fromMarkWord path"))
 
-          } otherwise {
+          }.otherwise {
             slotCtx(i).fromMarkWord := False
 
             goto(COPY_SURV_REQ)
@@ -346,16 +321,12 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
         }
       }
 
-      COPY_SURV_REQ.whenIsActive {
-        // request is driven by centralized Process2CopySurvivor arbitration
-      }
-
       READ_HEAP_PTR.whenIsActive {
         when(heapRegionHit(i)) {
           slotCtx(i).heapRegionHumongous := heapRegionCache(heapRegionHitIndex(i))
           when(slotCtx(i).fromMarkWord) {
             slotCtx(i).fromMarkWord := False
-            when(heapRegionCache(heapRegionHitIndex(i))){
+            when(heapRegionCache(heapRegionHitIndex(i))){ // 已经Release了 这里 Finish就可以
               finishSlot(i)
             }.otherwise{
               slotCtx(i).accessDestRegionAttr := False
@@ -364,9 +335,8 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
           }.otherwise{ goto(WAIT_COPY_OR_MARK) }
 
         } otherwise {
-          issueReq(m, heapRegionLookupAddr(i), False, U(8), U(0), True, False, slotIssued(i)) { rd =>
+          issueDirectRead(m, heapRegionLookupAddr(i), U(8), READ_HUMONGOUS) { rd =>
             slotCtx(i).heapRegion := rd(GCElementWidth - 1 downto 0)
-            goto(READ_HUMONGOUS)
           }
         }
       }
@@ -374,7 +344,7 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
       READ_HUMONGOUS.whenIsActive {
         val humAddr = (slotCtx(i).heapRegion.resize(MMUAddrWidth) + U"xbc").resize(MMUAddrWidth)
 
-        issueReq(m, humAddr, False, U(4), U(0), True, False, slotIssued(i)) { rd =>
+        issueReq(m, humAddr, False, U(4), U(0), True, False, issued) { rd =>
           val hum = (rd(31 downto 0) & U(2, 32 bits)) =/= U(0)
 
           slotCtx(i).heapRegionHumongous := hum
@@ -399,8 +369,8 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
         when (slotCopy2SurvivorDone(i)) {
           val needRelease = !slotCopy2SurvivorBypassGranted(i)
 
-          when(needRelease) {
-            slotReleaseFetch(i) := True
+          when(needRelease) { // 没有提前因为TypeArray Bypass release掉
+            releaseFetchFromSlotDyn(i)
           }
 
           slotCopy2SurvivorDone(i) := False
@@ -411,10 +381,10 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
       }
 
       WRITE_BACK.whenIsActive {
-        issueReq(m, slotCtx(i).task.resize(MMUAddrWidth), True, writeBackSize(), writeBackObjOf(i), False, False, slotIssued(i)) { _ =>}
+        issueReq(m, slotCtx(i).task.resize(MMUAddrWidth), True, writeBackSize(), writeBackObjOf(i), False, False, issued) { _ =>}
 
-        when(slotIssued(i)) {
-          slotIssued(i) := False
+        when(issued) {
+          issued := False
 
           val sameRegion = ((slotCtx(i).task ^ slotCtx(i).destOopPtr) >> io.ConfigIO.LogOfHRGrainBytes) === U(0)
 
@@ -438,33 +408,15 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
       }
 
       READ_DEST_ATTR.whenIsActive {
-        issueReq(m, destRegionAttrAddr(i), False, U(2), U(0), True, False, slotIssued(i)) { rd =>
+        issueDirectRead(m, destRegionAttrAddr(i), U(2), SEND_AOP) { rd =>
           slotCtx(i).accessDestRegionAttr := True
           slotCtx(i).destRegionAttr       := rd(15 downto 0)
-
-          goto(WAIT_AOP)
-        }
-      }
-
-      WAIT_AOP.whenIsActive {
-        // request is driven by centralized AOP arbitration
-      }
-
-      always {
-        when(slotGotoIdle(i)) {
-          goto(IDLE)
-
-        } elsewhen slotStart(i) {
-          goto(READ_SRC_ATTR)
-
-        } elsewhen slotCopyReqAccepted(i) {
-          goto(READ_HEAP_PTR)
         }
       }
     }
 
     slotIsCopyReq(i) := slotFsm.isActive(slotFsm.COPY_SURV_REQ)
-    slotIsWaitAop(i) := slotFsm.isActive(slotFsm.WAIT_AOP)
+    slotIsWaitAop(i) := slotFsm.isActive(slotFsm.SEND_AOP)
   }
 
   // Shared regionAttrCache fill Fixed priority: slot0 > slot1
@@ -521,14 +473,12 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     when(io.Process2CopySurvivor.cmd.fire) {
       when(grantCopy0) {
         slotCopy2SurvivorInflight(0)      := True
-        slotCopy2SurvivorTypeArraySeen(0) := False
         slotCopy2SurvivorBypassGranted(0) := False
         slotCopyReqAccepted(0) := True
       }
 
       when(grantCopy1) {
         slotCopy2SurvivorInflight(1)      := True
-        slotCopy2SurvivorTypeArraySeen(1) := False
         slotCopy2SurvivorBypassGranted(1) := False
         slotCopyReqAccepted(1) := True
       }

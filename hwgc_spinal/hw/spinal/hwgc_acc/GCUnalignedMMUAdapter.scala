@@ -7,24 +7,21 @@ import spinal.lib._
 
 import scala.language.postfixOps
 
-class GCUnalignedMMUAdapter(
-                             downstreamReturnsResponse: Boolean = true
-                           ) extends Component with HWParameters {
+/*
+* @params: downstreamReturnsResponse: 下游是否会返回Resp.valid
+*/
+class GCUnalignedMMUAdapter(downstreamReturnsResponse: Boolean = true) extends Component with HWParameters {
   val io = new Bundle {
     val in  = slave(new LocalMMUIO)
     val out = master(new LocalMMUIO)
   }
 
-  // defaults
   io.in.ConherentRequsetSourceID.valid := False
   io.in.ConherentRequsetSourceID.payload.clearAll()
-
-  io.out.Request.payload.clearAll()
-
   io.in.Response.valid := False
   io.in.Response.payload.clearAll()
+  io.out.Request.payload.clearAll()
 
-  // request state
   val busy             = RegInit(False)
   val splitReq         = RegInit(False)
   val sendBeat0Pending = RegInit(False)
