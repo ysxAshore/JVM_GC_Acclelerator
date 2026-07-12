@@ -7,61 +7,77 @@ import spinal.lib.fsm._
 
 import scala.language.postfixOps
 
+/**
+ * GC 任务栈
+ *
+ * 模块使用片上环形栈保存活跃任务；片上任务过多时从栈底 SpillOut 到主存队列JVM queue，
+ * 片上任务不足时再从主存队列JVM queue中 ReadBack。由于主存储 stack_data 是同步读 RAM，
+ * 模块在栈顶设置 TopCache，为 Pop 和 PrePop 提供低延迟数据
+ *
+ * 数据方向：
+ *   Push -> 片上栈顶；Pop/PrePop <- TopCache；
+ *   SpillOut: 片上栈底 -> JVM queue；ReadBack: JVM queue -> 片上栈底。
+ */
 class GCTaskStack extends Module with GCTopParameters with GCParameters with HWParameters {
   val io = new Bundle {
-    val toFetch        = master(new GCToFetch)
-    val toStack        = slave(new GCToStack)
+    val toFetch        = master(new GCToFetch) // Pop and PrePop
+    val toStack        = slave(new GCToStack)  // Push exclude lastPush
     val Mreq           = master(new LocalMMUIO)
     val ConfigIO       = slave(new GCTaskStackConfigIO)
     val DebugTimeStamp = in UInt(64 bits)
   }
-
   io.Mreq.Request.valid := False
   io.Mreq.Request.payload.clearAll()
   io.Mreq.Response.ready := True
-
   io.ConfigIO.Done := False
   io.ConfigIO.config.ready := False
 
+  // queue_bottom 使用软件/JVM 队列的逻辑索引；stack 指针使用片上环形栈索引
   val queuePtrWidth = 32
   val stackPtrWidth = log2Up(GCTaskStack_Entry)
 
+  // stack_top 指向片上栈顶；stack_bottom 指向片上栈底边界
+  // 两者相等表示片上栈为空，并牺牲一个槽位区分 full/empty
   val stack_top    = RegInit(U(0, stackPtrWidth bits))
   val stack_bottom = RegInit(U(0, stackPtrWidth bits))
 
+  // JVM queue 元素数组基地址及当前有效元素数量/底部逻辑位置
   val queue_elems_base = RegInit(U(0, MMUAddrWidth bits))
   val queue_bottom     = RegInit(U(0, queuePtrWidth bits))
 
-  // 主存储：同步读 RAM. Pop / PrePop 不直接从这里出，而是通过 TopCache
+  // 片上任务主存储：同步读 RAM. Pop / PrePop 不直接读取它，而是通过 TopCache
   val stack_data = Mem(UInt(GCElementWidth bits), GCTaskStack_Entry)
 
-  // 全局 prefetched 标记 表示某个物理 stack entry 是否已经被 PrePop 过
+  // 按物理stack entry保存PrePop标记, 物理位置被新数据覆盖时必须清零
+  // 即使任务被挤出TopCache又重新Refill, 该标记仍可避免同一个任务被重复PrePop 
   val prefetched = Vec.fill(GCTaskStack_Entry)(RegInit(False))
 
+  // 环形指针辅助函数
   def stkInc(ptr: UInt, step: UInt): UInt = WrapInc(ptr, GCTaskStack_Entry, step)
   def stkDec(ptr: UInt, step: UInt): UInt = WrapDec(ptr, GCTaskStack_Entry, step)
   def queInc(ptr: UInt, step: UInt): UInt = WrapInc(ptr, GCTaskQueue_Size, step).resize(queuePtrWidth)
   def queDec(ptr: UInt, step: UInt): UInt = WrapDec(ptr, GCTaskQueue_Size, step).resize(queuePtrWidth)
+
+  // JVM queue 的每个 GCElement 占 8 字节，将逻辑索引转换成 MMU 字节地址
   def elemAddr(idx: UInt): UInt = (queue_elems_base + (idx.resize(MMUAddrWidth) << 3)).resize(MMUAddrWidth)
 
   val stk_nextTop = stkInc(stack_top, U(1, stackPtrWidth bits))
   val stk_prevTop = stkDec(stack_top, U(1, stackPtrWidth bits))
 
+  // 环形栈容量统计。保留一个槽位，因此最大可用数为 Entry-1
   val task_empty = stack_top === stack_bottom // 硬件栈队列空
   val task_usage = (stack_top - stack_bottom).resize(stackPtrWidth + 1) // 硬件栈已用项数
   val task_free  = U(GCTaskStack_Entry - 1, stackPtrWidth + 1 bits) - task_usage // 牺牲一个槽判断满
 
+  // 使用迟滞阈值避免 SpillOut 和 ReadBack 在边界附近来回切换
   val need_spillOut = task_usage >= U(GCTaskStack_SpillNeed + 4, task_usage.getWidth bits)
   val need_readback = (task_usage <= U(GCTaskStack_ReadNeed - 4, task_usage.getWidth bits)) && (queue_bottom =/= U(0, queuePtrWidth bits))
 
-  // TopCache(pop从这里取)
-  // offset 0 是stack_top 对应数据，offset 越大越靠近 stack_bottom。
-  //    topCacheData(0) = 当前 stack_top 对应的数据
-  //    topCacheData(1) = stack_top - 1
-  //    topCacheData(2) = stack_top - 2
-  // topCacheIdx 用于记录每个 cache entry 对应的 hardware_stack index。
+  // TopCache：同步 RAM 上方的栈顶缓存
+  // offset 0 对应 stack_top；offset 1 对应 stack_top-1，依次向 stack_bottom 延伸。
+  // topCacheIdx 保存每个缓存项对应的物理 stack_data 索引；有效项范围为
+  // [0, topCacheCount)。TopCache 容量取扫描窗口的两倍，以隐藏 refill 延迟。
   val TopCacheDepth = PreFetchScanWindow << 1
-
   val topCacheCountWidth  = log2Up(TopCacheDepth + 1)
   val topCacheOffsetWidth = log2Up(TopCacheDepth)
 
@@ -75,69 +91,63 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   val topCacheEmpty = topCacheCount === U(0, topCacheCountWidth bits)
   val topCacheFull  = topCacheCount === U(TopCacheDepth, topCacheCountWidth bits)
 
-  // Push-follow PrePop bookkeeping
-  // push_count: 记录最近 Push 进来的任务数量。
-  // pushPrePopRem: 第一次 push-follow PrePop 之后，还剩几个 pushed entry 要继续 PrePop。
-  // pushPrePopOffset: 后续 push-follow PrePop 从 topCacheData(offset) 取数据。
+  // Push-follow PrePop：Push burst 结束后，优先把刚 Push 的任务提供给 Fetch。
+  // push_count 记录尚未开始该流程的新任务数；第一次返回 offset 0，随后由
+  // pushPrePopOffset 从 offset 1 开始继续，pushPrePopRem 记录剩余数量。
   val push_count       = RegInit(U(0, 32 bits))
   val not_prefetch     = RegInit(False)
   val pushPrePopRem    = RegInit(U(0, 32 bits))
   val pushPrePopOffset = RegInit(U(1, topCacheOffsetWidth bits))
 
-  // State visibility
+  // 状态机状态可见信号
   val inWork = Bool()
 
-  // Pop / Push interface
-  // LastPush: LastPush 不是进入 TaskStack 的 payload. 它只是通知 Push burst 结束，可以重新允许 PrePop。
-  val pushCanAccept = inWork && task_free =/= U(0, task_free.getWidth bits)
+  // Pop / Push 接口
+  val pushCanAccept = inWork && task_free =/= U(0, task_free.getWidth bits) // 状态机在Work状态 且 stack_data 没有满
   io.toStack.Push.ready := pushCanAccept
 
-  // pop 被 连续的 几个 push 阻塞
+  // push-follow PrePop 未处理完时禁止普通 Pop，避免新任务的观察次序混乱
   val popBlockedByPushFollow = (push_count =/= U(0, 32 bits)) || (pushPrePopRem =/= U(0, 32 bits))
-  val popAvailable = !topCacheEmpty
+  val popAvailable = !topCacheEmpty // TopCache 不空 即可做Pop操作
   io.toFetch.Pop.valid := inWork && popAvailable && !popBlockedByPushFollow
-  io.toFetch.Pop.payload := topCacheData(0)
+  io.toFetch.Pop.payload := topCacheData(0) // 每次取bias 0 数据
 
   val pushFire = io.toStack.Push.fire
   val popFire  = io.toFetch.Pop.fire
 
+  // 若本周期 Pop 消费了一个刚 Push 的任务，Fetch 看到的 PushCount 同拍减一
   val pushCountForFetch = Mux(popFire && push_count =/= U(0, 32 bits), push_count - U(1, 32 bits), push_count)
   io.toFetch.PushCount := pushCountForFetch
 
-  // PrePop candidate selection from TopCache
-  // 普通 PrePop： 扫描 topCacheData(1..PreFetchScanWindow)，不扫描 offset 0. offset 0 留给 Pop
-  // push-follow PrePop： 第一次返回 offset 0. 后续返回 offset 1, 2, ...
+  // PrePop 候选选择
+  // 普通模式扫描 offset 1..PreFetchScanWindow，offset 0 留给 Pop 选择离栈顶最近且从未 PrePop 的项
+  // push-follow 模式则从刚 Push 的 offset 0 开始。
   val normalCandidates    = Vec(Bool(), PreFetchScanWindow)
   val normalCandidateOffs = Vec(UInt(topCacheOffsetWidth bits), PreFetchScanWindow)
-
   for (i <- 1 until PreFetchScanWindow + 1) {
     val off = U(i, topCacheOffsetWidth bits)
     // topCache entry 有效 且 没有被 PrePop过(topCache and hardware_stack)
     normalCandidates(i - 1) := cacheOffsetValid(off) && !topCachePrefetched(off) && !prefetched(topCacheIdx(off))
     normalCandidateOffs(i - 1) := off
   }
-
   val normalFirstOH = OHMasking.first(normalCandidates.asBits)
+  val normalPrePopOffset = MuxOH(normalFirstOH, normalCandidateOffs)
+
   val pushFollowPrePopMode = (pushCountForFetch =/= U(0, 32 bits)) || (pushPrePopRem =/= U(0, 32 bits))
   val pushFollowOffset = Mux(pushCountForFetch =/= U(0, 32 bits), U(0, topCacheOffsetWidth bits), pushPrePopOffset)
-  val normalPrePopOffset = MuxOH(normalFirstOH, normalCandidateOffs)
   val prefetchOffset = Mux(pushFollowPrePopMode, pushFollowOffset, normalPrePopOffset)
 
   val prefetchHit = Mux(pushFollowPrePopMode, cacheOffsetValid(pushFollowOffset), normalFirstOH.orR)
 
-  // 为了简化 TopCache shift / 标记逻辑，PrePop 不和 Push/Pop 同拍
+  // Push/Pop 会移动缓存项，禁止与 PrePop 同拍，避免给移动前后错误的项打标记
   val prefetchBlockedByStackMove = pushFire || popFire
-
   io.toFetch.PrePop.valid := inWork && prefetchHit && !not_prefetch && !prefetchBlockedByStackMove
   io.toFetch.PrePop.payload := topCacheData(prefetchOffset)
   val preFire = io.toFetch.PrePop.fire
 
-  // TopCache refill using stack_data.readSync
-  //   readSync response 如果本周期不能 append，就直接丢弃。
-  //   TopCache 满后如果发生 Push，TopCache 会整体右移并挤出 tail。
-  //   Push 之前发出的 refill response 是基于旧 stack_top / old offset 算的。
-  //   如果把它 hold 住，之后再 append，就可能把 BCE8 这种更深处的数据
-  //   错误插入，导致 BF10 被跳过。
+  // TopCache 后台 refill
+  // readSync 请求后下一拍返回。response 只在返回当拍能 append 时接收，否则丢弃；
+  // 不能长期 hold，因为 Push 会改变 stack_top 与所有缓存 offset 的对应关系
   val refillRespValid = RegInit(False)
   val refillRespIdx   = Reg(UInt(stackPtrWidth bits))
 
@@ -146,21 +156,16 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
 
   val refillData = stack_data.readSync(refillReqIdx, refillReq)
 
-  // 只有 response 回来并且当拍可以接收时才 append。
-  // Push 同拍不 append，因为 Push 会改变 TopCache offset 关系。
+  // TopCache 满但本周期  Pop 时会产生空位，因此仍允许 append；Push 同拍禁止 append(因为会改变TopCache offset关系)
   val refillAppendAllowed = refillRespValid && !pushFire && (popFire || !topCacheFull)
   val refillAppendData = refillData
   val refillAppendIdx  = refillRespIdx
-
   val refillAppendPrefetched = prefetched(refillRespIdx)
-
-  // 如果本周期 append 了一个返回值，那么新的 refill request 要继续往更深处读。
   val refillAppendWillHappen = refillAppendAllowed
 
+  // 若本拍会 append 已返回的数据，新 refill 必须再向深处多读一项，避免重复读取
   val refillOffsetWide = topCacheCount.resize(stackPtrWidth + 1) + refillAppendWillHappen.asUInt.resize(stackPtrWidth + 1)
-
   refillReqIdx := stkDec(stack_top, refillOffsetWide.resize(stackPtrWidth))
-
   val refillHasMoreData = task_usage > refillOffsetWide.resize(task_usage.getWidth)
 
   // 发起新的 refill request。
