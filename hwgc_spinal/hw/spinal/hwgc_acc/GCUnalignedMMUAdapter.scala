@@ -297,7 +297,7 @@ class GCUnalignedMMUAdapter(downstreamReturnsResponse: Boolean = true) extends C
 
   when(currentRespFire) {
     when(!splitReq) {
-      when(!isWrite) { 
+      when(!isWrite || needDoCmpXchg) { 
         // 恢复 对应的请求数据
         bypassRespPayload.ResponseData := io.out.Response.payload.ResponseData |>> (offset << 3)
       }

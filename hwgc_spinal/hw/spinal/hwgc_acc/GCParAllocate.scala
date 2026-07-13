@@ -171,13 +171,13 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
         // 128bits 对齐的访问 64bits
         // val casData = Mux(
         //   addr(3),
-        //   Cat(desired.resize(128) << 64, expected.resize(128) << 64),
+        //   Cat((desired.resize(128) << 64).resize(128), (expected.resize(128) << 64).resize(128)),
         //   Cat(desired.resize(128), expected.resize(128))
         // ).asUInt.resize(MMUDataWidth)
         val casData = desired
 
         issueReq(io.MreqMainIml, addr, True, U(8), casData, True, True, issued) { rd =>
-          // val observerd = rd(GCElementWidth - 1 downto 0)
+          // val observed = rd(GCElementWidth - 1 downto 0)
           // when(observed === expected) {
           when(expected === expected) {
             destObjPtr := alloc_top
@@ -668,7 +668,7 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
   val selectAllocate = RegInit(False)
 
   val lockPtr = RegInit(U(0, GCElementWidth bits))
-  val wakeUpSel = RegInit(U(0, 2 bits))
+  val wakeUpSel = RegInit(U(0, 1 bits))
   val mainFsm = new MyStateMachine {
     val IDLE = new State with EntryPoint
     val LOAD_REGION_PTR = new State
@@ -716,7 +716,7 @@ class GCParAllocate extends Module with GCTopParameters with HWParameters {
     }
     def wakeLockPtr(ptr: UInt, sel: UInt): Unit = {
       lockPtr := ptr
-      wakeUpSel := sel
+      wakeUpSel := sel.resized
       goto(WAKE_LOCK_PTR_IRQ)
     }
     def tryUnlock32(addr: UInt, successState: State, wakeSel: UInt): Unit = {

@@ -422,7 +422,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
         // 128bits 对齐的访问 64bits
         // val casData = Mux(
         //   addr(3),
-        //   Cat(desired.resize(128) << 64, expected.resize(128) << 64),
+        //   Cat((desired.resize(128) << 64).resize(128), (expected.resize(128) << 64).resize(128)),
         //   Cat(desired.resize(128), expected.resize(128))
         // ).asUInt.resize(MMUDataWidth)
         val casData = desired
@@ -431,7 +431,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
           val observed = rd(GCElementWidth - 1 downto 0)
           slotCtx(i).runtime.forwardDecided := True
 
-          // when(observerd === expected) {
+          // when(observed === expected) {
           when(expected === expected) {
             slotCtx(i).runtime.forwardPtr := 0
 
