@@ -288,6 +288,8 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     }
 
     SEND.whenIsActive {
+      copyDoneSeen := False
+
       val isOop = main_data.oopType === U(NotArrayOop)
 
       when(isOop) {
@@ -347,7 +349,7 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
       when(io.Trace2Fetch.fire) {
         val payload = io.Trace2Fetch.payload
 
-        when(mainIsIdle) {
+        when(mainIsIdle && (io.CopyDone || copyDoneSeen)) {
           receiveTask(payload, main_data)
           main_data.fromObj := U(0)
           mainGotoReadOop := True
@@ -401,8 +403,6 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
 
       when(io.PushMreq.Response.fire) {
         val rd = io.PushMreq.Response.payload.ResponseData
-
-        copyDoneSeen := False
 
         when(mainIsIdle) {
           main_data.task    := push_data.task

@@ -51,7 +51,7 @@ class GCArrayProcess extends Module with HWParameters with GCTopParameters with 
   val heapRegionCacheValid = Vec.fill(heapRegionCacheEntries)(RegInit(False))
   val heapRegionCacheReplacePtr = RegInit(U(0, log2Up(heapRegionCacheEntries) bits))
 
-  val heapRegionAddrLookup = (io.ConfigIO.HeapRegionBiasedBase + (destOopPtr >> io.ConfigIO.HeapRegionShiftBy) * U(8)).resize(MMUAddrWidth)
+  val heapRegionAddrLookup = (io.ConfigIO.HeapRegionBiasedBase + ((destOopPtr >> io.ConfigIO.HeapRegionShiftBy) << U(3))).resize(MMUAddrWidth)
   val heapRegionHitVec = Vec.fill(heapRegionCacheEntries)(Bool())
   for (i <- 0 until heapRegionCacheEntries) {
     heapRegionHitVec(i) := heapRegionCacheValid(i) && heapRegionCacheTag(i) === heapRegionAddrLookup

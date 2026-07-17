@@ -95,7 +95,8 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   //   - 已发读请求但响应还没回来
   //   - 响应已经回来但还没写
   //   - 正在拆成 write0/write1 写出的 slot
-  val taskDoneNow = task_valid && (readReqIdx === readBeatCount) && !anySlotBusy && !writeActive
+  val pendingWriteResp = RegInit(U(0, 32 bits))
+  val taskDoneNow = task_valid && (readReqIdx === readBeatCount) && !anySlotBusy && !writeActive && pendingWriteResp === 0
   io.ToCopy.Done := zeroTaskDone || taskDoneNow
 
   when(io.ToCopy.cmd.fire) {
@@ -254,9 +255,10 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   io.writeMReq.Request.payload.NeedResponse := False
   io.writeMReq.Request.payload.NeedDoCmpxChg := False
 
-  val writeFire = io.writeMReq.Request.fire
+  val writeReqFire = io.writeMReq.Request.fire
+  val writeRespFire = io.writeMReq.Response.fire
 
-  when(writeFire) {
+  when(writeReqFire) {
     when(!writeSecond && needWrite1) {
       writeSecond := True
     } otherwise {
@@ -266,6 +268,12 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
       needWrite1 := False
       slotBusy(writeSlot) := False
     }
+  }
+
+  when(writeReqFire && !writeRespFire){
+    pendingWriteResp := pendingWriteResp + 1
+  }.elsewhen(!writeReqFire && writeRespFire) {
+    pendingWriteResp := pendingWriteResp - 1
   }
 
   io.writeMReq.Response.ready := True

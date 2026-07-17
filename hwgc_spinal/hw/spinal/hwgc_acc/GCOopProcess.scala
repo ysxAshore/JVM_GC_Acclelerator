@@ -73,9 +73,9 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     if (DebugEnable) {
       report(Seq("[GCOopProcess<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
     }
-  def regionAttrAddrOf(i: Int): UInt = (io.ConfigIO.RegionAttrBiasedBase + (slotCtx(i).srcOopPtr >> io.ConfigIO.RegionAttrShiftBy) << U(1)).resize(MMUAddrWidth)
-  def destRegionAttrAddrOf(i: Int): UInt = (io.ConfigIO.RegionAttrBiasedBase + (slotCtx(i).destOopPtr >> io.ConfigIO.RegionAttrShiftBy) << U(1)).resize(MMUAddrWidth)
-  def heapRegionLookupAddrOf(i: Int): UInt = (io.ConfigIO.HeapRegionBiasedBase + (slotCtx(i).task >> io.ConfigIO.HeapRegionShiftBy) << U(3)).resize(MMUAddrWidth)
+  def regionAttrAddrOf(i: Int): UInt = (io.ConfigIO.RegionAttrBiasedBase + ((slotCtx(i).srcOopPtr >> io.ConfigIO.RegionAttrShiftBy) << U(1))).resize(MMUAddrWidth)
+  def destRegionAttrAddrOf(i: Int): UInt = (io.ConfigIO.RegionAttrBiasedBase + ((slotCtx(i).destOopPtr >> io.ConfigIO.RegionAttrShiftBy) << U(1))).resize(MMUAddrWidth)
+  def heapRegionLookupAddrOf(i: Int): UInt = (io.ConfigIO.HeapRegionBiasedBase + ((slotCtx(i).task >> io.ConfigIO.HeapRegionShiftBy) << U(3))).resize(MMUAddrWidth)
   def writeBackObjOf(i: Int): UInt = {
     Mux(io.ConfigIO.UseCompressedOop,
       ((slotCtx(i).destOopPtr - io.ConfigIO.CompressedOopBase) >> io.ConfigIO.CompressedOopShift).resize(GCElementWidth),
