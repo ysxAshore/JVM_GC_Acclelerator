@@ -135,13 +135,11 @@ class GCAccTop extends Module with GCTopParameters {
   gcFetch.io.Fetch2OopProcess <> gcOopProcess.io.Fetch2Process
   gcFetch.io.Fetch2ArrayProcess <> gcArrayProcess.io.Fetch2Process
   gcFetch.io.Trace2Fetch <> gcTrace.io.Trace2Fetch
-  gcFetch.io.gcWriteSrcOopPtr <> gcOopCopy2Survivor.io.ToFetch
   gcFetch.io.ConfigIO.UseCompressedOop := CompressedFlag(0)
   gcFetch.io.ConfigIO.CompressedOopBase := CompressedOopBase
   gcFetch.io.ConfigIO.CompressedOopShift := CompressedFlag(15 downto 8)
   gcFetch.io.ConfigIO.UseCompressedKlassPointers := CompressedFlag(1)
   gcFetch.io.DebugTimeStamp := DebugTimeStamp
-  gcFetch.io.CopyDone := gcCopy.io.ToCopy.Done
 
   // GCOopProcess (ToAop)
   gcOopProcess.io.Mreq0 <> gcUnalignedMMUAdapter(4).io.in
@@ -311,6 +309,29 @@ class GCAccTop extends Module with GCTopParameters {
       }
     }
   }
+
+  // Add these connections where GCFetch and GCCopy are instantiated.
+  gcFetch.io.CopyFwdMain <> gcCopy.io.FwdMain
+  gcFetch.io.CopyFwdPush <> gcCopy.io.FwdPush
+  gcFetch.io.CopyFwdPre  <> gcCopy.io.FwdPre
+
+  // Existing compatibility/debug connection may remain.
+  gcFetch.io.CopyDone := gcCopy.io.ToCopy.Done
+
+  gcFetch.io.gcWriteSrcOopPtr.writeForward.valid :=
+    gcOopCopy2Survivor.io.ToFetch.writeForward.valid
+  gcFetch.io.gcWriteSrcOopPtr.writeForward.payload :=
+    gcOopCopy2Survivor.io.ToFetch.writeForward.payload
+
+  gcOopProcess.io.gcWriteSrcOopPtr.writeForward.valid :=
+    gcOopCopy2Survivor.io.ToFetch.writeForward.valid
+  gcOopProcess.io.gcWriteSrcOopPtr.writeForward.payload :=
+    gcOopCopy2Survivor.io.ToFetch.writeForward.payload
+
+  gcArrayProcess.io.gcWriteSrcOopPtr.writeForward.valid :=
+    gcOopCopy2Survivor.io.ToFetch.writeForward.valid
+  gcArrayProcess.io.gcWriteSrcOopPtr.writeForward.payload :=
+    gcOopCopy2Survivor.io.ToFetch.writeForward.payload
 }
 
 object GCAccTopVerilog extends App{

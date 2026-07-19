@@ -35,7 +35,15 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     val toFetch            = slave(new GCToFetch)
     val gcWriteSrcOopPtr   = slave(new GCWriteSrcOopPtr) // srcOopPtr updated MarkWord forward Path
     val Trace2Fetch        = slave Stream UInt(GCElementWidth bits) // LastPush forward Path
-    val CopyDone           = in Bool() // 在CopyDone之后Push的才可以读，以确保读到的是新数据
+    val CopyDone           = in Bool() // 保留为调试/兼容信号，正确性由 Copy forwarding 接口保证
+
+    // Copy store-buffer forwarding ports. A request may be:
+    //   1. fully forwarded (mask covers all requested bytes),
+    //   2. partially forwarded and merged with the MMU response,
+    //   3. stalled when bytes overlap the active copy but data has not returned yet.
+    val CopyFwdMain        = master(GCCopyForwardPort())
+    val CopyFwdPush        = master(GCCopyForwardPort())
+    val CopyFwdPre         = master(GCCopyForwardPort())
 
     val Fetch2ArrayProcess = master(new GCToProcessUnit)
     val Fetch2OopProcess   = master(new GCToProcessUnit)
@@ -62,6 +70,33 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     m.Request.payload.RequestVirtualAddr  := addr
   }
 
+  def driveCopyFwd(port: GCCopyForwardPort, addr: UInt, sizeBytes: UInt): Unit = {
+    port.valid := True
+    port.addr  := addr.resize(MMUAddrWidth)
+    port.size  := sizeBytes.resize(LineBytesNumBitSize)
+  }
+
+  def requestedByteMask(sizeBytes: UInt): Bits = {
+    val ret = Bits(LineBytesNum bits)
+    for (i <- 0 until LineBytesNum) {
+      ret(i) := U(i, LineBytesNumBitSize bits) < sizeBytes.resize(LineBytesNumBitSize)
+    }
+    ret
+  }
+
+  def byteMaskToBits(mask: Bits): Bits = {
+    val ret = Bits(MMUDataWidth bits)
+    for (i <- 0 until LineBytesNum) {
+      ret(i * 8 + 7 downto i * 8) := Mux(mask(i), B"8'xFF", B"8'x00")
+    }
+    ret
+  }
+
+  def mergeCopyForward(memoryData: UInt, fwdMask: Bits, fwdData: UInt): UInt = {
+    val bitMask = byteMaskToBits(fwdMask)
+    ((memoryData.asBits & ~bitMask) | (fwdData.asBits & bitMask)).asUInt
+  }
+
   clearMreq(io.MainMreq)
   clearMreq(io.PushMreq)
   clearMreq(io.PreMreq)
@@ -69,6 +104,16 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
   io.toFetch.Pop.ready    := False
   io.toFetch.PrePop.ready := False
   io.Trace2Fetch.ready    := False
+
+  def clearCopyFwd(port: GCCopyForwardPort): Unit = {
+    port.valid := False
+    port.addr  := 0
+    port.size  := 0
+  }
+
+  clearCopyFwd(io.CopyFwdMain)
+  clearCopyFwd(io.CopyFwdPush)
+  clearCopyFwd(io.CopyFwdPre)
 
   io.Fetch2ArrayProcess.clearOut()
   io.Fetch2OopProcess.clearOut()
@@ -103,12 +148,12 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
   def dbg(msg: Seq[Any]): Unit =
     if (DebugEnable) report(Seq("[GCFetch<", io.DebugTimeStamp, ">] ") ++ msg ++ Seq("\n"))
 
-  def driveProcessUnit(target: GCToProcessUnit, payload: GcFetchData): Unit = {
+  def driveProcessUnit(target: GCToProcessUnit, payload: GcFetchData, effectiveMarkWord: UInt): Unit = {
     target.cmd.valid             := True
     target.cmd.payload.Task      := payload.task
     target.cmd.payload.OopType   := payload.oopType
     target.cmd.payload.SrcOopPtr := payload.fromObj
-    target.cmd.payload.MarkWord  := payload.markWord
+    target.cmd.payload.MarkWord  := effectiveMarkWord
     target.cmd.payload.KlassPtr  := payload.klassPtr
     target.cmd.payload.SrcLength := payload.srcLength
   }
@@ -119,10 +164,19 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
   val main_data = RegInit(GcFetchData().getZero)
   val push_data = RegInit(GcFetchData().getZero)
 
+  // Forwarding information is sampled when an MMU read request fires and is
+  // merged into the corresponding response. Each Fetch pipeline has at most
+  // one outstanding MMU read, so one register pair per pipeline is sufficient.
+  val mainFwdMask = RegInit(B(0, LineBytesNum bits))
+  val mainFwdData = RegInit(U(0, MMUDataWidth bits))
+  val pushFwdMask = RegInit(B(0, LineBytesNum bits))
+  val pushFwdData = RegInit(U(0, MMUDataWidth bits))
+  val preFwdMask  = RegInit(B(0, LineBytesNum bits))
+  val preFwdData  = RegInit(U(0, MMUDataWidth bits))
+
   // PreFetch ring buffer
-  val preBuf      = Vec.fill(PreFetchBufferNum)(RegInit(GcFetchData().getZero))
-  val preBufDone  = Vec.fill(PreFetchBufferNum)(RegInit(False))
-  val preBufMwHit = Vec.fill(PreFetchBufferNum)(RegInit(False))
+  val preBuf     = Vec.fill(PreFetchBufferNum)(RegInit(GcFetchData().getZero))
+  val preBufDone = Vec.fill(PreFetchBufferNum)(RegInit(False))
 
   val buf_top    = RegInit(U(0, PreFetchBufferWidth bits))
   val buf_bottom = RegInit(U(0, PreFetchBufferWidth bits))
@@ -141,8 +195,7 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
   def bufDec(ptr: UInt, step: UInt): UInt = WrapDec(ptr, PreFetchBufferNum, step).resize(PreFetchBufferWidth)
 
   def resetSlot(idx: UInt): Unit = {
-    preBufDone(idx)  := False
-    preBufMwHit(idx) := False
+    preBufDone(idx) := False
   }
 
   val mainIsIdle     = Bool()
@@ -167,30 +220,74 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     targetDoneSeen := True
   }
 
-  val copyDoneSeen = RegInit(False)
-  when(io.CopyDone) {
-    copyDoneSeen := True
-  }
-
   // mainFsm 弹出了一个任务，该任务的 PreFetch 条目存在但尚未完成 在这种情况下，mainFsm 会等待 preFsm 完成该 buf_bottom 槽位
   val waitForPrefetch = RegInit(False)
 
-  // MarkWord forwarding
-  val fwdValid = RegInit(False)
-  val fwdObj   = RegInit(U(0, preBuf(0).fromObj.getWidth bits))
-  val fwdValue = RegInit(U(0, GCElementWidth bits))
+  // ============================================================================
+  // MarkWord forwarding cache
+  //
+  // Copy2Survivor 可能在 Fetch 已经读出旧 MarkWord 后才安装 forwarding
+  // MarkWord。原来的单项记录会被后续对象覆盖，因此这里使用小型全相联缓存。
+  // 容量覆盖 prefetch buffer、main 和 push 的活动上下文。
+  //
+  // 查询优先级：
+  //   1. 本周期 writeForward（解决 writeForward 与 SEND 同周期）
+  //   2. forwarding cache
+  //   3. Fetch 原先读回的 MarkWord
+  // ============================================================================
+  val ForwardCacheEntries = 1 << log2Up(PreFetchBufferNum + 4)
+  val fwdCacheValid = Vec.fill(ForwardCacheEntries)(RegInit(False))
+  val fwdCacheObj   = Vec.fill(ForwardCacheEntries)(RegInit(U(0, GCElementWidth bits)))
+  val fwdCacheValue = Vec.fill(ForwardCacheEntries)(RegInit(U(0, GCElementWidth bits)))
+  val fwdCacheReplacePtr = RegInit(U(0, log2Up(ForwardCacheEntries) bits))
 
-  when(io.gcWriteSrcOopPtr.writeForward.valid) {
-    fwdValid := True
-    fwdObj   := io.gcWriteSrcOopPtr.writeForward.payload.srcOopPtr
-    fwdValue := io.gcWriteSrcOopPtr.writeForward.payload.writeValue
+  val incomingFwdValid = io.gcWriteSrcOopPtr.writeForward.valid
+  val incomingFwdObj   = io.gcWriteSrcOopPtr.writeForward.payload.srcOopPtr
+  val incomingFwdValue = io.gcWriteSrcOopPtr.writeForward.payload.writeValue
+
+  val incomingFwdHitVec = Bits(ForwardCacheEntries bits)
+  for (i <- 0 until ForwardCacheEntries) {
+    incomingFwdHitVec(i) := fwdCacheValid(i) && fwdCacheObj(i) === incomingFwdObj
+  }
+  val incomingFwdHit      = incomingFwdHitVec.orR
+  val incomingFwdHitIndex = OHToUInt(incomingFwdHitVec)
+
+  when(incomingFwdValid) {
+    when(incomingFwdHit) {
+      fwdCacheValue(incomingFwdHitIndex) := incomingFwdValue
+    } otherwise {
+      fwdCacheValid(fwdCacheReplacePtr) := True
+      fwdCacheObj(fwdCacheReplacePtr)   := incomingFwdObj
+      fwdCacheValue(fwdCacheReplacePtr) := incomingFwdValue
+      fwdCacheReplacePtr := fwdCacheReplacePtr + U(1, fwdCacheReplacePtr.getWidth bits)
+    }
+  }.elsewhen(mainIsIdle && pushIsIdle &&
+    buf_count === U(0, buf_count.getWidth bits) && !waitForPrefetch) {
+    // 没有任何已经读取但尚未消费的 Fetch 上下文时，旧 forwarding
+    // 条目不再承担 RAW 修复职责，可以安全清空，也避免跨 GC 地址复用。
+    for (i <- 0 until ForwardCacheEntries) {
+      fwdCacheValid(i) := False
+    }
+    fwdCacheReplacePtr := 0
   }
 
-  for (i <- 0 until PreFetchBufferNum) {
-    when(io.gcWriteSrcOopPtr.writeForward.valid && preBufDone(i) && preBuf(i).fromObj === io.gcWriteSrcOopPtr.writeForward.payload.srcOopPtr) {
-      preBuf(i).markWord := io.gcWriteSrcOopPtr.writeForward.payload.writeValue
-      preBufMwHit(i)     := True
+  def resolveForwardMark(obj: UInt, fallback: UInt): UInt = {
+    val resolved = UInt(GCElementWidth bits)
+    resolved := fallback
+
+    // Cache 命中覆盖旧的内存读回值。
+    for (i <- 0 until ForwardCacheEntries) {
+      when(fwdCacheValid(i) && fwdCacheObj(i) === obj) {
+        resolved := fwdCacheValue(i)
+      }
     }
+
+    // 同周期 forwarding 的优先级最高。
+    when(incomingFwdValid && incomingFwdObj === obj) {
+      resolved := incomingFwdValue
+    }
+
+    resolved
   }
 
   // Main StateMachine
@@ -251,10 +348,24 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
         main_data.fromObj := main_data.task
         goto(READ_MW_REQ)
       }.otherwise {
-        driveReadReq(io.MainMreq, main_data.task, oopReadSize)
+        driveCopyFwd(io.CopyFwdMain, main_data.task, oopReadSize)
 
-        when(io.MainMreq.Request.fire) {
-          goto(READ_OOP_RESP)
+        val reqMask = requestedByteMask(oopReadSize)
+        val fullFwd = (io.CopyFwdMain.mask & reqMask) === reqMask
+
+        when(!io.CopyFwdMain.stall) {
+          when(fullFwd) {
+            main_data.fromObj := decodeReadOopResp(io.CopyFwdMain.data)
+            goto(READ_MW_REQ)
+          }.otherwise {
+            driveReadReq(io.MainMreq, main_data.task, oopReadSize)
+
+            when(io.MainMreq.Request.fire) {
+              mainFwdMask := io.CopyFwdMain.mask
+              mainFwdData := io.CopyFwdMain.data
+              goto(READ_OOP_RESP)
+            }
+          }
         }
       }
     }
@@ -263,17 +374,31 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
       io.MainMreq.Response.ready := True
 
       when(io.MainMreq.Response.fire) {
-        val rd = io.MainMreq.Response.payload.ResponseData
+        val rd = mergeCopyForward(io.MainMreq.Response.payload.ResponseData, mainFwdMask, mainFwdData)
         main_data.fromObj := decodeReadOopResp(rd)
         goto(READ_MW_REQ)
       }
     }
 
     READ_MW_REQ.whenIsActive {
-      driveReadReq(io.MainMreq, main_data.fromObj, mwReadSize)
+      driveCopyFwd(io.CopyFwdMain, main_data.fromObj, mwReadSize)
 
-      when(io.MainMreq.Request.fire) {
-        goto(READ_MW_RESP)
+      val reqMask = requestedByteMask(mwReadSize)
+      val fullFwd = (io.CopyFwdMain.mask & reqMask) === reqMask
+
+      when(!io.CopyFwdMain.stall) {
+        when(fullFwd) {
+          fillMwKlassLen(io.CopyFwdMain.data, main_data)
+          goto(SEND)
+        }.otherwise {
+          driveReadReq(io.MainMreq, main_data.fromObj, mwReadSize)
+
+          when(io.MainMreq.Request.fire) {
+            mainFwdMask := io.CopyFwdMain.mask
+            mainFwdData := io.CopyFwdMain.data
+            goto(READ_MW_RESP)
+          }
+        }
       }
     }
 
@@ -281,21 +406,23 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
       io.MainMreq.Response.ready := True
 
       when(io.MainMreq.Response.fire) {
-        val rd = io.MainMreq.Response.payload.ResponseData
+        val rd = mergeCopyForward(io.MainMreq.Response.payload.ResponseData, mainFwdMask, mainFwdData)
         fillMwKlassLen(rd, main_data)
         goto(SEND)
       }
     }
 
     SEND.whenIsActive {
-      copyDoneSeen := False
-
       val isOop = main_data.oopType === U(NotArrayOop)
 
+      // 最终消费边界再次查询 forwarding，解决 MarkWord 已经被 Fetch
+      // 读入 main_data、随后 Copy2Survivor 才更新它的 RAW。
+      val dispatchMarkWord = resolveForwardMark(main_data.fromObj, main_data.markWord)
+
       when(isOop) {
-        driveProcessUnit(io.Fetch2OopProcess, main_data)
+        driveProcessUnit(io.Fetch2OopProcess, main_data, dispatchMarkWord)
       }.otherwise {
-        driveProcessUnit(io.Fetch2ArrayProcess, main_data)
+        driveProcessUnit(io.Fetch2ArrayProcess, main_data, dispatchMarkWord)
       }
 
       val unitFire = Mux(isOop, io.Fetch2OopProcess.cmd.fire, io.Fetch2ArrayProcess.cmd.fire)
@@ -306,7 +433,7 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
           "Dispatch Task=", main_data.task,
           " OopType=", main_data.oopType,
           " SrcOopPtr=", main_data.fromObj,
-          " MarkWord=", main_data.markWord,
+          " MarkWord=", dispatchMarkWord,
           " KlassPtr=", main_data.klassPtr,
           " success!"
         ))
@@ -341,15 +468,13 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
     val READ_MW_RESP  = new State
     val SEND          = new State
 
-    def pushYieldOk: Bool = main_data.oopType === U(PartialArrayOop) || io.CopyDone || copyDoneSeen
-
     IDLE.whenIsActive {
       io.Trace2Fetch.ready := True
 
       when(io.Trace2Fetch.fire) {
         val payload = io.Trace2Fetch.payload
 
-        when(mainIsIdle && (io.CopyDone || copyDoneSeen)) {
+        when(mainIsIdle) {
           receiveTask(payload, main_data)
           main_data.fromObj := U(0)
           mainGotoReadOop := True
@@ -368,11 +493,23 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
         goto(READ_MW_REQ)
 
       }.otherwise {
-        when(pushYieldOk) { // Push状态机在等待CopyDone时不发起OOP读取请求 and main_data is PartialArrayOop 不需要复制
-          driveReadReq(io.PushMreq, push_data.task, oopReadSize)
+        driveCopyFwd(io.CopyFwdPush, push_data.task, oopReadSize)
 
-          when(io.PushMreq.Request.fire) {
-            goto(READ_OOP_RESP)
+        val reqMask = requestedByteMask(oopReadSize)
+        val fullFwd = (io.CopyFwdPush.mask & reqMask) === reqMask
+
+        when(!io.CopyFwdPush.stall) {
+          when(fullFwd) {
+            push_data.fromObj := decodeReadOopResp(io.CopyFwdPush.data)
+            goto(READ_MW_REQ)
+          }.otherwise {
+            driveReadReq(io.PushMreq, push_data.task, oopReadSize)
+
+            when(io.PushMreq.Request.fire) {
+              pushFwdMask := io.CopyFwdPush.mask
+              pushFwdData := io.CopyFwdPush.data
+              goto(READ_OOP_RESP)
+            }
           }
         }
       }
@@ -382,18 +519,39 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
       io.PushMreq.Response.ready := True
 
       when(io.PushMreq.Response.fire) {
-        val rd = io.PushMreq.Response.payload.ResponseData
+        val rd = mergeCopyForward(io.PushMreq.Response.payload.ResponseData, pushFwdMask, pushFwdData)
         push_data.fromObj := decodeReadOopResp(rd)
         goto(READ_MW_REQ)
       }
     }
 
     READ_MW_REQ.whenIsActive {
-      when(pushYieldOk) {
-        driveReadReq(io.PushMreq, push_data.fromObj, mwReadSize)
+      driveCopyFwd(io.CopyFwdPush, push_data.fromObj, mwReadSize)
 
-        when(io.PushMreq.Request.fire) {
-          goto(READ_MW_RESP)
+      val reqMask = requestedByteMask(mwReadSize)
+      val fullFwd = (io.CopyFwdPush.mask & reqMask) === reqMask
+
+      when(!io.CopyFwdPush.stall) {
+        when(fullFwd) {
+          when(mainIsIdle) {
+            main_data.task    := push_data.task
+            main_data.oopType := push_data.oopType
+            main_data.fromObj := push_data.fromObj
+            fillMwKlassLen(io.CopyFwdPush.data, main_data)
+            mainGotoSend := True
+            goto(IDLE)
+          }.otherwise {
+            fillMwKlassLen(io.CopyFwdPush.data, push_data)
+            goto(SEND)
+          }
+        }.otherwise {
+          driveReadReq(io.PushMreq, push_data.fromObj, mwReadSize)
+
+          when(io.PushMreq.Request.fire) {
+            pushFwdMask := io.CopyFwdPush.mask
+            pushFwdData := io.CopyFwdPush.data
+            goto(READ_MW_RESP)
+          }
         }
       }
     }
@@ -402,7 +560,7 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
       io.PushMreq.Response.ready := True
 
       when(io.PushMreq.Response.fire) {
-        val rd = io.PushMreq.Response.payload.ResponseData
+        val rd = mergeCopyForward(io.PushMreq.Response.payload.ResponseData, pushFwdMask, pushFwdData)
 
         when(mainIsIdle) {
           main_data.task    := push_data.task
@@ -522,10 +680,28 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
         goto(READ_MW_REQ)
 
       }.otherwise {
-        driveReadReq(io.PreMreq, preBuf(buf_work).task, oopReadSize)
+        driveCopyFwd(io.CopyFwdPre, preBuf(buf_work).task, oopReadSize)
 
-        when(io.PreMreq.Request.fire) {
-          goto(READ_OOP_RESP)
+        val reqMask = requestedByteMask(oopReadSize)
+        val fullFwd = (io.CopyFwdPre.mask & reqMask) === reqMask
+
+        when(!io.CopyFwdPre.stall) {
+          when(fullFwd) {
+            val newFromObj = decodeReadOopResp(io.CopyFwdPre.data)
+            preBuf(buf_work).fromObj := newFromObj
+
+            // 如果 forwarding 与 OopPtr 读取交错，后续 READ_MW 和最终
+            // SEND 会通过 forwarding cache 再次解析。
+            goto(READ_MW_REQ)
+          }.otherwise {
+            driveReadReq(io.PreMreq, preBuf(buf_work).task, oopReadSize)
+
+            when(io.PreMreq.Request.fire) {
+              preFwdMask := io.CopyFwdPre.mask
+              preFwdData := io.CopyFwdPre.data
+              goto(READ_OOP_RESP)
+            }
+          }
         }
       }
     }
@@ -534,26 +710,76 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
       io.PreMreq.Response.ready := True
 
       when(io.PreMreq.Response.fire) {
-        val rd = io.PreMreq.Response.payload.ResponseData
+        val rd = mergeCopyForward(io.PreMreq.Response.payload.ResponseData, preFwdMask, preFwdData)
         val newFromObj = decodeReadOopResp(rd)
 
         preBuf(buf_work).fromObj := newFromObj
 
-        when(fwdValid && fwdObj === newFromObj) {
-          preBuf(buf_work).markWord := fwdValue
-          preBufMwHit(buf_work)     := True
-          fwdValid := False
-        }
-
+        // forwarding cache 保留可能晚于该 OopPtr 读取到达的更新。
         goto(READ_MW_REQ)
       }
     }
 
     READ_MW_REQ.whenIsActive {
-      driveReadReq(io.PreMreq, preBuf(buf_work).fromObj, mwReadSize)
+      driveCopyFwd(io.CopyFwdPre, preBuf(buf_work).fromObj, mwReadSize)
 
-      when(io.PreMreq.Request.fire) {
-        goto(READ_MW_RESP)
+      val reqMask = requestedByteMask(mwReadSize)
+      val fullFwd = (io.CopyFwdPre.mask & reqMask) === reqMask
+
+      when(!io.CopyFwdPre.stall) {
+        when(fullFwd) {
+          val rd = io.CopyFwdPre.data
+          val currentFromObj = preBuf(buf_work).fromObj
+
+          val finalMw = resolveForwardMark(
+            currentFromObj,
+            rd(GCElementWidth - 1 downto 0)
+          )
+
+          when(waitForPrefetch && mainIsIdle && buf_work === buf_bottom) {
+            waitForPrefetch := False
+
+            main_data.task     := preBuf(buf_bottom).task
+            main_data.oopType  := preBuf(buf_bottom).oopType
+            main_data.fromObj  := preBuf(buf_bottom).fromObj
+            main_data.markWord := finalMw
+            main_data.klassPtr := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+
+            main_data.srcLength := Mux(
+              io.ConfigIO.UseCompressedKlassPointers,
+              rd(GCElementWidth * 2 - 1 downto GCElementWidth + 32),
+              rd(GCElementWidth * 2 + 31 downto GCElementWidth * 2)
+            )
+
+            mainGotoSend := True
+
+            resetSlot(buf_bottom)
+            buf_bottom := bufInc(buf_bottom, U(1, PreFetchBufferWidth bits))
+            buf_count  := buf_count - U(1, buf_count.getWidth bits)
+
+          }.otherwise {
+            preBuf(buf_work).markWord := finalMw
+            preBuf(buf_work).klassPtr := rd(GCElementWidth * 2 - 1 downto GCElementWidth)
+
+            preBuf(buf_work).srcLength := Mux(
+              io.ConfigIO.UseCompressedKlassPointers,
+              rd(GCElementWidth * 2 - 1 downto GCElementWidth + 32),
+              rd(GCElementWidth * 2 + 31 downto GCElementWidth * 2)
+            )
+
+            preBufDone(buf_work) := True
+          }
+
+          goto(IDLE)
+        }.otherwise {
+          driveReadReq(io.PreMreq, preBuf(buf_work).fromObj, mwReadSize)
+
+          when(io.PreMreq.Request.fire) {
+            preFwdMask := io.CopyFwdPre.mask
+            preFwdData := io.CopyFwdPre.data
+            goto(READ_MW_RESP)
+          }
+        }
       }
     }
 
@@ -561,25 +787,13 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
       io.PreMreq.Response.ready := True
 
       when(io.PreMreq.Response.fire) {
-        val rd = io.PreMreq.Response.payload.ResponseData
+        val rd = mergeCopyForward(io.PreMreq.Response.payload.ResponseData, preFwdMask, preFwdData)
         val currentFromObj = preBuf(buf_work).fromObj
 
-        val hitFwdNow = (fwdValid && currentFromObj === fwdObj) ||
-          (io.gcWriteSrcOopPtr.writeForward.valid && currentFromObj === io.gcWriteSrcOopPtr.writeForward.payload.srcOopPtr)
-
-        val finalMw = UInt(GCElementWidth bits)
-        finalMw := rd(GCElementWidth - 1 downto 0)
-
-        when(hitFwdNow) {
-          when(io.gcWriteSrcOopPtr.writeForward.valid) {
-            finalMw := io.gcWriteSrcOopPtr.writeForward.payload.writeValue
-          }.otherwise {
-            finalMw := fwdValue
-            fwdValid := False
-          }
-        }.elsewhen(preBufMwHit(buf_work)) {
-          finalMw := preBuf(buf_work).markWord
-        }
+        val finalMw = resolveForwardMark(
+          currentFromObj,
+          rd(GCElementWidth - 1 downto 0)
+        )
 
         when(waitForPrefetch && mainIsIdle && buf_work === buf_bottom) {
           // The main pipeline is waiting for exactly this prefetch entry.
@@ -618,6 +832,29 @@ class GCFetch extends Module with HWParameters with GCTopParameters with GCParam
         }
 
         goto(IDLE)
+      }
+    }
+  }
+
+  // ============================================================================
+  // Patch values that were already materialized in Fetch registers.
+  //
+  // 该块放在 FSM 赋值之后，使同周期旧 MMU 响应不能覆盖 forwarding 通知。
+  // SEND 仍执行 resolveForwardMark()，因此 forwarding 与 dispatch 同周期
+  // 的情况也被覆盖。
+  // ============================================================================
+  when(incomingFwdValid) {
+    when(main_data.fromObj === incomingFwdObj) {
+      main_data.markWord := incomingFwdValue
+    }
+
+    when(push_data.fromObj === incomingFwdObj) {
+      push_data.markWord := incomingFwdValue
+    }
+
+    for (i <- 0 until PreFetchBufferNum) {
+      when(preBufDone(i) && preBuf(i).fromObj === incomingFwdObj) {
+        preBuf(i).markWord := incomingFwdValue
       }
     }
   }

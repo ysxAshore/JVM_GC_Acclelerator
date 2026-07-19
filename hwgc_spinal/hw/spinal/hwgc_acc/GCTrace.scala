@@ -132,8 +132,8 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
   val regionAttrCache = Vec(Reg(UInt(16 bits)) init 0, RegionAttrCacheEntries)
   val regionAttrCacheReplacePtr = RegInit(U(0, RegionAttrCacheIndexWidth bits))
   val decodedRawHeapOop = Mux(io.ConfigIO.UseCompressedOops,
-      (io.ConfigIO.CompressedOopBase + (rawHeapOop << io.ConfigIO.CompressedOopShift)).resize(GCElementWidth),
-      rawHeapOop
+    (io.ConfigIO.CompressedOopBase + (rawHeapOop << io.ConfigIO.CompressedOopShift)).resize(GCElementWidth),
+    rawHeapOop
   )
   val regionAttrAddrLookup = (io.ConfigIO.RegionAttrBiasedBase + ((decodedRawHeapOop >> io.ConfigIO.RegionAttrShiftBy) << 1)).resize(MMUAddrWidth)
   val regionAttrHitVec = Vec(Bool(), RegionAttrCacheEntries)
@@ -206,9 +206,9 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
       }
     }
 
-     // Consume one element from a 32-byte read window.
-     // remainCount includes the current element when READ_OOP is active.
-     // Therefore it is decremented here, when the element is actually consumed.
+    // Consume one element from a 32-byte read window.
+    // remainCount includes the current element when READ_OOP is active.
+    // Therefore it is decremented here, when the element is actually consumed.
     def consumeWindow(base: UInt, data: UInt): Unit = {
       when(io.ConfigIO.UseCompressedOops) {
         val index = ((src - base) >> 2).resize(3 bits)
@@ -300,22 +300,22 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
         goto(DISPATCH)
 
         dbg(Seq("Receive GCTrace Task",
-            ", RegionAttrBase = ", io.ConfigIO.RegionAttrBase,
-            ", RegionAttrShiftBy = ", io.ConfigIO.RegionAttrShiftBy,
-            ", RegionAttrBiasedBase = ", io.ConfigIO.RegionAttrBiasedBase,
-            ", HeapRegionBias = ", io.ConfigIO.HeapRegionBias,
-            ", HeapRegionShiftBy = ", io.ConfigIO.HeapRegionShiftBy,
-            ", LogOfHRGrainBytes = ", io.ConfigIO.LogOfHRGrainBytes,
-            ", OopType = ", io.ToTrace.cmd.payload.OopType,
-            ", KlassPtr = ", io.ToTrace.cmd.payload.KlassPtr,
-            ", SrcOopPtr = ", io.ToTrace.cmd.payload.SrcOopPtr,
-            ", DestOopPtr = ", io.ToTrace.cmd.payload.DestOopPtr,
-            ", Kid = ", io.ToTrace.cmd.payload.Kid,
-            ", ArrayLength = ", io.ToTrace.cmd.payload.ArrayLength,
-            ", PartialArrayStart = ", io.ToTrace.cmd.payload.PartialArrayStart,
-            ", StepIndex = ", io.ToTrace.cmd.payload.StepIndex,
-            ", StepNCreate = ", io.ToTrace.cmd.payload.StepNCreate
-          )
+          ", RegionAttrBase = ", io.ConfigIO.RegionAttrBase,
+          ", RegionAttrShiftBy = ", io.ConfigIO.RegionAttrShiftBy,
+          ", RegionAttrBiasedBase = ", io.ConfigIO.RegionAttrBiasedBase,
+          ", HeapRegionBias = ", io.ConfigIO.HeapRegionBias,
+          ", HeapRegionShiftBy = ", io.ConfigIO.HeapRegionShiftBy,
+          ", LogOfHRGrainBytes = ", io.ConfigIO.LogOfHRGrainBytes,
+          ", OopType = ", io.ToTrace.cmd.payload.OopType,
+          ", KlassPtr = ", io.ToTrace.cmd.payload.KlassPtr,
+          ", SrcOopPtr = ", io.ToTrace.cmd.payload.SrcOopPtr,
+          ", DestOopPtr = ", io.ToTrace.cmd.payload.DestOopPtr,
+          ", Kid = ", io.ToTrace.cmd.payload.Kid,
+          ", ArrayLength = ", io.ToTrace.cmd.payload.ArrayLength,
+          ", PartialArrayStart = ", io.ToTrace.cmd.payload.PartialArrayStart,
+          ", StepIndex = ", io.ToTrace.cmd.payload.StepIndex,
+          ", StepNCreate = ", io.ToTrace.cmd.payload.StepNCreate
+        )
         )
       }
     }
@@ -435,14 +435,14 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
           remainCount := mirrorCount.resize(32)
         }
       } elsewhen (Kid === U(InstanceRefKlassID)) {
-         // index 0 -> discovered index 1 -> referent index 2 -> discovered
+        // index 0 -> discovered index 1 -> referent index 2 -> discovered
         when(refFieldIndex === U(3)) {
           refFieldIndex := U(0)
           goto(FINISH)
         } otherwise {
           val discoveredOffset = Mux(io.ConfigIO.UseCompressedOops && io.ConfigIO.UseCompressedKlassPointers,
-              U"x18",
-              Mux(io.ConfigIO.UseCompressedKlassPointers, U"x1c", U"x28"))
+            U"x18",
+            Mux(io.ConfigIO.UseCompressedKlassPointers, U"x1c", U"x28"))
           val referentOffset = Mux(io.ConfigIO.UseCompressedOops && io.ConfigIO.UseCompressedKlassPointers, U"xc", U"x10")
           val fieldOffset = Mux(refFieldIndex === U(1), referentOffset, discoveredOffset)
 

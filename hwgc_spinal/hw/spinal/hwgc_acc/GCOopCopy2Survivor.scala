@@ -431,8 +431,8 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
           val observed = rd(GCElementWidth - 1 downto 0)
           slotCtx(i).runtime.forwardDecided := True
 
-          // when(observed === expected) {
           when(expected === expected) {
+          //when(observed === expected) {
             slotCtx(i).runtime.forwardPtr := 0
 
             toFetchPending(i) := True
@@ -870,9 +870,9 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
     val myIdx = slotCtx(i).runtime.plabTargetIdx
 
     val samePlabBuffer = slotValid(other) && slotCtx(other).runtime.usingPlabCacheBuffer &&
-        plabCacheValid(myIdx) && slotCtx(other).runtime.plabBuffer === plabCacheBuffer(myIdx)
+      plabCacheValid(myIdx) && slotCtx(other).runtime.plabBuffer === plabCacheBuffer(myIdx)
     val otherNeedBlock = slotValid(other) && slotCtx(other).runtime.afterAllocCache &&
-        samePlabBuffer && (!slotCtx(other).runtime.forwardDecided || slotCtx(other).runtime.forwardPtr =/= U(0, GCElementWidth bits))
+      samePlabBuffer && (!slotCtx(other).runtime.forwardDecided || slotCtx(other).runtime.forwardPtr =/= U(0, GCElementWidth bits))
 
     // 同 idx 被另一个 slot lock 时，当前 slot 必须阻塞
     val sameIdxLockedByOther = plabOpBusy(myIdx) && plabOpOwner(myIdx) =/= U(i, 1 bits)
@@ -924,7 +924,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   for (i <- 0 until 2) {
     val idx = slotCtx(i).runtime.plabTargetIdx
     slotPlabAllocGrant(i) := slotPlabSelectGrant(i) && plabCacheValid(idx) &&
-        plabEnough(i, idx) && !slotAllocCacheHazard(i)
+      plabEnough(i, idx) && !slotAllocCacheHazard(i)
   }
 
   // PLAB refill request generation
@@ -934,7 +934,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
     val idx = slotCtx(i).runtime.plabTargetIdx
 
     plabRefillReq(i) := slotValid(i) && slotIsPlabSelect(i) && slotPlabSelectGrant(i) &&
-        !plabCacheValid(idx) && !plabRefillBusy(idx) && plabFreeOrMine(i, idx)
+      !plabCacheValid(idx) && !plabRefillBusy(idx) && plabFreeOrMine(i, idx)
   }
 
   // Shared cache fill: klass cache
@@ -1171,7 +1171,7 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   for (i <- 0 until 2) {
     val idx = slotCtx(i).runtime.plabTargetIdx
     wantAlloc(i) := slotValid(i) && slotIsAllocCache(i) &&
-        !slotCtx(i).runtime.allocIssued && !slotAllocCacheHazard(i) && ownsPlab(i, idx)
+      !slotCtx(i).runtime.allocIssued && !slotAllocCacheHazard(i) && ownsPlab(i, idx)
   }
 
   when(!allocBusy) {

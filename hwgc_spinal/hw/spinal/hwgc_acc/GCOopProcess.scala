@@ -31,6 +31,7 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
 
     val Process2Aop          = master(new GCToAop)
     val Fetch2Process        = slave(new GCToProcessUnit)
+    val gcWriteSrcOopPtr     = slave(new GCWriteSrcOopPtr)
     val Process2CopySurvivor = master(new GCToSurvivor)
 
     val ConfigIO             = slave(new GCOopProcessConfigIO)
@@ -54,6 +55,33 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   // slot 状态 放前面 不然 会报错NullPointer
   val slotValid = Vec.fill(2)(RegInit(False))
   val slotCtx   = Vec.fill(2)(Reg(SlotCtx()) init SlotCtx().getZero)
+
+  // Copy2Survivor 安装 forwarding MarkWord 后，将更新广播到仍在
+  // OopProcess 中、但尚未真正送入 Copy2Survivor 的任务。
+  val incomingFwdValid = io.gcWriteSrcOopPtr.writeForward.valid
+  val incomingFwdObj   = io.gcWriteSrcOopPtr.writeForward.payload.srcOopPtr
+  val incomingFwdValue = io.gcWriteSrcOopPtr.writeForward.payload.writeValue
+
+  def isForwardedMark(mark: UInt): Bool =
+    (mark & U(3, GCElementWidth bits)) === U(3, GCElementWidth bits)
+
+  val slotLiveFwdHit       = Vec.fill(2)(Bool())
+  val slotEffectiveMarkWord = Vec.fill(2)(UInt(GCElementWidth bits))
+
+  for (i <- 0 until 2) {
+    slotLiveFwdHit(i) :=
+      incomingFwdValid &&
+        slotValid(i) &&
+        slotCtx(i).srcOopPtr === incomingFwdObj
+
+    // 本周期 forwarding 直接覆盖寄存器中的旧 MarkWord，解决
+    // forwarding 与 DECIDE/COPY_SURV_REQ 同周期的 RAW。
+    slotEffectiveMarkWord(i) := Mux(
+      slotLiveFwdHit(i),
+      incomingFwdValue,
+      slotCtx(i).markWord
+    )
+  }
 
   val slotStart           = Vec.fill(2)(Bool())
   val slotGotoIdle        = Vec.fill(2)(Bool())
@@ -96,10 +124,18 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     slotCopy2SurvivorBypassGranted(i) := False
   }
   def allocToSlot(i: Int): Unit = {
+    val allocFwdHit =
+      incomingFwdValid &&
+        io.Fetch2Process.cmd.payload.SrcOopPtr === incomingFwdObj
+
     slotValid(i) := True
 
-    slotCtx(i).task      := io.Fetch2Process.cmd.payload.Task
-    slotCtx(i).markWord  := io.Fetch2Process.cmd.payload.MarkWord
+    slotCtx(i).task := io.Fetch2Process.cmd.payload.Task
+    slotCtx(i).markWord := Mux(
+      allocFwdHit,
+      incomingFwdValue,
+      io.Fetch2Process.cmd.payload.MarkWord
+    )
     slotCtx(i).klassPtr  := io.Fetch2Process.cmd.payload.KlassPtr
     slotCtx(i).srcOopPtr := io.Fetch2Process.cmd.payload.SrcOopPtr
     slotCtx(i).srcLength := io.Fetch2Process.cmd.payload.SrcLength
@@ -235,6 +271,19 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     }
   }
 
+  // 更新已经进入 OopProcess 的任务。
+  //
+  // slotCopy2SurvivorInflight=True 时，任务已经真正 fire 给 Copy2Survivor，
+  // 此后不再尝试回退 OopProcess 状态；正确性由 Copy2Survivor 的 CAS 保证。
+  // 这里更新 markWord 本身是安全的，但只会影响尚未 fire 的状态和调试可见值。
+  when(incomingFwdValid) {
+    for (i <- 0 until 2) {
+      when(slotValid(i) && slotCtx(i).srcOopPtr === incomingFwdObj) {
+        slotCtx(i).markWord := incomingFwdValue
+      }
+    }
+  }
+
   // allowSecondInFlight 的集中更新 (应该不会有同周期的 fetchReleasePulse 和 fetchAccept 均有效)
   // 如果本周期有 slotReleaseFetch，则允许 Fetch 后续再发一个任务
   // 如果本周期只是 Fetch 被接收，则消耗这个 token
@@ -299,10 +348,11 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
           finishSlot(i)
 
         } otherwise {
-          val doCopy2Survivor = (slotCtx(i).markWord & U(3, GCElementWidth bits)) =/= U(3, GCElementWidth bits)
+          val currentMarkWord = slotEffectiveMarkWord(i)
+          val doCopy2Survivor = !isForwardedMark(currentMarkWord)
 
-          when(!doCopy2Survivor) { // 不需要复制 可以提前结束
-            slotCtx(i).destOopPtr   := slotCtx(i).markWord & ~U(3, GCElementWidth bits)
+          when(!doCopy2Survivor) { // 已经有 forwarding pointer，不再复制
+            slotCtx(i).destOopPtr   := currentMarkWord & ~U(3, GCElementWidth bits)
             slotCtx(i).fromMarkWord := True
 
             releaseFetchFromSlotDyn(i)
@@ -318,6 +368,25 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
 
             dbg(Seq("slot", i.toString, " go copy2survivor path"))
           }
+        }
+      }
+
+      COPY_SURV_REQ.whenIsActive {
+        val currentMarkWord = slotEffectiveMarkWord(i)
+
+        // 任务已经进入 COPY_SURV_REQ，但还没有 cmd.fire 时，如果其他任务
+        // 已经安装 forwarding pointer，则取消本次复制，直接使用目标地址。
+        when(isForwardedMark(currentMarkWord) && !slotCopy2SurvivorInflight(i)) {
+          slotCtx(i).destOopPtr   := currentMarkWord & ~U(3, GCElementWidth bits)
+          slotCtx(i).fromMarkWord := True
+
+          releaseFetchFromSlotDyn(i)
+          goto(WRITE_BACK)
+
+          dbg(Seq(
+            "slot", i.toString,
+            " receives late forwarding before Copy2Survivor fire, bypass copy"
+          ))
         }
       }
 
@@ -452,8 +521,17 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   // Centralized Copy2Survivor arbitration fixed priority: slot0 > slot1
   val slotWantCopySurvivor = Vec.fill(2)(Bool())
 
-  slotWantCopySurvivor(0) := slotValid(0) && slotIsCopyReq(0) && !slotCopy2SurvivorInflight(0)
-  slotWantCopySurvivor(1) := slotValid(1) && slotIsCopyReq(1) && !slotCopy2SurvivorInflight(1)
+  slotWantCopySurvivor(0) :=
+    slotValid(0) &&
+      slotIsCopyReq(0) &&
+      !slotCopy2SurvivorInflight(0) &&
+      !isForwardedMark(slotEffectiveMarkWord(0))
+
+  slotWantCopySurvivor(1) :=
+    slotValid(1) &&
+      slotIsCopyReq(1) &&
+      !slotCopy2SurvivorInflight(1) &&
+      !isForwardedMark(slotEffectiveMarkWord(1))
 
   val grantCopy0 = slotWantCopySurvivor(0)
   val grantCopy1 = !slotWantCopySurvivor(0) && slotWantCopySurvivor(1)
@@ -461,14 +539,18 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   when(grantCopy0 || grantCopy1) {
     io.Process2CopySurvivor.cmd.valid := True
     io.Process2CopySurvivor.cmd.payload.Owner := Mux(grantCopy0, U(0, 1 bits), U(1, 1 bits))
-    io.Process2CopySurvivor.cmd.payload.MarkWord := Mux(grantCopy0, slotCtx(0).markWord, slotCtx(1).markWord)
+    io.Process2CopySurvivor.cmd.payload.MarkWord := Mux(
+      grantCopy0,
+      slotEffectiveMarkWord(0),
+      slotEffectiveMarkWord(1)
+    )
     io.Process2CopySurvivor.cmd.payload.KlassPtr := Mux(grantCopy0, slotCtx(0).klassPtr, slotCtx(1).klassPtr)
     io.Process2CopySurvivor.cmd.payload.SrcOopPtr := Mux(grantCopy0, slotCtx(0).srcOopPtr, slotCtx(1).srcOopPtr)
     io.Process2CopySurvivor.cmd.payload.SrcLength := Mux(grantCopy0, slotCtx(0).srcLength, slotCtx(1).srcLength)
     io.Process2CopySurvivor.cmd.payload.SrcRegionAttr := Mux(grantCopy0, slotCtx(0).srcRegionAttr, slotCtx(1).srcRegionAttr)
     io.Process2CopySurvivor.cmd.payload.RegionAttrPtr := Mux(grantCopy0,
-        srcRegionAttrAddr(0).resize(GCElementWidth),
-        srcRegionAttrAddr(1).resize(GCElementWidth))
+      srcRegionAttrAddr(0).resize(GCElementWidth),
+      srcRegionAttrAddr(1).resize(GCElementWidth))
 
     when(io.Process2CopySurvivor.cmd.fire) {
       when(grantCopy0) {

@@ -49,7 +49,7 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   val stack_data = Mem(UInt(GCElementWidth bits), GCTaskStack_Entry)
 
   // 按物理stack entry保存PrePop标记, 物理位置被新数据覆盖时必须清零
-  // 即使任务被挤出TopCache又重新Refill, 该标记仍可避免同一个任务被重复PrePop 
+  // 即使任务被挤出TopCache又重新Refill, 该标记仍可避免同一个任务被重复PrePop
   val prefetched = Vec.fill(GCTaskStack_Entry)(RegInit(False))
 
   // 环形指针辅助函数
@@ -485,7 +485,7 @@ class GCTaskStack extends Module with GCTopParameters with GCParameters with HWP
   // Task exhausted
   // 注意 TopCache / refill response 也要算进去。 否则可能 stack_top == stack_bottom 时提前结束。
   val task_exhausted = task_empty && queue_bottom === U(0) && topCacheCount === U(0) &&
-      !refillRespValid && push_count === U(0) && pushPrePopRem === U(0)
+    !refillRespValid && push_count === U(0) && pushPrePopRem === U(0)
 
   // FSM
   val fsm = new StateMachine {

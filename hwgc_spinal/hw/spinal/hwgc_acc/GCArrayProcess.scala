@@ -9,9 +9,10 @@ import scala.language.postfixOps
 
 class GCArrayProcess extends Module with HWParameters with GCTopParameters with GCParameters {
   val io = new Bundle {
-    val Mreq          = master(new LocalMMUIO)
-    val Fetch2Process = slave(new GCToProcessUnit)
-    val Process2Trace = master(new GCToTrace)
+    val Mreq              = master(new LocalMMUIO)
+    val Fetch2Process     = slave(new GCToProcessUnit)
+    val gcWriteSrcOopPtr  = slave(new GCWriteSrcOopPtr)
+    val Process2Trace     = master(new GCToTrace)
     val ConfigIO      = slave(new GCArrayProcessConfigIO)
     val DebugTimeStamp = in UInt(64 bits)
   }
@@ -35,6 +36,13 @@ class GCArrayProcess extends Module with HWParameters with GCTopParameters with 
   val destOopPtr = RegInit(U(0, GCElementWidth bits))
   val markWord   = RegInit(U(0, GCElementWidth bits))
   val srcLength  = RegInit(U(0, 32 bits))
+
+  val incomingFwdValid = io.gcWriteSrcOopPtr.writeForward.valid
+  val incomingFwdObj   = io.gcWriteSrcOopPtr.writeForward.payload.srcOopPtr
+  val incomingFwdValue = io.gcWriteSrcOopPtr.writeForward.payload.writeValue
+
+  def isForwardedMark(mark: UInt): Bool =
+    (mark & U(3, GCElementWidth bits)) === U(3, GCElementWidth bits)
 
   val step_index  = RegInit(U(0, 32 bits))
   val dest_length = RegInit(U(0, 32 bits))
@@ -63,6 +71,7 @@ class GCArrayProcess extends Module with HWParameters with GCTopParameters with 
   // Main StateMachine
   val fsm = new MyStateMachine {
     val IDLE            = new State with EntryPoint
+    val WAIT_FORWARD    = new State
     val READ_DEST_LEN   = new State // WRITE_DEST_LEN in TRACE module(DISPATCH)
     val CALC_STEP       = new State
     val LOOKUP_HEAP_REG = new State
@@ -74,17 +83,60 @@ class GCArrayProcess extends Module with HWParameters with GCTopParameters with 
       io.Fetch2Process.cmd.ready := True
 
       when(io.Fetch2Process.cmd.fire) {
+        val inputFwdHit =
+          incomingFwdValid &&
+            io.Fetch2Process.cmd.payload.SrcOopPtr === incomingFwdObj
+
+        val inputMarkWord = Mux(
+          inputFwdHit,
+          incomingFwdValue,
+          io.Fetch2Process.cmd.payload.MarkWord
+        )
+
         oopType    := io.Fetch2Process.cmd.payload.OopType
         srcOopPtr  := io.Fetch2Process.cmd.payload.SrcOopPtr
-        markWord   := io.Fetch2Process.cmd.payload.MarkWord
-        destOopPtr := io.Fetch2Process.cmd.payload.MarkWord & ~U(3, GCElementWidth bits)
+        markWord   := inputMarkWord
+        destOopPtr := inputMarkWord & ~U(3, GCElementWidth bits)
         srcLength  := io.Fetch2Process.cmd.payload.SrcLength
 
         issued := False
 
+        // PartialArray 只有在 MarkWord 已经变成 forwarding pointer 后，
+        // 才能把 markWord & ~3 当作目标对象地址。
+        when(isForwardedMark(inputMarkWord)) {
+          goto(READ_DEST_LEN)
+        } otherwise {
+          goto(WAIT_FORWARD)
+        }
+
+        dbg(Seq(
+          "Receive task from Fetch Module, srcOopPtr=",
+          io.Fetch2Process.cmd.payload.SrcOopPtr,
+          ", markWord=", inputMarkWord
+        ))
+      }
+    }
+
+    WAIT_FORWARD.whenIsActive {
+      val currentFwdHit =
+        incomingFwdValid &&
+          srcOopPtr === incomingFwdObj
+
+      when(currentFwdHit) {
+        // 对已经 fire 到 ArrayProcess、但携带旧 MarkWord 的任务进行修正。
+        markWord   := incomingFwdValue
+        destOopPtr := incomingFwdValue & ~U(3, GCElementWidth bits)
         goto(READ_DEST_LEN)
 
-        dbg(Seq("Receive task from Fetch Module, the srcOopPtr is ", io.Fetch2Process.cmd.payload.SrcOopPtr, ", the markWord is ", io.Fetch2Process.cmd.payload.MarkWord))
+        dbg(Seq(
+          "Receive late forwarding in ArrayProcess, srcOopPtr=",
+          srcOopPtr,
+          ", newMarkWord=", incomingFwdValue
+        ))
+
+      }.elsewhen(isForwardedMark(markWord)) {
+        // 防御性路径：寄存器中已经是 forwarding pointer。
+        goto(READ_DEST_LEN)
       }
     }
 
