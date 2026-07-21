@@ -58,7 +58,7 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   require((GCCopyEntry & (GCCopyEntry - 1)) == 0)
   require((CompletionEntries & (CompletionEntries - 1)) == 0)
   require((WcbEntries & (WcbEntries - 1)) == 0)
-  require(CompletionEntries >= GCCopyEntry)
+  require(CompletionEntries >= GCCopyEntry) // CompletionEntries >= GCCopyEntry 的约束确保了完成窗口不会成为瓶颈：最多只会有 GCCopyEntry 个 beat 同时在飞行，而完成窗口至少那么大，所以永远不会因为窗口满而阻塞
 
   // 将地址向下对齐到一个 MMU beat
   def alignDown(x: UInt, width: Int): UInt = x & ~U(BeatBytes - 1, width bits)
@@ -102,8 +102,8 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   val srcBase = RegInit(U(0, GCElementWidth bits))
   val srcOff = RegInit(U(0, OffBits bits))
 
-  // 源 beat 总数和下一个准备发出的读取 beat 编号。
-  val readBeatCount = RegInit(U(0, 32 bits))
+  // 源 beat 总数和下一个准备发出的读取 beat 编号
+  val readBeatCount = RegInit(U(0, 32 bits)) // ceil((srcOff + size) / BeatBytes)
   val readReqIdx = RegInit(U(0, 32 bits))
 
   // 连续完成前缀状态
@@ -111,7 +111,7 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   val nextCommitIdx = RegInit(U(0, 32 bits))
   val committedBytes = RegInit(U(0, 32 bits))
 
-  // 向 Fetch 暴露当前 Copy 状态。
+  // 向 Fetch 暴露当前 Copy 状态
   io.State.Active := taskValid
   io.State.Epoch := copyEpoch
   io.State.SrcPtr := srcPtr
@@ -136,27 +136,25 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   val frag1Data = Vec.fill(GCCopyEntry)(RegInit(U(0, MMUDataWidth bits)))
   val frag1Mask = Vec.fill(GCCopyEntry)(RegInit(U(0, BeatBytes bits)))
 
-  // 每个源 beat 已进入 WCB、但目标写响应尚未返回的 line 数量
+  // 每个源 beat 已进入 WCB、但目标写响应尚未返回的 line 数量 2 bit 因为一个bit最多跨越两个cache line
+  // 只有当该计数器归零、且两个 fragment 都不再 pending 时，该 beat 才算真正"完成"
   val slotPendingLineAck = Vec.fill(GCCopyEntry)(RegInit(U(0, 2 bits)))
 
   // MMU 读取响应 SourceID 到 ROB slot 的映射
   val sourceId2RobSlot = Reg(Vec(Seq.fill(LLCSourceMaxNum)(U(0, RobPtrBits bits))))
 
-  // --------------------------------------------------------------------------
   // 每个 ROB slot 的组合地址映射
-  // --------------------------------------------------------------------------
-
-  // 该 beat 第一个有效源字节对应的逻辑复制偏移。
-  val slotLogicalStart = Vec(UInt(32 bits), GCCopyEntry)
-
-  // 该 beat 中第一个有效源字节在 beat 内的偏移。
-  val slotValidStart = Vec(UInt(32 bits), GCCopyEntry)
-
-  // 该 beat 实际参与复制的有效字节数量。
-  val slotValidBytes = Vec(UInt(32 bits), GCCopyEntry)
-
-  // 该 beat 第一个有效字节对应的目标地址。
-  val slotDstStart = Vec(UInt(GCElementWidth bits), GCCopyEntry)
+  /*
+  设 idx = slotReqIdx(i)                        // 该 slot 的逻辑 beat 编号
+     logicalOffset = idx * BeatBytes           // 该 beat 在源地址空间中的起始偏移
+     slotLogicalStart = logicalOffset - srcOff // 减去首 beat 的源内偏移，得到逻辑复制偏移
+                                               // 特殊：idx=0 时直接为 0
+     slotValidStart = idx==0 ? srcOff : 0      // 仅首 beat 有内部偏移，其余 beat 从头开始
+  */
+  val slotLogicalStart = Vec(UInt(32 bits), GCCopyEntry) // 该 beat 第一个有效源字节对应的逻辑复制偏移
+  val slotValidStart = Vec(UInt(32 bits), GCCopyEntry) // 该 beat 中第一个有效源字节在 beat 内的偏移
+  val slotValidBytes = Vec(UInt(32 bits), GCCopyEntry) // 该 beat 实际参与复制的有效字节数量
+  val slotDstStart = Vec(UInt(GCElementWidth bits), GCCopyEntry) // 该 beat 第一个有效字节对应的目标地址
 
   for (i <- 0 until GCCopyEntry) {
     val idx = slotReqIdx(i)
@@ -172,36 +170,57 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
     slotDstStart(i) := (dstPtr + slotLogicalStart(i).resize(GCElementWidth)).resize(GCElementWidth)
   }
 
-  // --------------------------------------------------------------------------
   // 有界乱序完成窗口
-  // --------------------------------------------------------------------------
+  // ROB 中的 beat 可以乱序完成目标写入（beat 5 可能比 beat 3 先写回），但 committedBytes 必须按顺序推进——beat 0 完成之前，不能说"已提交 64 字节"
+  // 因此需要一个中间结构来记录"已完成但尚未提交"的 beat
+  val completionValid = Vec.fill(CompletionEntries)(RegInit(False)) // completionValid 表示对应槽位包含有效完成信息
+  val completionTag = Vec.fill(CompletionEntries)(RegInit(U(0, 32 bits))) // completionTag 保存完整 beat 编号，防止低位索引环绕后误命中
 
-  // completionValid 表示对应槽位包含有效完成信息。
-  val completionValid = Vec.fill(CompletionEntries)(RegInit(False))
-
-  // completionTag 保存完整 beat 编号，防止低位索引环绕后误命中。
-  val completionTag = Vec.fill(CompletionEntries)(RegInit(U(0, 32 bits)))
-
-  /** 获取逻辑 beat 在完成窗口中的环形索引。 */
+  // 获取逻辑 beat 在完成窗口中的环形索引
   def completionIndex(beatIdx: UInt): UInt = beatIdx(CompletionPtrBits - 1 downto 0)
 
-  /** 判断某个逻辑 beat 是否已经完成目标内存写入。 */
+  // 判断某个逻辑 beat 是否已经完成目标内存写入
   def completionHit(beatIdx: UInt): Bool = {
     val index = completionIndex(beatIdx)
     completionValid(index) && completionTag(index) === beatIdx
   }
 
-  // --------------------------------------------------------------------------
-  // 目标 cache line 写合并缓冲区 WCB
-  // --------------------------------------------------------------------------
+  /* 
+  具体数值例子（BeatBytes = 64, srcOff = 12）：
+    源地址: 0x100C (对齐后 srcBase = 0x1000, srcOff = 12)
+    目标地址: 0x2000 (对齐后)
 
+    源 Beat 0: [0x1000 - 0x103F]
+      有效部分: 字节 12~63（52 字节）
+      目标起始偏移 = 0 (目标地址刚好对齐)
+      → frag0: 目标 line 0x2000, 偏移 0~51（52 字节）
+      → 没有 frag1（52 ≤ 64）
+
+    源 Beat 1: [0x1040 - 0x107F]
+      有效部分: 字节 0~63（完整 64 字节）
+      目标地址 = 0x2000 + 52 = 0x2034
+      目标 line 起始 = 0x2000（对齐），偏移 = 0x34 = 52
+
+      → frag0: 目标 line 0x2000, 偏移 52~63（12 字节）
+           ↑ 和 Beat 0 的 frag0 是同一个目标 line！
+      → frag1: 目标 line 0x2040, 偏移 0~51（52 字节）
+  */
+  // 源 Beat 0 和 Beat 1 都需要写入目标 line 0x2000！如果直接各写各的，第二次写入会覆盖第一次的结果（或者需要读-改-写）
+  // WCB先把两个片段的数据和掩码合并到同一个缓冲区，等所有字节都齐了，再一次性写入
+  /* 
+  WCB 的生命周期分三个阶段：
+      阶段 1: 空闲    wcbValid=false, wcbIssued=false
+      阶段 2: 收集中  wcbValid=true,  wcbIssued=false  ← 可以继续接收片段
+      阶段 3: 已发出  wcbValid=true,  wcbIssued=true   ← 等待写响应，不能接收新片段 Issued就是用来控制防止在写请求发出后又有新片段被错误的合并
+  */
   val wcbValid = Vec.fill(WcbEntries)(RegInit(False))
   val wcbIssued = Vec.fill(WcbEntries)(RegInit(False))
   val wcbAddr = Vec.fill(WcbEntries)(RegInit(U(0, MMUAddrWidth bits)))
   val wcbData = Vec.fill(WcbEntries)(RegInit(U(0, MMUDataWidth bits)))
   val wcbMask = Vec.fill(WcbEntries)(RegInit(U(0, BeatBytes bits)))
 
-  // 当源 beat 和目标 line 宽度相同时，一个目标 line 最多由两个源 beat 贡献。
+  // 当源 beat 和目标 line 宽度相同时，一个目标 line 最多由两个源 beat 贡献
+  // 追踪的目的：当写响应返回时（确认目标 line 已经写入内存），需要知道是哪些源 beat 的哪些片段在这个 WCB 中，以便正确递减 slotPendingLineAck 计数器
   val wcbContrib0Valid = Vec.fill(WcbEntries)(RegInit(False))
   val wcbContrib0Slot = Vec.fill(WcbEntries)(RegInit(U(0, RobPtrBits bits)))
   val wcbContrib0Tag = Vec.fill(WcbEntries)(RegInit(U(0, 32 bits)))
@@ -210,13 +229,12 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   val wcbContrib1Slot = Vec.fill(WcbEntries)(RegInit(U(0, RobPtrBits bits)))
   val wcbContrib1Tag = Vec.fill(WcbEntries)(RegInit(U(0, 32 bits)))
 
-  // MMU 写响应 SourceID 到 WCB slot 的映射。
+  // MMU 写响应 SourceID 到 WCB slot 的映射
   val sourceId2WcbSlot = Reg(Vec(Seq.fill(LLCSourceMaxNum)(U(0, WcbPtrBits bits))))
 
   /**
-   * 计算目标 line 中属于当前 Copy 范围的全部字节。
-   *
-   * WCB 收集到该掩码覆盖的全部字节后，才允许发出目标写请求。
+   * 计算目标 line 中属于当前 Copy 范围的全部字节
+   * WCB 收集到该掩码覆盖的全部字节后，才允许发出目标写请求
    */
   def expectedDestinationMask(lineAddr: UInt): UInt = {
     val result = UInt(BeatBytes bits)
@@ -230,27 +248,20 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
     result
   }
 
-  // --------------------------------------------------------------------------
   // 命令接收和任务完成
-  // --------------------------------------------------------------------------
-
-  // 同一时间只允许一个 Copy 事务。
+  // 同一时间只允许一个 Copy 事务
   io.ToCopy.cmd.ready := !taskValid
 
   val anySlotBusy = slotBusy.asBits.orR
   val anyWcbValid = wcbValid.asBits.orR
 
-  // 所有源读取均已发出、连续完成前缀到达结尾，并且 ROB/WCB 均为空时任务完成。
-  val taskDoneNow = taskValid &&
-    readReqIdx === readBeatCount &&
-    nextCommitIdx === readBeatCount &&
-    !anySlotBusy &&
-    !anyWcbValid
+  // 所有源读取均已发出、连续完成前缀到达结尾，并且 ROB/WCB 均为空时任务完成
+  val taskDoneNow = taskValid && readReqIdx === readBeatCount && nextCommitIdx === readBeatCount &&
+    !anySlotBusy && !anyWcbValid
 
   io.ToCopy.Done := zeroTaskDone || taskDoneNow
 
   when(io.ToCopy.cmd.fire) {
-    // 锁存任务参数。
     srcPtr := io.ToCopy.cmd.payload.SrcOopPtr
     dstPtr := io.ToCopy.cmd.payload.DestOopPtr
     totalSize := io.ToCopy.cmd.payload.Size
@@ -264,10 +275,10 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
     nextCommitIdx := 0
     committedBytes := 0
 
-    // 新任务使用新的 epoch，使旧任务的 Fetch 预解码信息自动失效。
+    // 新任务使用新的 epoch，使旧任务的 Fetch 预解码信息自动失效
     copyEpoch := copyEpoch + 1
 
-    // 清空 ROB。
+    // 清空 ROB
     for (i <- 0 until GCCopyEntry) {
       slotBusy(i) := False
       slotForwardValid(i) := False
@@ -278,13 +289,13 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
       slotPendingLineAck(i) := 0
     }
 
-    // 清空完成窗口。
+    // 清空完成窗口
     for (i <- 0 until CompletionEntries) {
       completionValid(i) := False
       completionTag(i) := 0
     }
 
-    // 清空 WCB。
+    // 清空 WCB
     for (i <- 0 until WcbEntries) {
       wcbValid(i) := False
       wcbIssued(i) := False
@@ -298,15 +309,13 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
     taskValid := True
 
     when(io.ToCopy.cmd.payload.Size === 0) {
-      // 零长度任务不产生任何 MMU 请求，下一周期直接完成。
+      // 零长度任务不产生任何 MMU 请求，下一周期直接完成
       zeroTaskDone := True
     }.otherwise {
       zeroTaskDone := False
 
-      // ceil((srcOff + size) / BeatBytes)。
       readBeatCount := ((io.ToCopy.cmd.payload.SrcOopPtr(OffBits - 1 downto 0) +
-        io.ToCopy.cmd.payload.Size +
-        U(BeatBytes - 1, 32 bits)) >> OffBits).resize(32)
+        io.ToCopy.cmd.payload.Size + U(BeatBytes - 1, 32 bits)) >> OffBits).resize(32)
     }
   }.elsewhen(zeroTaskDone) {
     taskValid := False
@@ -315,21 +324,16 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
     taskValid := False
   }
 
-  // --------------------------------------------------------------------------
   // 源读取请求发射
-  // --------------------------------------------------------------------------
-
-  // beat index 的低位直接选择 ROB slot。
+  // beat index 的低位直接选择 ROB slot
   val readSlot = readReqIdx(RobPtrBits - 1 downto 0)
 
-  // 限制读请求不能超出完成窗口容量，防止 completion table 发生模索引覆盖。
+  // 限制读请求不能超出完成窗口容量，防止 completion table 发生模索引覆盖
   val completionDistance = (readReqIdx - nextCommitIdx).resize(32)
   val completionHasCredit = completionDistance < U(CompletionEntries, 32 bits)
 
-  val readCanAllocate = taskValid &&
-    readReqIdx =/= readBeatCount &&
-    !slotBusy(readSlot) &&
-    completionHasCredit
+  val readCanAllocate = taskValid && readReqIdx =/= readBeatCount &&
+    !slotBusy(readSlot) && completionHasCredit
 
   val currentReadAddr = (srcBase + (readReqIdx.resize(GCElementWidth) |<< OffBits)).resize(MMUAddrWidth)
 
@@ -346,10 +350,10 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   when(io.readMReq.Request.fire) {
     val sourceId = io.readMReq.ConherentRequsetSourceID.payload.resized
 
-    // 记录响应 SourceID 对应的 ROB slot。
+    // 记录响应 SourceID 对应的 ROB slot
     sourceId2RobSlot(sourceId) := readSlot
 
-    // 初始化新分配的 ROB slot。
+    // 初始化新分配的 ROB slot
     slotBusy(readSlot) := True
     slotForwardValid(readSlot) := False
     slotReqIdx(readSlot) := readReqIdx
@@ -360,88 +364,65 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
     readReqIdx := readReqIdx + 1
   }
 
-  // --------------------------------------------------------------------------
   // 源读取响应和目标片段生成
-  // --------------------------------------------------------------------------
-
   val readResponseSourceId = io.readMReq.Response.payload.ResponseSourceID.resized
   val readResponseSlot = sourceId2RobSlot(readResponseSourceId)
 
-  // 只接受当前任务中已经分配且尚未接收数据的 slot。
-  io.readMReq.Response.ready := taskValid &&
-    slotBusy(readResponseSlot) &&
-    !slotForwardValid(readResponseSlot)
+  // 只接受当前任务中已经分配且尚未接收数据的 slot
+  io.readMReq.Response.ready := taskValid && slotBusy(readResponseSlot) &&!slotForwardValid(readResponseSlot)
 
   val readResponseFire = io.readMReq.Response.fire
   val responseData = io.readMReq.Response.payload.ResponseData
 
-  // 去掉首尾 beat 中不属于 Copy 范围的源字节。
+  // 去掉首尾 beat 中不属于 Copy 范围的源字节
   val responseValidStart = slotValidStart(readResponseSlot)
   val responseValidBytes = slotValidBytes(readResponseSlot)
   val responseShiftedData = responseData |>> (responseValidStart << 3)
 
-  // 计算有效数据在目标地址空间中的起点。
+  // 计算有效数据在目标地址空间中的起点
   val responseDestinationByteAddr = dstPtr + slotLogicalStart(readResponseSlot).resize(GCElementWidth)
   val responseDestinationLine0 = alignDown(responseDestinationByteAddr, GCElementWidth).resize(MMUAddrWidth)
   val responseDestinationOffset0 = responseDestinationByteAddr(OffBits - 1 downto 0)
 
-  // 第一个目标 line 可容纳的数据量。
+  // 第一个目标 line 可容纳的数据量
   val responseSpace0 = BeatBytesU32 - responseDestinationOffset0.resize(32)
   val responseLength0 = Mux(responseValidBytes <= responseSpace0, responseValidBytes, responseSpace0)
 
-  // 超出第一个目标 line 的部分进入第二个片段。
+  // 超出第一个目标 line 的部分进入第二个片段
   val responseLength1 = responseValidBytes - responseLength0
 
-  val generatedFragment0Data =
-    (responseShiftedData |<< (responseDestinationOffset0 << 3)).resize(MMUDataWidth)
-
-  val generatedFragment0Mask =
-    genMask(responseLength0.resize(BeatLenBits), responseDestinationOffset0)
-
-  val generatedFragment1Data =
-    (responseShiftedData |>> (responseLength0.resize(BeatLenBits) << 3)).resize(MMUDataWidth)
-
-  val generatedFragment1Mask =
-    genMask(responseLength1.resize(BeatLenBits), U(0, OffBits bits))
+  val generatedFragment0Data = (responseShiftedData |<< (responseDestinationOffset0 << 3)).resize(MMUDataWidth)
+  val generatedFragment0Mask = genMask(responseLength0.resize(BeatLenBits), responseDestinationOffset0)
+  val generatedFragment1Data = (responseShiftedData |>> (responseLength0.resize(BeatLenBits) << 3)).resize(MMUDataWidth)
+  val generatedFragment1Mask = genMask(responseLength1.resize(BeatLenBits), U(0, OffBits bits))
 
   when(readResponseFire) {
     // 保存原始源 beat，供 Fetch forwarding 使用。
     slotData(readResponseSlot) := responseData
     slotForwardValid(readResponseSlot) := True
 
-    // 生成第一个目标 line 片段。
+    // 生成第一个目标 line 片段
     frag0Addr(readResponseSlot) := responseDestinationLine0
     frag0Data(readResponseSlot) := generatedFragment0Data
     frag0Mask(readResponseSlot) := generatedFragment0Mask
     frag0Pending(readResponseSlot) := responseLength0 =/= 0
 
-    // 生成可能存在的第二个目标 line 片段。
-    frag1Addr(readResponseSlot) :=
-      (responseDestinationLine0 + U(BeatBytes, MMUAddrWidth bits)).resized
+    // 生成可能存在的第二个目标 line 片段
+    frag1Addr(readResponseSlot) := (responseDestinationLine0 + U(BeatBytes, MMUAddrWidth bits)).resized
 
     frag1Data(readResponseSlot) := generatedFragment1Data
     frag1Mask(readResponseSlot) := generatedFragment1Mask
     frag1Pending(readResponseSlot) := responseLength1 =/= 0
   }
 
-  // --------------------------------------------------------------------------
-  // WCB 完整性判断
-  // --------------------------------------------------------------------------
-
   val wcbReady = Vec(Bool(), WcbEntries)
 
   for (i <- 0 until WcbEntries) {
     val expected = expectedDestinationMask(wcbAddr(i))
 
-    // 收齐该目标 line 属于 Copy 范围的所有字节后即可发出。
-    wcbReady(i) := wcbValid(i) &&
-      !wcbIssued(i) &&
-      ((wcbMask(i) & expected) === expected)
+    // 收齐该目标 line 属于 Copy 范围的所有字节后即可发出
+    wcbReady(i) := wcbValid(i) && !wcbIssued(i) && ((wcbMask(i) & expected) === expected)
   }
-
-  // --------------------------------------------------------------------------
-  // 独立片段调度器
-  // --------------------------------------------------------------------------
 
   val FragmentCount = GCCopyEntry * 2
 
@@ -453,7 +434,7 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   val fragmentIsSecond = Vec(Bool(), FragmentCount)
   val fragmentCanMerge = Vec(Bool(), FragmentCount)
 
-  // 将每个 ROB slot 的两个片段展开为统一调度队列。
+  // 将每个 ROB slot 的两个片段展开为统一调度队列
   for (i <- 0 until GCCopyEntry) {
     val first = i * 2
     val second = first + 1
@@ -477,19 +458,16 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
       val hitVector = Vec(Bool(), WcbEntries)
 
       for (w <- 0 until WcbEntries) {
-        // 已经 ready 或已经 issued 的 WCB 不允许继续合并。
-        hitVector(w) := wcbValid(w) &&
-          !wcbIssued(w) &&
-          !wcbReady(w) &&
-          wcbAddr(w) === fragmentAddr(fragmentIndex)
+        // 已经 ready 或已经 issued 的 WCB 不允许继续合并
+        hitVector(w) := wcbValid(w) && !wcbIssued(w) &&
+          !wcbReady(w) && wcbAddr(w) === fragmentAddr(fragmentIndex)
       }
 
-      fragmentCanMerge(fragmentIndex) :=
-        fragmentValid(fragmentIndex) && hitVector.asBits.orR
+      fragmentCanMerge(fragmentIndex) := fragmentValid(fragmentIndex) && hitVector.asBits.orR
     }
   }
 
-  // 查找空闲 WCB 项。
+  // 查找空闲 WCB 项
   val wcbFreeMask = Bits(WcbEntries bits)
 
   for (i <- 0 until WcbEntries) {
@@ -500,7 +478,7 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   val fragmentValidBits = fragmentValid.asBits
   val mergeableFragmentBits = fragmentCanMerge.asBits
 
-  // 优先选择可以合并到已有 WCB 的片段，减少 WCB 项占用。
+  // 优先选择可以合并到已有 WCB 的片段，减少 WCB 项占用
   val selectedFragmentOH = Bits(FragmentCount bits)
   selectedFragmentOH := 0
 
@@ -519,19 +497,17 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   val selectedFragmentOwner = fragmentOwner(selectedFragmentIndex)
   val selectedFragmentIsSecond = fragmentIsSecond(selectedFragmentIndex)
 
-  // 查询选中片段是否命中可继续合并的 WCB。
+  // 查询选中片段是否命中可继续合并的 WCB
   val selectedWcbHitMask = Bits(WcbEntries bits)
 
   for (i <- 0 until WcbEntries) {
-    selectedWcbHitMask(i) := wcbValid(i) &&
-      !wcbIssued(i) &&
-      !wcbReady(i) &&
-      wcbAddr(i) === selectedFragmentAddr
+    selectedWcbHitMask(i) := wcbValid(i) && !wcbIssued(i) &&
+      !wcbReady(i) && wcbAddr(i) === selectedFragmentAddr
   }
 
   val selectedWcbHit = selectedWcbHitMask.orR
 
-  // 默认选择第一个空闲 WCB；命中已有 WCB 时改为命中项。
+  // 默认选择第一个空闲 WCB；命中已有 WCB 时改为命中项
   val selectedWcbIndex = UInt(WcbPtrBits bits)
   selectedWcbIndex := OHToUInt(OHMasking.first(wcbFreeMask)).resize(WcbPtrBits)
 
@@ -546,24 +522,20 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
     val ownerTag = slotReqIdx(selectedFragmentOwner)
 
     when(selectedWcbHit) {
-      // 使用字节掩码把新片段合并进已有 WCB。
+      // 使用字节掩码把新片段合并进已有 WCB
       val expandedMask = expandByteMask(selectedFragmentMask)
 
-      wcbData(selectedWcbIndex) :=
-        ((wcbData(selectedWcbIndex) & ~expandedMask) |
-          (selectedFragmentData & expandedMask)).resized
+      wcbData(selectedWcbIndex) := ((wcbData(selectedWcbIndex) & ~expandedMask) | (selectedFragmentData & expandedMask)).resized
+      wcbMask(selectedWcbIndex) := wcbMask(selectedWcbIndex) | selectedFragmentMask
 
-      wcbMask(selectedWcbIndex) :=
-        wcbMask(selectedWcbIndex) | selectedFragmentMask
-
-      // 当前结构假定一个目标 line 最多只有两个源 beat 贡献。
+      // 当前结构假定一个目标 line 最多只有两个源 beat 贡献
       assert(!wcbContrib1Valid(selectedWcbIndex))
 
       wcbContrib1Valid(selectedWcbIndex) := True
       wcbContrib1Slot(selectedWcbIndex) := selectedFragmentOwner
       wcbContrib1Tag(selectedWcbIndex) := ownerTag
     }.otherwise {
-      // 使用空闲项创建新的 WCB line。
+      // 使用空闲项创建新的 WCB line
       wcbValid(selectedWcbIndex) := True
       wcbIssued(selectedWcbIndex) := False
       wcbAddr(selectedWcbIndex) := selectedFragmentAddr
@@ -577,7 +549,7 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
       wcbContrib1Valid(selectedWcbIndex) := False
     }
 
-    // 片段进入 WCB 后，从 ROB 的待调度片段中移除。
+    // 片段进入 WCB 后，从 ROB 的待调度片段中移除
     when(selectedFragmentIsSecond) {
       frag1Pending(selectedFragmentOwner) := False
     }.otherwise {
@@ -585,11 +557,8 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
     }
   }
 
-  // --------------------------------------------------------------------------
   // 目标写请求发射
-  // --------------------------------------------------------------------------
-
-  // 每周期选择一个已经收齐数据、但尚未发出的 WCB。
+  // 每周期选择一个已经收齐数据、但尚未发出的 WCB
   val writeIssueMask = wcbReady.asBits
   val writeIssueOH = OHMasking.first(writeIssueMask)
   val writeIssueValid = writeIssueMask.orR
@@ -610,27 +579,22 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   when(writeRequestFire) {
     val sourceId = io.writeMReq.ConherentRequsetSourceID.payload.resized
 
-    // 保存写响应 SourceID 到 WCB 项的映射。
+    // 保存写响应 SourceID 到 WCB 项的映射
     sourceId2WcbSlot(sourceId) := writeIssueIndex
 
-    // 已发出的 WCB 不允许继续接收片段。
+    // 已发出的 WCB 不允许继续接收片段
     wcbIssued(writeIssueIndex) := True
   }
 
-  // --------------------------------------------------------------------------
   // 目标写响应和源 beat 乱序完成
-  // --------------------------------------------------------------------------
-
   val writeResponseSourceId = io.writeMReq.Response.payload.ResponseSourceID.resized
   val writeResponseWcbIndex = sourceId2WcbSlot(writeResponseSourceId)
 
-  io.writeMReq.Response.ready := taskValid &&
-    wcbValid(writeResponseWcbIndex) &&
-    wcbIssued(writeResponseWcbIndex)
-
+  io.writeMReq.Response.ready := taskValid && wcbValid(writeResponseWcbIndex) && wcbIssued(writeResponseWcbIndex)
+  
   val writeResponseFire = io.writeMReq.Response.fire
 
-  // 对每个 ROB slot 判断当前写响应是否确认了它贡献的目标 line。
+  // 对每个 ROB slot 判断当前写响应是否确认了它贡献的目标 line
   val responseContributor = Vec(Bool(), GCCopyEntry)
 
   for (i <- 0 until GCCopyEntry) {
@@ -646,28 +610,23 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
         wcbContrib1Slot(writeResponseWcbIndex) === slotIndex &&
         wcbContrib1Tag(writeResponseWcbIndex) === slotReqIdx(i)
 
-    responseContributor(i) :=
-      writeResponseFire &&
-        slotBusy(i) &&
-        (contributor0Hit || contributor1Hit)
+    responseContributor(i) := writeResponseFire && slotBusy(i) && (contributor0Hit || contributor1Hit)
   }
 
   for (i <- 0 until GCCopyEntry) {
-    // 当前周期是否有该 slot 的一个片段进入 WCB。
-    val fragmentIncrement =
-      fragmentAccepted &&
-        selectedFragmentOwner === U(i, RobPtrBits bits)
+    // 当前周期是否有该 slot 的一个片段进入 WCB
+    val fragmentIncrement = fragmentAccepted && selectedFragmentOwner === U(i, RobPtrBits bits)
 
-    // 当前周期是否有该 slot 的一个 WCB 写响应返回。
+    // 当前周期是否有该 slot 的一个 WCB 写响应返回
     val responseDecrement = responseContributor(i)
 
-    // 组合计算同时处理加一和减一后的未确认目标 line 数量。
+    // 组合计算同时处理加一和减一后的未确认目标 line 数量
     val pendingAfterEvents =
       slotPendingLineAck(i).resize(3) +
         fragmentIncrement.asUInt.resize(3) -
         responseDecrement.asUInt.resize(3)
 
-    // 判断接受片段后是否仍有片段留在 ROB 外部等待调度。
+    // 判断接受片段后是否仍有片段留在 ROB 外部等待调度
     val fragment0Remains =
       frag0Pending(i) &&
         !(fragmentAccepted &&
@@ -907,11 +866,6 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   driveForwardLookup(io.FwdPush)
   driveForwardLookup(io.FwdPre)
 
-  // --------------------------------------------------------------------------
-  // 调试性能计数器
-  // --------------------------------------------------------------------------
-
-  // 统计当前 Copy 任务持续的周期数。
   val counter = RegInit(U(0, 64 bits))
 
   when(taskValid) {

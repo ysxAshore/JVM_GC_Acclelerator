@@ -56,26 +56,19 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   val slotValid = Vec.fill(2)(RegInit(False))
   val slotCtx   = Vec.fill(2)(Reg(SlotCtx()) init SlotCtx().getZero)
 
-  // Copy2Survivor 安装 forwarding MarkWord 后，将更新广播到仍在
-  // OopProcess 中、但尚未真正送入 Copy2Survivor 的任务。
+  // 将更新广播到仍在 OopProcess 中、但尚未真正送入 Copy2Survivor 的任务
   val incomingFwdValid = io.gcWriteSrcOopPtr.writeForward.valid
   val incomingFwdObj   = io.gcWriteSrcOopPtr.writeForward.payload.srcOopPtr
   val incomingFwdValue = io.gcWriteSrcOopPtr.writeForward.payload.writeValue
 
-  def isForwardedMark(mark: UInt): Bool =
-    (mark & U(3, GCElementWidth bits)) === U(3, GCElementWidth bits)
+  def isForwardedMark(mark: UInt): Bool = (mark & U(3, GCElementWidth bits)) === U(3, GCElementWidth bits)
 
   val slotLiveFwdHit       = Vec.fill(2)(Bool())
   val slotEffectiveMarkWord = Vec.fill(2)(UInt(GCElementWidth bits))
 
   for (i <- 0 until 2) {
-    slotLiveFwdHit(i) :=
-      incomingFwdValid &&
-        slotValid(i) &&
-        slotCtx(i).srcOopPtr === incomingFwdObj
+    slotLiveFwdHit(i) := incomingFwdValid && slotValid(i) && slotCtx(i).srcOopPtr === incomingFwdObj
 
-    // 本周期 forwarding 直接覆盖寄存器中的旧 MarkWord，解决
-    // forwarding 与 DECIDE/COPY_SURV_REQ 同周期的 RAW。
     slotEffectiveMarkWord(i) := Mux(
       slotLiveFwdHit(i),
       incomingFwdValue,
@@ -124,9 +117,7 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     slotCopy2SurvivorBypassGranted(i) := False
   }
   def allocToSlot(i: Int): Unit = {
-    val allocFwdHit =
-      incomingFwdValid &&
-        io.Fetch2Process.cmd.payload.SrcOopPtr === incomingFwdObj
+    val allocFwdHit = incomingFwdValid && io.Fetch2Process.cmd.payload.SrcOopPtr === incomingFwdObj
 
     slotValid(i) := True
 
@@ -271,11 +262,11 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
     }
   }
 
-  // 更新已经进入 OopProcess 的任务。
+  // 更新已经进入 OopProcess 的任务
   //
   // slotCopy2SurvivorInflight=True 时，任务已经真正 fire 给 Copy2Survivor，
   // 此后不再尝试回退 OopProcess 状态；正确性由 Copy2Survivor 的 CAS 保证。
-  // 这里更新 markWord 本身是安全的，但只会影响尚未 fire 的状态和调试可见值。
+  // 这里更新 markWord 本身是安全的，但只会影响尚未 fire 的状态和调试可见值
   when(incomingFwdValid) {
     for (i <- 0 until 2) {
       when(slotValid(i) && slotCtx(i).srcOopPtr === incomingFwdObj) {
@@ -348,6 +339,7 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
           finishSlot(i)
 
         } otherwise {
+          // 选择新的MarkWord
           val currentMarkWord = slotEffectiveMarkWord(i)
           val doCopy2Survivor = !isForwardedMark(currentMarkWord)
 
@@ -375,7 +367,7 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
         val currentMarkWord = slotEffectiveMarkWord(i)
 
         // 任务已经进入 COPY_SURV_REQ，但还没有 cmd.fire 时，如果其他任务
-        // 已经安装 forwarding pointer，则取消本次复制，直接使用目标地址。
+        // 已经安装 forwarding pointer，则取消本次复制，直接使用目标地址
         when(isForwardedMark(currentMarkWord) && !slotCopy2SurvivorInflight(i)) {
           slotCtx(i).destOopPtr   := currentMarkWord & ~U(3, GCElementWidth bits)
           slotCtx(i).fromMarkWord := True
@@ -521,17 +513,11 @@ class GCOopProcess extends Module with HWParameters with GCTopParameters with GC
   // Centralized Copy2Survivor arbitration fixed priority: slot0 > slot1
   val slotWantCopySurvivor = Vec.fill(2)(Bool())
 
-  slotWantCopySurvivor(0) :=
-    slotValid(0) &&
-      slotIsCopyReq(0) &&
-      !slotCopy2SurvivorInflight(0) &&
-      !isForwardedMark(slotEffectiveMarkWord(0))
+  slotWantCopySurvivor(0) := slotValid(0) && slotIsCopyReq(0) &&
+      !slotCopy2SurvivorInflight(0) && !isForwardedMark(slotEffectiveMarkWord(0))
 
-  slotWantCopySurvivor(1) :=
-    slotValid(1) &&
-      slotIsCopyReq(1) &&
-      !slotCopy2SurvivorInflight(1) &&
-      !isForwardedMark(slotEffectiveMarkWord(1))
+  slotWantCopySurvivor(1) := slotValid(1) && slotIsCopyReq(1) &&
+      !slotCopy2SurvivorInflight(1) && !isForwardedMark(slotEffectiveMarkWord(1))
 
   val grantCopy0 = slotWantCopySurvivor(0)
   val grantCopy1 = !slotWantCopySurvivor(0) && slotWantCopySurvivor(1)
