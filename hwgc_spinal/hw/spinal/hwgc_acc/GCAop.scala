@@ -61,8 +61,8 @@ class GCAop extends Module with GCTopParameters with HWParameters {
   val writeBufferData = RegInit(U(0, MMUDataWidth bits)) // 先得到高位数据 再得到低位数据
 
   // NoAopSrc handling
-  // NoAopSrc 和 Aop.Ready 可能不同拍有效。 所以制作上升沿锁存 NoAopSrc。
-  // 等 FSM 回到 IDLE，并且 io.Aop.Valid 也没有挂起时，再执行 writeback。
+  // NoAopSrc 和 Aop.Ready 可能不同拍有效。 所以制作上升沿锁存 NoAopSrc
+  // 等 FSM 回到 IDLE，并且 io.Aop.Valid 也没有挂起时，再执行 writeback
   val noAopSrcLast    = RegNext(io.NoAopSrc) init False
   val noAopSrcRise    = io.NoAopSrc && !noAopSrcLast
   val noAopSrcPending = RegInit(False)
@@ -110,7 +110,7 @@ class GCAop extends Module with GCTopParameters with HWParameters {
 
       io.Aop.cmd.ready := True
 
-      // 如果 noAopSeen 和 io.Aop.Valid 同拍有效，优先接收这个已经挂在接口上的 Aop。
+      // 如果 noAopSeen 和 io.Aop.Valid 同拍有效，优先接收这个已经挂在接口上的 Aop
       when(io.Aop.cmd.valid) {
         dest   := io.Aop.cmd.payload.Task
         issued := False

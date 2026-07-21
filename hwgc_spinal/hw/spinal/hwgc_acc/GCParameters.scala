@@ -13,6 +13,14 @@ trait GCParameters {
 
   val GCCopyEntry = 8
 
+  val GCCopyCompletionEntry = 16
+  val GCCopyWriteCombineEntry = 4
+  val GCCopyEpochWidth = 16
+
+  // Internal provenance tag. It is removed before a task is used as an MMU
+  // address. The JVM heap/task address space must not use this bit.
+  val TracePushTagBit = 63
+
   /* ----------------- ScannerTask Tag ----------------- */
   val PartialArrayTag = 2
   val GCOopTagWidth = 2
@@ -33,6 +41,17 @@ trait GCParameters {
   val PreFetchBufferWidth = log2Up(PreFetchBufferNum)
 
   val GCTaskQueue_Size = 1 << 17
+}
+
+// Public Copy transaction state used by GCFetch for early query predecode.
+case class GCCopyPublicState() extends Bundle with GCTopParameters with GCParameters {
+  val Active = Bool()
+  val Epoch = UInt(GCCopyEpochWidth bits)
+  val SrcPtr = UInt(GCElementWidth bits)
+  val DstPtr = UInt(GCElementWidth bits)
+  val SrcBase = UInt(GCElementWidth bits)
+  val TotalSize = UInt(32 bits)
+  val CommittedBytes = UInt(32 bits)
 }
 
 class GCToFetch extends Bundle with GCTopParameters with IMasterSlave {

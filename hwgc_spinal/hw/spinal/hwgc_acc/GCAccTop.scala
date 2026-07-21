@@ -9,30 +9,33 @@ import scala.language.postfixOps
 class GCAccTop extends Module with GCTopParameters {
   val io  = new GCAccTopIO
 
+  // 19 = 1(TaskStack) + 3(Fetch:PrePop,Push,Main) + 1(ArrayProcess) + 2(OopProcess) + 2(OopCopy2Survivor) + 1(Allocate) + 
+  //      3(ParAllocate) + 1(NewGCAlloc) + 1(AllocFreeRegion) + 1(Aop) + 1(Trace) +
+  //      2(Copy)
   val LocalMMUIOsNum = 19
 
-  val gcTaskStack = new GCTaskStack
-  val gcFetch = new GCFetch
-  val gcArrayProcess = new GCArrayProcess
-  val gcOopProcess = new GCOopProcess
-  val gcOopCopy2Survivor = new GCOopCopy2Survivor
-  val gcAllocate = new GCAllocate
-  val gcParAllocate = new GCParAllocate
-  val gcNewGCAlloc = new GCNewGCAlloc
-  val gcAllocFreeRegion = new GCAllocFreeRegion
-  val gcCopy = new GCCopy
-  val gcTrace = new GCTrace
   val gcAop = new GCAop
-  val gcLocalMMU = new GCLocalMMU(LocalMMUIOsNum)
-  val gcUnalignedMMUAdapter = Array.fill(LocalMMUIOsNum - 2)(new GCUnalignedMMUAdapter)
+  val gcCopy = new GCCopy
+  val gcFetch = new GCFetch
+  val gcTrace = new GCTrace
+  val gcAllocate = new GCAllocate
+  val gcTaskStack = new GCTaskStack
+  val gcNewGCAlloc = new GCNewGCAlloc
+  val gcOopProcess = new GCOopProcess
+  val gcParAllocate = new GCParAllocate
+  val gcArrayProcess = new GCArrayProcess
+  val gcAllocFreeRegion = new GCAllocFreeRegion
+  val gcOopCopy2Survivor = new GCOopCopy2Survivor
+  val gcUnalignedMMUAdapter = Array.fill(LocalMMUIOsNum - 2)(new GCUnalignedMMUAdapter) // - 2(exclude Copy readMreq and writeMreq)
 
+  val gcLocalMMU = new GCLocalMMU(LocalMMUIOsNum)
   gcUnalignedMMUAdapter.zipWithIndex.foreach{ case(adapter, i) =>
     gcLocalMMU.io.localMMUIOs(i) <> adapter.io.out
   }
 
   val task_valid = RegInit(False) // 当前有任务在进行
   val taskStackDone = RegInit(False) // TaskStack 完成缓存
-  val taskStackStart = RegInit(False) // TaskStack 握手Valid
+  val taskStackStart = RegInit(False) // TaskStack 握手Valid, 在握手之后复位
 
   val ChunkSize = RegInit(U(0, 32 bits))
   val AgeThreshold = RegInit(U(0, 32 bits))
@@ -64,13 +67,10 @@ class GCAccTop extends Module with GCTopParameters {
   val DebugTimeStamp = RegInit(U(0,64 bits))
   DebugTimeStamp := DebugTimeStamp + U(1)
 
-  // 已经接受了一个task
-  val taskStackAccepted = task_valid && !taskStackStart
-
   io.config.cmd.ready := !task_valid
-  io.config.Done := task_valid && (taskStackAccepted && gcTaskStack.io.ConfigIO.Done || taskStackDone) && gcOopProcess.io.SlotIsEmpty
+  io.config.Done := task_valid && (gcTaskStack.io.ConfigIO.Done || taskStackDone) && gcOopProcess.io.SlotIsEmpty
 
-  when(taskStackAccepted && gcTaskStack.io.ConfigIO.Done){
+  when(task_valid && gcTaskStack.io.ConfigIO.Done){
     taskStackDone := True
   }
 
@@ -111,10 +111,12 @@ class GCAccTop extends Module with GCTopParameters {
     CompressedFlag                    := io.config.cmd.payload.CompressedFlag
   }
 
+  // 内部可能会更新AgeThreshold
   when(gcOopCopy2Survivor.io.UpdateAgeThreshold.valid){
     AgeThreshold := gcOopCopy2Survivor.io.UpdateAgeThreshold.payload.resized
   }
 
+  // gcTaskStack 握手成功 则 复位 taskStackStart
   when(gcTaskStack.io.ConfigIO.config.fire){
     taskStackStart := False
   }
@@ -122,7 +124,9 @@ class GCAccTop extends Module with GCTopParameters {
   // GCTaskStack
   gcTaskStack.io.toFetch <> gcFetch.io.toFetch
   gcTaskStack.io.toStack <> gcTrace.io.ToStack
+
   gcTaskStack.io.Mreq <> gcUnalignedMMUAdapter(0).io.in
+
   gcTaskStack.io.ConfigIO.config.payload.TaskQueue_Bottom := TaskQueue_Bottom
   gcTaskStack.io.ConfigIO.config.payload.TaskQueue_ElemsBase := TaskQueue_ElemsBase
   gcTaskStack.io.ConfigIO.config.valid := taskStackStart
@@ -132,19 +136,35 @@ class GCAccTop extends Module with GCTopParameters {
   gcFetch.io.MainMreq <> gcUnalignedMMUAdapter(1).io.in
   gcFetch.io.PushMreq <> gcUnalignedMMUAdapter(2).io.in
   gcFetch.io.PreMreq <> gcUnalignedMMUAdapter(3).io.in
+
   gcFetch.io.Fetch2OopProcess <> gcOopProcess.io.Fetch2Process
   gcFetch.io.Fetch2ArrayProcess <> gcArrayProcess.io.Fetch2Process
   gcFetch.io.Trace2Fetch <> gcTrace.io.Trace2Fetch
+
+  gcFetch.io.gcWriteSrcOopPtr.writeForward.valid := gcOopCopy2Survivor.io.ToFetch.writeForward.valid
+  gcFetch.io.gcWriteSrcOopPtr.writeForward.payload := gcOopCopy2Survivor.io.ToFetch.writeForward.payload
+
+  gcFetch.io.CopyFwdMain <> gcCopy.io.FwdMain
+  gcFetch.io.CopyFwdPush <> gcCopy.io.FwdPush
+  gcFetch.io.CopyFwdPre  <> gcCopy.io.FwdPre
+  gcFetch.io.CopyState := gcCopy.io.State
+  gcFetch.io.CopyDone := gcCopy.io.ToCopy.Done
+
   gcFetch.io.ConfigIO.UseCompressedOop := CompressedFlag(0)
   gcFetch.io.ConfigIO.CompressedOopBase := CompressedOopBase
   gcFetch.io.ConfigIO.CompressedOopShift := CompressedFlag(15 downto 8)
   gcFetch.io.ConfigIO.UseCompressedKlassPointers := CompressedFlag(1)
   gcFetch.io.DebugTimeStamp := DebugTimeStamp
 
-  // GCOopProcess (ToAop)
+  // GCOopProcess
   gcOopProcess.io.Mreq0 <> gcUnalignedMMUAdapter(4).io.in
   gcOopProcess.io.Mreq1 <> gcUnalignedMMUAdapter(5).io.in
+
+  gcOopProcess.io.gcWriteSrcOopPtr.writeForward.valid := gcOopCopy2Survivor.io.ToFetch.writeForward.valid
+  gcOopProcess.io.gcWriteSrcOopPtr.writeForward.payload := gcOopCopy2Survivor.io.ToFetch.writeForward.payload
+
   gcOopProcess.io.Process2CopySurvivor <> gcOopCopy2Survivor.io.ToCopySurvivor
+
   gcOopProcess.io.ConfigIO.RegionAttrShiftBy := RegionAttrShiftBy
   gcOopProcess.io.ConfigIO.RegionAttrBiasedBase := RegionAttrBiasedBase
   gcOopProcess.io.ConfigIO.LogOfHRGrainBytes := LogOfHRGrainBytes
@@ -155,8 +175,12 @@ class GCAccTop extends Module with GCTopParameters {
   gcOopProcess.io.ConfigIO.CompressedOopShift := CompressedFlag(15 downto 8)
   gcOopProcess.io.DebugTimeStamp := DebugTimeStamp
 
-  // GCArrayProcess (ToTrace)
+  // GCArrayProcess
   gcArrayProcess.io.Mreq <> gcUnalignedMMUAdapter(6).io.in
+
+  gcArrayProcess.io.gcWriteSrcOopPtr.writeForward.valid := gcOopCopy2Survivor.io.ToFetch.writeForward.valid
+  gcArrayProcess.io.gcWriteSrcOopPtr.writeForward.payload := gcOopCopy2Survivor.io.ToFetch.writeForward.payload
+
   gcArrayProcess.io.ConfigIO.ChunkSize := ChunkSize
   gcArrayProcess.io.ConfigIO.StepperOffset := StepperOffset
   gcArrayProcess.io.ConfigIO.HeapRegionShiftBy := HeapRegionShiftBy
@@ -167,8 +191,11 @@ class GCAccTop extends Module with GCTopParameters {
   // GCOopCopy2Survivor
   gcOopCopy2Survivor.io.Mreq0 <> gcUnalignedMMUAdapter(7).io.in
   gcOopCopy2Survivor.io.Mreq1 <> gcUnalignedMMUAdapter(8).io.in
+
   gcOopCopy2Survivor.io.ToCopy <> gcCopy.io.ToCopy
+
   gcOopCopy2Survivor.io.ToAllocate <> gcAllocate.io.ToAllocate
+
   gcOopCopy2Survivor.io.ConfigIO.ChunkSize := ChunkSize
   gcOopCopy2Survivor.io.ConfigIO.AgeThreshold := AgeThreshold
   gcOopCopy2Survivor.io.ConfigIO.YoungWordsBase := YoungWordsBase
@@ -185,7 +212,9 @@ class GCAccTop extends Module with GCTopParameters {
 
   // gcAllocate(ToParAllocate)
   gcAllocate.io.Mreq <> gcUnalignedMMUAdapter(9).io.in
+
   gcAllocate.io.ToParAllocate <> gcParAllocate.io.ToParAllocate
+
   gcAllocate.io.ConfigIO.G1h := G1h
   gcAllocate.io.ConfigIO.ObjectKlassObj := ObjectKlass
   gcAllocate.io.ConfigIO.IntArrayKlassObj := IntArrayKlassObj
@@ -196,13 +225,17 @@ class GCAccTop extends Module with GCTopParameters {
   gcAllocate.io.DebugTimeStamp := DebugTimeStamp
 
   // gcParAllocate
-  gcParAllocate.io.MreqMainIml <> gcUnalignedMMUAdapter(10).io.in
   gcParAllocate.io.MreqPar <> gcUnalignedMMUAdapter(11).io.in
+  gcParAllocate.io.MreqMainIml <> gcUnalignedMMUAdapter(10).io.in
   gcParAllocate.io.MreqAttempt <> gcUnalignedMMUAdapter(12).io.in
+
   gcParAllocate.io.ToNewGCAlloc <> gcNewGCAlloc.io.ToNewGCAlloc
+
   gcParAllocate.io.CacheUpdateOut <> io.CacheUpdateOut
   gcParAllocate.io.CacheUpdateIn <> io.CacheUpdateIn
+
   gcParAllocate.io.Irq.clearIn()
+
   gcParAllocate.io.ConfigIO.G1h := G1h
   gcParAllocate.io.ConfigIO.Thread := Thread
   gcParAllocate.io.ConfigIO.LockPtr := LockPtr
@@ -211,40 +244,48 @@ class GCAccTop extends Module with GCTopParameters {
 
   // gcNewAlloc
   gcNewGCAlloc.io.Mreq <> gcUnalignedMMUAdapter(13).io.in
+
   gcNewGCAlloc.io.ToAllocFreeRegion <> gcAllocFreeRegion.io.ToAllocFreeRegion
+
   gcNewGCAlloc.io.Irq.clearIn()
+
   gcNewGCAlloc.io.ConfigIO.G1h := G1h
   gcNewGCAlloc.io.ConfigIO.DummyRegion := DummyRegion
 
   // gcAllocFreeRegion
   gcAllocFreeRegion.io.Mreq <> gcUnalignedMMUAdapter(14).io.in
+
   gcAllocFreeRegion.io.ConfigIO.G1h := G1h
 
   // gcTrace
   gcTrace.io.Mreq <> gcUnalignedMMUAdapter(15).io.in
-  gcTrace.io.ConfigIO.ChunkSize                        := ChunkSize
-  gcTrace.io.ConfigIO.RegionAttrBase                   := RegionAttrBase
-  gcTrace.io.ConfigIO.RegionAttrShiftBy                := RegionAttrShiftBy
-  gcTrace.io.ConfigIO.RegionAttrBiasedBase             := RegionAttrBiasedBase
-  gcTrace.io.ConfigIO.HeapRegionBias                   := HeapRegionBias
-  gcTrace.io.ConfigIO.HeapRegionShiftBy                := HeapRegionShiftBy
-  gcTrace.io.ConfigIO.LogOfHRGrainBytes                := LogOfHRGrainBytes
-  gcTrace.io.ConfigIO.UseCompressedOops                := CompressedFlag(0)
-  gcTrace.io.ConfigIO.CompressedOopBase                := CompressedOopBase
-  gcTrace.io.ConfigIO.CompressedOopShift               := CompressedFlag(15 downto 8)
-  gcTrace.io.ConfigIO.UseCompressedKlassPointers       := CompressedFlag(1)
+
+  gcTrace.io.ConfigIO.ChunkSize                          := ChunkSize
+  gcTrace.io.ConfigIO.RegionAttrBase                     := RegionAttrBase
+  gcTrace.io.ConfigIO.RegionAttrShiftBy                  := RegionAttrShiftBy
+  gcTrace.io.ConfigIO.RegionAttrBiasedBase               := RegionAttrBiasedBase
+  gcTrace.io.ConfigIO.HeapRegionBias                     := HeapRegionBias
+  gcTrace.io.ConfigIO.HeapRegionShiftBy                  := HeapRegionShiftBy
+  gcTrace.io.ConfigIO.LogOfHRGrainBytes                  := LogOfHRGrainBytes
+  gcTrace.io.ConfigIO.UseCompressedOops                  := CompressedFlag(0)
+  gcTrace.io.ConfigIO.CompressedOopBase                  := CompressedOopBase
+  gcTrace.io.ConfigIO.CompressedOopShift                 := CompressedFlag(15 downto 8)
+  gcTrace.io.ConfigIO.UseCompressedKlassPointers         := CompressedFlag(1)
   gcTrace.io.ConfigIO.HumongousReclaimCandidatesBoolBase := HumongousReclaimCandidatesBoolBase
-  gcTrace.io.DebugTimeStamp := DebugTimeStamp
+  gcTrace.io.DebugTimeStamp                              := DebugTimeStamp
 
   // gcAop
   gcAop.io.Mreq <> gcUnalignedMMUAdapter(16).io.in
+
+  gcAop.io.Irq.clearIn()
+
   gcAop.io.ConfigIO.CardTablePtr := CardTablePtr
   gcAop.io.ConfigIO.ParScanThreadStatePtr := ParScanThreadStatePtr
   gcAop.io.DebugTimeStamp := DebugTimeStamp
-  gcAop.io.NoAopSrc := (gcTaskStack.io.ConfigIO.Done || taskStackDone) && gcOopProcess.io.SlotIsEmpty
-  gcAop.io.Irq.clearIn()
 
-  // gcCopy
+  gcAop.io.NoAopSrc := (gcTaskStack.io.ConfigIO.Done || taskStackDone) && gcOopProcess.io.SlotIsEmpty // 不会再传递新的Aop任务
+
+  // gcCopy Copy的Mreq直接连LocalMMU 不需要经过对齐(其实现在的Unaligned对于对齐的也是直连的 也可以连接Unaligned, 这里为了省部件就不连了)
   gcCopy.io.readMReq <> gcLocalMMU.io.localMMUIOs(17)
   gcCopy.io.writeMReq <> gcLocalMMU.io.localMMUIOs(18)
 
@@ -309,29 +350,6 @@ class GCAccTop extends Module with GCTopParameters {
       }
     }
   }
-
-  // Add these connections where GCFetch and GCCopy are instantiated.
-  gcFetch.io.CopyFwdMain <> gcCopy.io.FwdMain
-  gcFetch.io.CopyFwdPush <> gcCopy.io.FwdPush
-  gcFetch.io.CopyFwdPre  <> gcCopy.io.FwdPre
-
-  // Existing compatibility/debug connection may remain.
-  gcFetch.io.CopyDone := gcCopy.io.ToCopy.Done
-
-  gcFetch.io.gcWriteSrcOopPtr.writeForward.valid :=
-    gcOopCopy2Survivor.io.ToFetch.writeForward.valid
-  gcFetch.io.gcWriteSrcOopPtr.writeForward.payload :=
-    gcOopCopy2Survivor.io.ToFetch.writeForward.payload
-
-  gcOopProcess.io.gcWriteSrcOopPtr.writeForward.valid :=
-    gcOopCopy2Survivor.io.ToFetch.writeForward.valid
-  gcOopProcess.io.gcWriteSrcOopPtr.writeForward.payload :=
-    gcOopCopy2Survivor.io.ToFetch.writeForward.payload
-
-  gcArrayProcess.io.gcWriteSrcOopPtr.writeForward.valid :=
-    gcOopCopy2Survivor.io.ToFetch.writeForward.valid
-  gcArrayProcess.io.gcWriteSrcOopPtr.writeForward.payload :=
-    gcOopCopy2Survivor.io.ToFetch.writeForward.payload
 }
 
 object GCAccTopVerilog extends App{

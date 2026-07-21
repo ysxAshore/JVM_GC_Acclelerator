@@ -153,7 +153,7 @@ class GCAllocate extends Module with GCTopParameters with HWParameters {
     }
 
     sPrepareSize.whenIsActive {
-      // @notice: plab_stats_value / no_of_gc_workers
+      // @notice: 需要除以并行GC数目 plab_stats_value / no_of_gc_workers
       plab_word_size := Min(Max(plab_stats_value(destAttrIdx), U"x102"), U"x40000")
       required_in_plab := (size.resize(GCElementWidth) + U(2)).resize(GCElementWidth)
 

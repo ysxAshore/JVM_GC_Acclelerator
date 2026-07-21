@@ -73,17 +73,28 @@ class GCTrace extends Module with GCTopParameters with GCParameters with HWParam
   val pendingPushValid = RegInit(False)
   val pendingPushPayload = RegInit(U(0, GCElementWidth bits))
 
+  // push 时 加入 tag
+  require(GCElementWidth > TracePushTagBit)
+
+  private def markTracePushTask(task: UInt): UInt = {
+    val tagMask = U(BigInt(1) << TracePushTagBit, GCElementWidth bits)
+    (task | tagMask).resize(GCElementWidth)
+  }
+
   def enqueueTask(task: UInt)(afterAccepted: => Unit): Unit = {
+    // This tag survives TaskStack, TopCache and JVM queue SpillOut/ReadBack.
+    val taggedTask = markTracePushTask(task)
+
     when(!pendingPushValid) {
       pendingPushValid := True
-      pendingPushPayload := task
+      pendingPushPayload := taggedTask
       afterAccepted
     } otherwise {
       io.ToStack.Push.valid := True
       io.ToStack.Push.payload := pendingPushPayload
 
       when(io.ToStack.Push.fire) {
-        pendingPushPayload := task
+        pendingPushPayload := taggedTask
         pendingPushValid := True
         afterAccepted
       }
