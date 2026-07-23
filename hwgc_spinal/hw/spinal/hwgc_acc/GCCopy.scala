@@ -369,7 +369,7 @@ class GCCopy extends Component with HWParameters with GCParameters with GCTopPar
   val readResponseSlot = sourceId2RobSlot(readResponseSourceId)
 
   // 只接受当前任务中已经分配且尚未接收数据的 slot
-  io.readMReq.Response.ready := taskValid && slotBusy(readResponseSlot) &&!slotForwardValid(readResponseSlot)
+  io.readMReq.Response.ready := taskValid && slotBusy(readResponseSlot) && !slotForwardValid(readResponseSlot)
 
   val readResponseFire = io.readMReq.Response.fire
   val responseData = io.readMReq.Response.payload.ResponseData

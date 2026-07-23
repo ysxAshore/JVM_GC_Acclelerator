@@ -370,7 +370,8 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   // Slot Fsms
   val slotIsPlabSelect = Vec.fill(2)(Bool()) // 状态泄漏
   val slotIsAllocCache = Vec.fill(2)(Bool())
-  val slotIsSendWork = Vec.fill(2)(Bool())
+  val slotIsSendCopyWork = Vec.fill(2)(Bool())
+  val slotIsSendTraceWork = Vec.fill(2)(Bool())
 
   for (i <- 0 until 2) {
     val m = slotMreq(i)
@@ -393,7 +394,9 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
 
       val DECIDE_FORWARD_PTR = new State
 
-      val SEND_WORK = new State
+      val SEND_COPY_WORK = new State
+      val SEND_TRACE_WORK = new State
+
       val GET_MONITOR_MW = new State
       val WRITE_MONITOR_MW = new State
       val WAIT_COPY_TRACE = new State
@@ -726,12 +729,18 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
       DECIDE_FORWARD_PTR.whenIsActive {
         // @notice: atomic-cas
         val newMw = forwardingMarkOf(slotCtx(i).runtime.destOopPtr)
-        casForwardPtr(slotCtx(i).configs.srcOopPtr, slotCtx(i).configs.markWord, newMw, SEND_WORK, READ_BOTTOM_HARD_END)
+        casForwardPtr(slotCtx(i).configs.srcOopPtr, slotCtx(i).configs.markWord, newMw, SEND_COPY_WORK, READ_BOTTOM_HARD_END)
       }
 
-      SEND_WORK.whenIsActive {
-        val needTrace = slotCtx(i).runtime.kid =/= U(TypeArrayKlassID, 32 bits)
+      SEND_COPY_WORK.whenIsActive {
+        val copyIssuedDone = slotCtx(i).runtime.copyIssued
 
+        when(copyIssuedDone){
+          goto(SEND_TRACE_WORK)
+        }
+      }
+
+      SEND_TRACE_WORK.whenIsActive {
         when(!slotCtx(i).runtime.writeDestOopPtrDone) {
           val addr = slotCtx(i).runtime.destOopPtr.resize(MMUAddrWidth)
           val newAge = nextAge(slotCtx(i).runtime.age)
@@ -749,10 +758,10 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
           }
         }
 
-        val copyIssuedDone = slotCtx(i).runtime.copyIssued
+        val needTrace = slotCtx(i).runtime.kid =/= U(TypeArrayKlassID, 32 bits)
         val traceIssuedDone = slotCtx(i).runtime.traceIssued || !needTrace
 
-        when(copyIssuedDone && traceIssuedDone && slotCtx(i).runtime.writeDestOopPtrDone) {
+        when(traceIssuedDone && slotCtx(i).runtime.writeDestOopPtrDone) {
           when(slotCtx(i).runtime.destOopPtr(15 downto 0) === 0 && !slotCtx(i).configs.markWord(0)) {
             goto(GET_MONITOR_MW)
           }.otherwise {
@@ -862,7 +871,8 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
 
     slotIsPlabSelect(i) := slotFsm.isActive(slotFsm.PLAB_SELECT)
     slotIsAllocCache(i) := slotFsm.isActive(slotFsm.ALLOC_CACHE)
-    slotIsSendWork(i) := slotFsm.isActive(slotFsm.SEND_WORK)
+    slotIsSendCopyWork(i) := slotFsm.isActive(slotFsm.SEND_COPY_WORK)
+    slotIsSendTraceWork(i) := slotFsm.isActive(slotFsm.SEND_TRACE_WORK)
   }
 
   for (i <- 0 until 2) {
@@ -1100,15 +1110,16 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   val wantCopy = Vec.fill(2)(Bool())
 
   for (i <- 0 until 2) {
-    wantCopy(i) := slotValid(i) && slotIsSendWork(i) && !slotCtx(i).runtime.copyIssued
+    wantCopy(i) := slotValid(i) && slotIsSendCopyWork(i) && !slotCtx(i).runtime.copyIssued
   }
 
-  when(!copyBusy) {
-    when(wantCopy(0)) {
-      driveCopy(0)
-    } elsewhen wantCopy(1) {
-      driveCopy(1)
-    }
+  val grantCopy0 = !copyBusy && wantCopy(0) && (!wantCopy(1) || olderSlot === U(0, 1 bits))
+  val grantCopy1 = !copyBusy && wantCopy(1) && (!wantCopy(0) || olderSlot === U(1, 1 bits))
+
+  when(grantCopy0) {
+    driveCopy(0)
+  }.elsewhen(grantCopy1) {
+    driveCopy(1)
   }
 
   // Trace arbitration
@@ -1137,16 +1148,17 @@ class GCOopCopy2Survivor extends Module with HWParameters with GCTopParameters w
   val wantTrace = Vec.fill(2)(Bool())
 
   for (i <- 0 until 2) {
-    wantTrace(i) := slotValid(i) && slotIsSendWork(i) && !slotCtx(i).runtime.traceIssued &&
-      slotCtx(i).runtime.kid =/= U(TypeArrayKlassID, 32 bits)
+    wantTrace(i) := slotValid(i) && slotIsSendTraceWork(i) && slotCtx(i).runtime.copyIssued && !slotCtx(i).runtime.traceIssued &&
+        slotCtx(i).runtime.kid =/= U(TypeArrayKlassID, 32 bits)
   }
 
-  when(!traceBusy) {
-    when(wantTrace(0)) {
-      driveTrace(0)
-    } elsewhen wantTrace(1) {
-      driveTrace(1)
-    }
+  val grantTrace0 = !traceBusy && wantTrace(0) && (!wantTrace(1) || olderSlot === U(0, 1 bits))
+  val grantTrace1 = !traceBusy && wantTrace(1) && (!wantTrace(0) || olderSlot === U(1, 1 bits))
+
+  when(grantTrace0) {
+    driveTrace(0)
+  }.elsewhen(grantTrace1) {
+    driveTrace(1)
   }
 
   // Allocate arbitration
